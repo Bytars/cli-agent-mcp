@@ -1,4 +1,4 @@
-module github.com/anher/cli-agent-mcp
+module github.com/andresh0816/cli-agent-mcp
 
 go 1.26.5
 

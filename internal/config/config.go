@@ -35,6 +35,13 @@ type Config struct {
 	ClaudeExtraArgs []string
 	CursorExtraArgs []string
 
+	// CustomName / CustomBin / CustomArgs configure the generic adapter, which
+	// can drive any CLI agent without writing Go. CustomArgs is a template whose
+	// entries may contain {{prompt}}, {{cwd}}, {{model}} and {{session}}.
+	CustomName string
+	CustomBin  string
+	CustomArgs []string
+
 	// DefaultCwd is the working directory used when a tool call omits `cwd`.
 	// Empty means "the server process's own working directory".
 	DefaultCwd string
@@ -97,6 +104,9 @@ func Load() Config {
 		PermissionMode:  getenv("CLI_AGENT_MCP_PERMISSION_MODE", "acceptEdits"),
 		ClaudeExtraArgs: splitList("CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS"),
 		CursorExtraArgs: splitList("CLI_AGENT_MCP_CURSOR_EXTRA_ARGS"),
+		CustomName:      getenv("CLI_AGENT_MCP_CUSTOM_NAME", "custom"),
+		CustomBin:       getenv("CLI_AGENT_MCP_CUSTOM_BIN", ""),
+		CustomArgs:      splitList("CLI_AGENT_MCP_CUSTOM_ARGS"),
 		DefaultCwd:      getenv("CLI_AGENT_MCP_DEFAULT_CWD", ""),
 		AllowedCwds:     allowed,
 		MaxTasks:        maxTasks,
