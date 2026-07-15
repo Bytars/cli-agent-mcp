@@ -1,0 +1,21 @@
+# Build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries / coverage
+*.test
+*.out
+coverage.*
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
