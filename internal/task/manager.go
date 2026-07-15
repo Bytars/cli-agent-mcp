@@ -3,8 +3,8 @@
 // A Task owns one agent *session*: the first turn starts it, and follow-up
 // turns resume it (so a delegating model can hold a multi-turn conversation with
 // the worker agent). Each turn spawns the agent headless; the process inherits
-// the server's environment, so the VPN and the 1Password SSH agent are visible
-// to the child with zero extra wiring.
+// the server's environment, so whatever the host machine can reach (VPN routes,
+// an SSH agent, credentials) is available to the worker with zero extra wiring.
 package task
 
 import (
@@ -54,6 +54,7 @@ type Task struct {
 	sessionID         string
 	lines             []string
 	resultText        string
+	lastText          string // last human-facing text event of the current turn
 	isError           bool
 	exitCode          *int
 	runErr            string
@@ -341,10 +342,12 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	t.canceledRequested = false
 	t.runErr = ""
 	t.resultText = ""
+	t.lastText = ""
 	t.isError = false
 	t.exitCode = nil
 	t.endedAt = time.Time{}
-	t.turns = append(t.turns, TurnInfo{Prompt: spec.Prompt, StartLine: len(t.lines), StartedAt: time.Now()})
+	turnStart := len(t.lines)
+	t.turns = append(t.turns, TurnInfo{Prompt: spec.Prompt, StartLine: turnStart, StartedAt: time.Now()})
 	t.mu.Unlock()
 
 	fail := func(msg string) {
@@ -385,7 +388,7 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go t.pump(stdout, false, sink, &wg)
-	go t.pump(stderr, true, nil, &wg)
+	go t.pump(stderr, true, sink, &wg)
 	wg.Wait()
 	waitErr := cmd.Wait()
 
@@ -408,7 +411,38 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 			t.runErr = waitErr.Error()
 		}
 	}
+	// Not every agent emits a terminal result event. Fall back to something
+	// useful so the delegating model always gets an answer, not an empty string.
+	if t.resultText == "" {
+		if useOutputAsResult(t.adapter) {
+			t.resultText = tailLines(t.lines[turnStart:], maxResultLines, maxResultChars)
+		} else if t.lastText != "" {
+			t.resultText = t.lastText
+		}
+	}
 	t.mu.Unlock()
+}
+
+const (
+	maxResultLines = 200
+	maxResultChars = 8000
+)
+
+func useOutputAsResult(a agent.Adapter) bool {
+	r, ok := a.(agent.ResultFromOutput)
+	return ok && r.UseOutputAsResult()
+}
+
+// tailLines joins the last maxLines lines, capped at maxChars from the end.
+func tailLines(lines []string, maxLines, maxChars int) string {
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	s := strings.TrimSpace(strings.Join(lines, "\n"))
+	if len(s) > maxChars {
+		s = "…" + s[len(s)-maxChars:]
+	}
+	return s
 }
 
 // appendLine adds a line. Caller holds t.mu.
@@ -417,8 +451,11 @@ func (t *Task) appendLine(line string) {
 }
 
 // pump reads a stream line by line, parsing agent stdout for structured events.
-// For stdout, each parsed event is forwarded to sink (if non-nil) after the task
-// lock is released, so a streaming caller sees live progress.
+// Each event is forwarded to sink (if non-nil) after the task lock is released,
+// so a streaming caller sees live progress. stderr is surfaced too — when an
+// agent fails it often says why only on stderr, and silence there is useless.
+//
+// Note both pumps share the sink, so a sink must be safe for concurrent use.
 func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup) {
 	defer wg.Done()
 	br := bufio.NewReaderSize(r, 1024*1024)
@@ -430,12 +467,18 @@ func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup)
 				t.mu.Lock()
 				t.appendLine("[stderr] " + line)
 				t.mu.Unlock()
+				if sink != nil {
+					sink(agent.Event{Raw: line, Text: "⚠ " + strings.TrimSpace(line)})
+				}
 			} else {
 				ev := t.adapter.ParseLine(line)
 				t.mu.Lock()
 				t.appendLine(line)
 				if ev.SessionID != "" {
 					t.sessionID = ev.SessionID
+				}
+				if ev.Text != "" {
+					t.lastText = ev.Text
 				}
 				if ev.Final {
 					t.isError = ev.FinalError

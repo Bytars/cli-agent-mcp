@@ -1,14 +1,15 @@
 // Command cli-agent-mcp is a Model Context Protocol server that lets an
 // orchestrating client (e.g. Claude Desktop) drive a local headless CLI coding
-// agent — Claude Code or Cursor — as a background worker.
+// agent — Claude Code, Cursor, or any tool you configure — as a background
+// worker.
 //
-// The worker runs on this machine and inherits this process's environment, so
-// anything the machine can reach (a VPN, internal servers via the 1Password SSH
-// agent) is transparently available to it. The orchestrator delegates a task,
-// polls for completion, reads the result, and can send follow-up turns — no
-// copy-pasting between two chat windows.
+// The worker runs on the host machine and inherits this process's environment,
+// so whatever that machine can reach (VPN routes, private hosts via an SSH
+// agent, credentials) is transparently available to it. The orchestrator
+// delegates a task, watches live progress, reads the result, and can send
+// follow-up turns — no copy-pasting between two windows.
 //
-// Transport is stdio, matching how Claude Desktop launches github-mcp-server.
+// Transport is stdio, matching how MCP clients launch server binaries.
 package main
 
 import (
@@ -17,6 +18,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -56,6 +58,7 @@ func main() {
 	reg := agent.NewRegistry(
 		agent.NewClaudeAdapter(cfg.ClaudeBin, cfg.PermissionMode, cfg.ClaudeExtraArgs),
 		agent.NewCursorAdapter(cfg.CursorBin, cfg.CursorExtraArgs),
+		agent.NewCustomAdapter(cfg.CustomName, cfg.CustomBin, cfg.CustomArgs),
 		agent.NewMockAdapter(),
 	)
 	mgr := task.NewManager(cfg.MaxTasks)
@@ -87,7 +90,7 @@ func main() {
 	}
 }
 
-const instructions = `This server delegates coding/ops tasks to a local headless CLI agent (Claude Code or Cursor) that runs on the user's machine with full access to their VPN and SSH-agent-backed internal servers. Treat the worker as an extension of yourself: delegate, watch it work, and report the result as if you did it.
+const instructions = `This server delegates coding/ops tasks to a headless CLI agent (Claude Code, Cursor, or a custom-configured tool) running on the host machine. The worker inherits that machine's environment, so it can reach whatever the host can — including private networks and hosts behind an SSH agent. Treat the worker as an extension of yourself: delegate, watch it work, and report the result as if you did it.
 
 PREFERRED (seamless, no polling):
 - agent_run_task — delegate a task and WAIT; the tool streams live progress notifications while the agent works, then returns the final result inline. Use this by default.
@@ -106,7 +109,7 @@ Long tasks may take minutes; agent_run_task keeps the connection alive via progr
 
 type startInput struct {
 	Prompt    string   `json:"prompt" jsonschema:"The task or instruction to delegate to the CLI agent."`
-	Agent     string   `json:"agent,omitempty" jsonschema:"Which agent to use: claude, cursor, or mock. Defaults to the server's configured default."`
+	Agent     string   `json:"agent,omitempty" jsonschema:"Which agent to use (e.g. claude, cursor, custom, mock). Call agent_list_agents to see what this server has available. Defaults to the server's configured default."`
 	Cwd       string   `json:"cwd,omitempty" jsonschema:"Absolute working directory for the agent. Defaults to the server's configured default."`
 	Model     string   `json:"model,omitempty" jsonschema:"Optional model override passed to the agent."`
 	ExtraArgs []string `json:"extra_args,omitempty" jsonschema:"Extra CLI flags appended verbatim to this run."`
@@ -185,12 +188,18 @@ func resolveTarget(reg *agent.Registry, cfg config.Config, agentName, cwd string
 // newProgressSink builds an EventSink that forwards each agent event to the MCP
 // client as a progress notification, so the user watches the worker live. It
 // returns nil when the client did not supply a progress token.
+//
+// The returned sink is safe for concurrent use: the task manager drives it from
+// both the stdout and stderr pumps.
 func newProgressSink(ctx context.Context, req *mcp.CallToolRequest) task.EventSink {
 	token := req.Params.GetProgressToken()
 	if token == nil {
 		return nil
 	}
-	var seq float64 // only the stdout pump goroutine calls the sink → no lock needed
+	var (
+		mu  sync.Mutex
+		seq float64 // MCP requires progress to strictly increase
+	)
 	return func(ev agent.Event) {
 		msg := ev.Text
 		if ev.Final {
@@ -203,11 +212,14 @@ func newProgressSink(ctx context.Context, req *mcp.CallToolRequest) task.EventSi
 		if strings.TrimSpace(msg) == "" {
 			return
 		}
+		mu.Lock()
 		seq++
+		n := seq
+		mu.Unlock()
 		_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
 			ProgressToken: token,
 			Message:       truncate(msg, 500),
-			Progress:      seq,
+			Progress:      n,
 		})
 	}
 }
@@ -399,24 +411,37 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 func printHelp() {
 	fmt.Print(`cli-agent-mcp ` + version + `
 
-An MCP (stdio) server that lets Claude Desktop drive a local headless CLI coding
-agent (Claude Code or Cursor) as a background worker.
+An MCP (stdio) server that lets an MCP client (e.g. Claude Desktop) drive a local
+headless CLI coding agent — Claude Code, Cursor, or any tool you configure — as a
+background worker, with live progress streaming.
 
 Usage:
-  cli-agent-mcp                 Run the MCP server over stdio (how Claude Desktop launches it).
+  cli-agent-mcp                 Run the MCP server over stdio (how an MCP client launches it).
   cli-agent-mcp --list-agents   Print detected agents and availability, then exit.
   cli-agent-mcp --version       Print version.
   cli-agent-mcp --help          This help.
 
 Configuration (environment variables):
-  CLI_AGENT_MCP_DEFAULT_AGENT      Default agent: claude|cursor|mock  (default: claude)
-  CLI_AGENT_MCP_CLAUDE_BIN         Claude Code launcher                (default: claude)
-  CLI_AGENT_MCP_CURSOR_BIN         Cursor launcher fallback            (default: cursor-agent)
-  CLI_AGENT_MCP_PERMISSION_MODE    Claude --permission-mode            (default: acceptEdits)
+  CLI_AGENT_MCP_DEFAULT_AGENT      Default agent: claude|cursor|custom|mock (default: claude)
+  CLI_AGENT_MCP_CLAUDE_BIN         Claude Code launcher                 (default: claude)
+  CLI_AGENT_MCP_CURSOR_BIN         Cursor launcher fallback             (default: cursor-agent)
+  CLI_AGENT_MCP_PERMISSION_MODE    Claude --permission-mode             (default: acceptEdits)
   CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS  Extra Claude flags (';'-separated)
   CLI_AGENT_MCP_CURSOR_EXTRA_ARGS  Extra Cursor flags (';'-separated)
   CLI_AGENT_MCP_DEFAULT_CWD        Default working directory
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
-  CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                  (default: 100)
+  CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
+
+Custom agent (drive any CLI without writing Go):
+  CLI_AGENT_MCP_CUSTOM_BIN         The agent's executable
+  CLI_AGENT_MCP_CUSTOM_ARGS        Arg template (';'-separated). Placeholders:
+                                     {{prompt}} {{cwd}} {{model}} {{session}}
+                                   An arg whose placeholder is empty is dropped, so
+                                   prefer the '--flag=value' form for optional ones.
+  CLI_AGENT_MCP_CUSTOM_NAME        Name to expose it as        (default: custom)
+
+  Example:
+    CLI_AGENT_MCP_CUSTOM_BIN=aider
+    CLI_AGENT_MCP_CUSTOM_ARGS=--no-pretty;--yes;--message;{{prompt}}
 `)
 }

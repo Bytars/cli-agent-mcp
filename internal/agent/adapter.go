@@ -1,12 +1,15 @@
 // Package agent defines the pluggable adapter interface that lets the MCP
-// server drive different headless CLI coding agents (Claude Code, Cursor, ...)
-// through one uniform surface.
+// server drive different headless CLI coding agents (Claude Code, Cursor, or any
+// tool configured through CustomAdapter) through one uniform surface.
 //
 // Design: rather than trying to control an interactive TUI (pseudo-terminals,
 // ANSI parsing, prompt detection — fragile), every adapter invokes its agent in
-// *headless / print* mode, streaming newline-delimited JSON. That gives a clean
-// programmatic contract: a session id to resume, and an unambiguous terminal
-// "result" event signalling the task is done.
+// *headless / print* mode, streaming newline-delimited output. That gives a
+// clean programmatic contract: a session id to resume, and an unambiguous
+// terminal "result" event signalling the task is done — with the process exit
+// code as a universal backstop.
+//
+// To support another agent, implement Adapter and register it in the Registry.
 package agent
 
 import (
@@ -46,12 +49,21 @@ type Adapter interface {
 	Available() (ok bool, detail string)
 
 	// Command builds the exec.Cmd for a run. It must NOT set Dir or Env; the
-	// task manager owns those (Env is inherited so the VPN and the 1Password SSH
-	// agent are visible to the child).
+	// task manager owns those. Env is inherited from the server process, so
+	// whatever the host machine can reach (VPN routes, SSH agent, credentials)
+	// is available to the child with no extra wiring.
 	Command(ctx context.Context, spec RunSpec) (*exec.Cmd, error)
 
 	// ParseLine interprets one line of stdout.
 	ParseLine(line string) Event
+}
+
+// ResultFromOutput is an optional interface for adapters whose agent has no
+// reliable terminal result event. When an adapter implements it and returns
+// true, the task manager falls back to the turn's collected output as the task
+// result instead of leaving it empty.
+type ResultFromOutput interface {
+	UseOutputAsResult() bool
 }
 
 // Registry is the set of adapters known to the server.
