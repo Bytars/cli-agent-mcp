@@ -5,6 +5,10 @@
 *.so
 *.dylib
 
+# Built binaries (this project's name, and release output)
+/cli-agent-mcp
+/dist/
+
 # Test binaries / coverage
 *.test
 *.out

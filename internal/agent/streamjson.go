@@ -19,10 +19,10 @@ type claudeStreamEvent struct {
 type claudeMessage struct {
 	Content []struct {
 		Type    string          `json:"type"`
-		Text    string          `json:"text"`            // text blocks
-		Name    string          `json:"name"`            // tool_use blocks
-		Content json.RawMessage `json:"content"`         // tool_result output: string or []block
-		IsError bool            `json:"is_error"`        // tool_result blocks
+		Text    string          `json:"text"`     // text blocks
+		Name    string          `json:"name"`     // tool_use blocks
+		Content json.RawMessage `json:"content"`  // tool_result output: string or []block
+		IsError bool            `json:"is_error"` // tool_result blocks
 	} `json:"content"`
 }
 
