@@ -25,7 +25,8 @@ import (
 	"github.com/andresh0816/cli-agent-mcp/internal/task"
 )
 
-const version = "0.1.0"
+// version is overridden at release time via -ldflags "-X main.version=<tag>".
+var version = "dev"
 
 func main() {
 	// Hidden subcommand used by the built-in mock agent to exercise the full
@@ -122,9 +123,9 @@ type followupInput struct {
 }
 
 type outputInput struct {
-	TaskID   string `json:"task_id" jsonschema:"The task id to read output from."`
-	SinceLine int   `json:"since_line,omitempty" jsonschema:"0-based line index to start from (for incremental reads)."`
-	MaxLines  int   `json:"max_lines,omitempty" jsonschema:"Maximum number of lines to return. 0 means all."`
+	TaskID    string `json:"task_id" jsonschema:"The task id to read output from."`
+	SinceLine int    `json:"since_line,omitempty" jsonschema:"0-based line index to start from (for incremental reads)."`
+	MaxLines  int    `json:"max_lines,omitempty" jsonschema:"Maximum number of lines to return. 0 means all."`
 }
 
 // ---- tool output types --------------------------------------------------

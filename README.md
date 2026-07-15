@@ -1,5 +1,9 @@
 # cli-agent-mcp
 
+[![ci](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/ci.yml)
+[![release](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/release.yml)
+[![latest release](https://img.shields.io/github/v/release/andresh0816/cli-agent-mcp?sort=semver)](https://github.com/andresh0816/cli-agent-mcp/releases/latest)
+
 An **MCP (Model Context Protocol) stdio server** — a single `.exe`, in the spirit
 of [github-mcp-server](https://github.com/github/github-mcp-server) — that lets
 an orchestrating client such as **Claude Desktop** drive a **local headless CLI
@@ -79,7 +83,28 @@ Adding another agent = implementing the small `agent.Adapter` interface
 | `agent_list_tasks` | List all tasks, newest first. |
 | `agent_list_agents` | Show which agents are available on this machine. |
 
-## Build
+## Install (recommended: download a binary)
+
+Grab a prebuilt binary from the
+[**Releases**](https://github.com/andresh0816/cli-agent-mcp/releases/latest) page —
+just like github-mcp-server. Pick the file for your platform:
+
+| Platform | Asset |
+|----------|-------|
+| Windows (x64) | `cli-agent-mcp_windows_amd64.exe` |
+| Windows (ARM) | `cli-agent-mcp_windows_arm64.exe` |
+| macOS (Apple Silicon) | `cli-agent-mcp_darwin_arm64` |
+| macOS (Intel) | `cli-agent-mcp_darwin_amd64` |
+| Linux (x64) | `cli-agent-mcp_linux_amd64` |
+| Linux (ARM) | `cli-agent-mcp_linux_arm64` |
+
+`checksums.txt` (SHA-256) is attached to each release to verify the download.
+
+Put the file somewhere stable (e.g. `C:\Tools\cli-agent-mcp.exe`) and point your
+Claude Desktop config at it (see below). No unzip needed — the assets are the raw
+binaries.
+
+## Build (from source)
 
 Requires Go 1.23+.
 
@@ -105,7 +130,7 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json` and add the server under
 {
   "mcpServers": {
     "cli-agent": {
-      "command": "C:\\Users\\someone\\Documents\\Projects\\Development\\tools\\cli-agent-mcp\\cli-agent-mcp.exe",
+      "command": "C:\\Tools\\cli-agent-mcp.exe",
       "env": {
         "CLI_AGENT_MCP_DEFAULT_AGENT": "claude",
         "CLI_AGENT_MCP_DEFAULT_CWD": "C:\\Users\\someone\\Documents\\Projects\\my-project",
@@ -153,6 +178,25 @@ Recommended hardening:
 - Set `CLI_AGENT_MCP_ALLOWED_CWDS` to restrict where tasks can run.
 - Keep `CLI_AGENT_MCP_DEFAULT_CWD` pointed at a specific project.
 - Start with `acceptEdits`; only move to `bypassPermissions` once you trust the flow.
+
+## Releases (maintainers)
+
+Releases are automated by [`.github/workflows/release.yml`](.github/workflows/release.yml).
+Cutting a release is a single tag push:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+That triggers a workflow that cross-compiles every platform binary (with the
+version baked in via `-ldflags -X main.version=0.2.0`), writes `checksums.txt`,
+and publishes a **GitHub Release** with auto-generated changelog notes and all
+assets attached. You can also run it manually from the Actions tab
+(`workflow_dispatch`) against an existing tag.
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `gofmt`, `go vet`,
+`go build`, and the end-to-end smoke test on every push and PR.
 
 ## Project layout
 
