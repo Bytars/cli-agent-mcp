@@ -176,8 +176,8 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_CLAUDE_BIN` | `claude` | Claude Code launcher (name in PATH or absolute path). |
 | `CLI_AGENT_MCP_CURSOR_BIN` | `cursor-agent` | Cursor launcher, used if the bundled runtime isn't auto-detected. |
 | `CLI_AGENT_MCP_PERMISSION_MODE` | `acceptEdits` | Claude Code `--permission-mode`: `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`. |
-| `CLI_AGENT_MCP_ALLOWED_TOOLS` | — | Claude Code `--allowedTools` allowlist, patterns supported (e.g. `Bash(git *),Edit`). **The best way to bound a headless worker.** |
-| `CLI_AGENT_MCP_DISALLOWED_TOOLS` | — | Claude Code `--disallowedTools` denylist. |
+| `CLI_AGENT_MCP_DISALLOWED_TOOLS` | — | Claude Code `--disallowedTools` (patterns, e.g. `Bash(rm:*),Bash(git push:*)`). **The reliable deny gate for a headless worker.** |
+| `CLI_AGENT_MCP_ALLOWED_TOOLS` | — | Claude Code `--allowedTools` — pre-approves tools; **additive, does not restrict.** |
 | `CLI_AGENT_MCP_ALLOW_EXTRA_ARGS` | `false` | Allow callers to pass raw agent flags via `extra_args`. **Keep off** — see safety. |
 | `CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS` | — | Extra Claude flags, `;`-separated. |
 | `CLI_AGENT_MCP_CURSOR_EXTRA_ARGS` | — | Extra Cursor flags, `;`-separated. |
@@ -316,25 +316,33 @@ refuse the call rather than executing. `agent_list_agents` reports
 
 ### Bound what the worker may do
 
-Prefer a precise allowlist over a permissive mode:
+**A headless worker executes tool calls by default** — this was verified against
+Claude Code 2.1.207: a `-p` run in `default` or `acceptEdits` mode runs shell
+commands without prompting (there's no human to prompt). So you do **not** need
+`bypassPermissions` to get real work done, and — importantly — you cannot rely on
+a permission mode to hold it back.
+
+The reliable brake is the **denylist**:
 
 ```json
-"CLI_AGENT_MCP_ALLOWED_TOOLS": "Read,Grep,Glob,Edit,Bash(git *),Bash(npm test)"
+"CLI_AGENT_MCP_DISALLOWED_TOOLS": "Bash(rm:*),Bash(git push:*),Bash(sudo:*)"
 ```
 
-`--allowedTools` / `--disallowedTools` support patterns, so you can grant exactly
-`Bash(git *)` instead of choosing between *no commands at all* and *every
-command*. This is server-side policy — tool callers cannot override it.
+`--disallowedTools` hard-denies matching tools/commands (a denied call shows up in
+the transcript as a `permission_denials` entry). `Bash` blocks all shell use;
+`Bash(git push:*)` blocks just that. This is server-side policy — tool callers
+cannot override it.
 
-For Claude Code, `--permission-mode` (`CLI_AGENT_MCP_PERMISSION_MODE`) accepts
-`acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`:
+> **`--allowedTools` does _not_ restrict.** It is *additive*: it pre-approves
+> tools (removes prompts), but tools not on it still run. Treat it as "run these
+> without ceremony," never as "only these are allowed." Verified: with
+> `--allowedTools "Bash(git status)"`, the worker still happily ran `git log`.
 
-- `acceptEdits` (default) — auto-approves file edits, but **commands still need
-  approval**, so a task that must run commands may stall or skip them.
-- `bypassPermissions` — runs everything, no prompts. Often what's wanted for
-  *"log into the server and run X"*, **but it means one AI can make another AI
-  run arbitrary commands on your machine and infrastructure.** If you need this,
-  pair it with `CLI_AGENT_MCP_ALLOWED_TOOLS` rather than leaving it wide open.
+Because a denylist is inherently incomplete, it is one layer — combine it with the
+directory boundary, plan-first, director-mode supervision, and the audit log
+below. `--permission-mode` (`CLI_AGENT_MCP_PERMISSION_MODE`) still exists
+(`acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`);
+`plan` is what powers `agent_plan_task`.
 
 ### `extra_args` is disabled by default — keep it that way
 
@@ -354,9 +362,9 @@ carry injected instructions. The blast radius is whatever the host machine can
 reach, including private infrastructure. Bound it deliberately:
 
 - `CLI_AGENT_MCP_ALLOWED_CWDS` — restrict where tasks may run.
-- `CLI_AGENT_MCP_ALLOWED_TOOLS` — restrict what they may do.
+- `CLI_AGENT_MCP_DISALLOWED_TOOLS` — deny the dangerous operations.
 - `CLI_AGENT_MCP_DEFAULT_CWD` — pin a specific project.
-- Plan first; keep `extra_args` off.
+- Plan first, supervise in director mode, keep the audit log on, keep `extra_args` off.
 
 ## Development
 
