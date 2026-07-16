@@ -10,6 +10,7 @@ package audit
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -21,11 +22,17 @@ type Logger struct {
 	f  *os.File
 }
 
-// New opens (creating/appending) the audit log at path. An empty path returns a
-// disabled logger that discards everything.
+// New opens (creating/appending) the audit log at path, creating the parent
+// directory if needed. An empty path returns a disabled logger that discards
+// everything.
 func New(path string) (*Logger, error) {
 	if path == "" {
 		return &Logger{}, nil
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
