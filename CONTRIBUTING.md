@@ -20,6 +20,7 @@ Please make sure these pass — they're exactly what CI runs:
 gofmt -l .            # must print nothing
 go vet ./...
 go build ./...
+go test ./...
 
 # End-to-end test over real MCP stdio, using the built-in mock agent.
 # Requires no Claude Code / Cursor install.
@@ -56,6 +57,13 @@ Guidelines:
   schema still works.
 - If your agent has no terminal result event, implement the optional
   `ResultFromOutput` interface so its output is used as the task result.
+- Only implement the optional `PlanCapable` interface if your agent can *truly*
+  propose without executing. It must fail closed: `agent_plan_task` refuses
+  agents that don't implement it, because silently executing a task the caller
+  asked it to merely plan is the worst possible outcome.
+- Anything that bounds what the worker may do (permission modes, tool
+  allowlists) belongs in server config — never in a parameter the calling model
+  can set, since the caller is itself a model.
 - Register the adapter in `main.go` and add any config to `internal/config`.
 
 Please include a short note in the README table and, where practical, extend

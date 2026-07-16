@@ -36,6 +36,9 @@ func main() {
 	cmd := exec.Command(serverExe)
 	cmd.Env = append(os.Environ(),
 		"CLI_AGENT_MCP_DEFAULT_AGENT="+agentName,
+		// Pin the gate closed so the extra_args assertion is hermetic regardless
+		// of what the developer happens to have exported.
+		"CLI_AGENT_MCP_ALLOW_EXTRA_ARGS=false",
 	)
 	cmd.Stderr = os.Stderr
 
@@ -94,6 +97,41 @@ func main() {
 		progressMu.Unlock()
 		if !sawToolLine {
 			log.Fatal("FAIL: expected a progress notification with the tool's last output line (↳ ...)")
+		}
+	}
+
+	// 0b. extra_args must be refused unless the operator opted in.
+	fmt.Println("\n== extra_args gate (must be refused by default) ==")
+	gateRes, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "agent_run_task", Arguments: map[string]any{
+		"prompt":     prompt,
+		"agent":      agentName,
+		"cwd":        cwd,
+		"extra_args": []string{"--dangerously-skip-permissions"},
+	}})
+	if err != nil {
+		log.Fatalf("agent_run_task (extra_args): %v", err)
+	}
+	if !gateRes.IsError {
+		log.Fatal("FAIL: extra_args was accepted; it must be refused unless CLI_AGENT_MCP_ALLOW_EXTRA_ARGS=true")
+	}
+	fmt.Printf("  correctly refused: %s\n", firstLine(textContent(gateRes)))
+
+	// 0c. plan-only run must not execute.
+	fmt.Println("\n== agent_plan_task (plan only, nothing executed) ==")
+	planRes := callTool(ctx, session, "agent_plan_task", map[string]any{
+		"prompt": prompt,
+		"agent":  agentName,
+		"cwd":    cwd,
+	})
+	planStatus := jsonField(planRes, "status")
+	planResult := jsonField(planRes, "result")
+	fmt.Printf("  status=%s\n  result=%s\n", planStatus, firstLine(planResult))
+	if agentName == "mock" {
+		if planStatus != "done" {
+			log.Fatalf("FAIL: expected plan status done, got %q", planStatus)
+		}
+		if !strings.Contains(planResult, "PLAN") {
+			log.Fatalf("FAIL: expected a plan in the result, got %q", planResult)
 		}
 	}
 
@@ -213,6 +251,13 @@ func jsonField(res *mcp.CallToolResult, key string) string {
 		}
 	}
 	return ""
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 func getenv(key, def string) string {

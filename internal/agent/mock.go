@@ -31,11 +31,18 @@ func (a *MockAdapter) Available() (bool, string) {
 	return true, a.selfExe + " __mock"
 }
 
+// SupportsPlanOnly lets the mock exercise the plan-only path end to end.
+func (a *MockAdapter) SupportsPlanOnly() bool { return true }
+
 func (a *MockAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, error) {
 	if a.selfExe == "" {
 		return nil, fmt.Errorf("mock: unknown executable path")
 	}
-	return exec.CommandContext(ctx, a.selfExe, "__mock", "-p", spec.Prompt), nil
+	args := []string{"__mock", "-p", spec.Prompt}
+	if spec.PlanOnly {
+		args = append(args, "--plan")
+	}
+	return exec.CommandContext(ctx, a.selfExe, args...), nil
 }
 
 func (a *MockAdapter) ParseLine(line string) Event { return parseClaudeStreamLine(line) }
@@ -44,9 +51,13 @@ func (a *MockAdapter) ParseLine(line string) Event { return parseClaudeStreamLin
 // Claude-style stream-json transcript for the given prompt and exits 0.
 func RunMock(args []string) int {
 	prompt := "no prompt"
+	planOnly := false
 	for i := 0; i < len(args); i++ {
 		if args[i] == "-p" && i+1 < len(args) {
 			prompt = args[i+1]
+		}
+		if args[i] == "--plan" {
+			planOnly = true
 		}
 	}
 	emit := func(v any) {
@@ -54,6 +65,24 @@ func RunMock(args []string) int {
 		fmt.Fprintln(os.Stdout, string(b))
 	}
 	emit(map[string]any{"type": "system", "subtype": "init", "session_id": "mock-session-1"})
+
+	// Plan-only: propose, execute nothing.
+	if planOnly {
+		emit(map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"content": []map[string]any{{"type": "text", "text": "Planning: " + prompt}},
+			},
+		})
+		emit(map[string]any{
+			"type":       "result",
+			"subtype":    "success",
+			"session_id": "mock-session-1",
+			"is_error":   false,
+			"result":     "PLAN for: " + prompt + "\n1. inspect\n2. change\n3. verify",
+		})
+		return 0
+	}
 	// Assistant decides to run a tool.
 	emit(map[string]any{
 		"type": "assistant",

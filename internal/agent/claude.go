@@ -8,20 +8,32 @@ import (
 
 // ClaudeAdapter drives Claude Code in headless (`-p`) mode with streaming JSON.
 type ClaudeAdapter struct {
-	Bin            string   // launcher; defaults handled by caller ("claude")
-	PermissionMode string   // --permission-mode value
-	ExtraArgs      []string // appended verbatim
+	Bin             string   // launcher; defaults handled by caller ("claude")
+	PermissionMode  string   // --permission-mode value
+	AllowedTools    string   // --allowedTools value (patterns, e.g. "Bash(git *),Edit")
+	DisallowedTools string   // --disallowedTools value
+	ExtraArgs       []string // appended verbatim
 }
 
 // NewClaudeAdapter constructs a Claude Code adapter.
-func NewClaudeAdapter(bin, permissionMode string, extraArgs []string) *ClaudeAdapter {
+func NewClaudeAdapter(bin, permissionMode, allowedTools, disallowedTools string, extraArgs []string) *ClaudeAdapter {
 	if bin == "" {
 		bin = "claude"
 	}
-	return &ClaudeAdapter{Bin: bin, PermissionMode: permissionMode, ExtraArgs: extraArgs}
+	return &ClaudeAdapter{
+		Bin:             bin,
+		PermissionMode:  permissionMode,
+		AllowedTools:    allowedTools,
+		DisallowedTools: disallowedTools,
+		ExtraArgs:       extraArgs,
+	}
 }
 
 func (a *ClaudeAdapter) Name() string { return "claude" }
+
+// SupportsPlanOnly reports that Claude Code can propose without executing, via
+// --permission-mode plan.
+func (a *ClaudeAdapter) SupportsPlanOnly() bool { return true }
 
 func (a *ClaudeAdapter) Available() (bool, string) {
 	if p, err := exec.LookPath(a.Bin); err == nil {
@@ -42,8 +54,20 @@ func (a *ClaudeAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 		"--output-format", "stream-json",
 		"--verbose",
 	}
-	if a.PermissionMode != "" {
+	// Plan mode overrides the configured permission mode: the point of a
+	// plan-only turn is that nothing runs, so it must win.
+	switch {
+	case spec.PlanOnly:
+		args = append(args, "--permission-mode", "plan")
+	case a.PermissionMode != "":
 		args = append(args, "--permission-mode", a.PermissionMode)
+	}
+	// Tool policy: server-side bounds on what the headless worker may do.
+	if a.AllowedTools != "" {
+		args = append(args, "--allowedTools", a.AllowedTools)
+	}
+	if a.DisallowedTools != "" {
+		args = append(args, "--disallowedTools", a.DisallowedTools)
 	}
 	if spec.Model != "" {
 		args = append(args, "--model", spec.Model)

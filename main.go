@@ -56,7 +56,7 @@ func main() {
 	cfg := config.Load()
 
 	reg := agent.NewRegistry(
-		agent.NewClaudeAdapter(cfg.ClaudeBin, cfg.PermissionMode, cfg.ClaudeExtraArgs),
+		agent.NewClaudeAdapter(cfg.ClaudeBin, cfg.PermissionMode, cfg.AllowedTools, cfg.DisallowedTools, cfg.ClaudeExtraArgs),
 		agent.NewCursorAdapter(cfg.CursorBin, cfg.CursorExtraArgs),
 		agent.NewCustomAdapter(cfg.CustomName, cfg.CustomBin, cfg.CustomArgs),
 		agent.NewMockAdapter(),
@@ -95,6 +95,8 @@ const instructions = `This server delegates coding/ops tasks to a headless CLI a
 PREFERRED (seamless, no polling):
 - agent_run_task — delegate a task and WAIT; the tool streams live progress notifications while the agent works, then returns the final result inline. Use this by default.
 - agent_run_followup — continue the same session with another instruction, same streaming behavior.
+
+IMPORTANT — you cannot stop the worker once it starts. Progress notifications are informational and arrive after each step has already run, so there is no way to veto an action mid-task. For anything risky, destructive, or hard to undo (deleting data, touching production, force-pushing, changing infrastructure), call agent_plan_task FIRST: it makes the agent propose its steps while executing nothing. Show that plan to the user, and only then call agent_run_followup on the returned task_id to execute it.
 
 ADVANCED (parallel / fire-and-forget):
 - agent_start_task — start a task in the background, returns a task_id immediately. Use only to run multiple agents at once or to kick something off and check later.
@@ -147,10 +149,11 @@ type listResult struct {
 }
 
 type agentInfo struct {
-	Name      string `json:"name"`
-	Available bool   `json:"available"`
-	Detail    string `json:"detail"`
-	IsDefault bool   `json:"is_default"`
+	Name             string `json:"name"`
+	Available        bool   `json:"available"`
+	Detail           string `json:"detail"`
+	IsDefault        bool   `json:"is_default"`
+	SupportsPlanOnly bool   `json:"supports_plan_only"`
 }
 
 type agentsResult struct {
@@ -162,6 +165,19 @@ type agentsResult struct {
 
 func textResult(msg string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: msg}}}
+}
+
+// checkExtraArgs enforces the extra_args policy. It fails closed: `extra_args`
+// is appended after the operator's configured flags, so allowing it by default
+// would let the calling model hand the agent e.g.
+// --dangerously-skip-permissions and void the server's permission policy.
+func checkExtraArgs(cfg config.Config, extra []string) error {
+	if len(extra) > 0 && !cfg.AllowExtraArgs {
+		return fmt.Errorf("extra_args is disabled on this server: refusing to pass %v to the agent, "+
+			"because arbitrary flags can override the configured permission policy. "+
+			"The operator can enable it with CLI_AGENT_MCP_ALLOW_EXTRA_ARGS=true", extra)
+	}
+	return nil
 }
 
 // resolveTarget picks the adapter and validated cwd for a task, returning a
@@ -237,6 +253,20 @@ func finishText(snap task.Snapshot) string {
 	return header + "\n\n" + body
 }
 
+// planText frames the outcome of a plan-only run, making it unmistakable that
+// nothing ran and stating how to proceed.
+func planText(snap task.Snapshot) string {
+	body := snap.Result
+	if body == "" {
+		body = fmt.Sprintf("(agent produced no plan text; status=%s)", snap.Status)
+	}
+	if snap.IsError || snap.Status == task.StatusFailed {
+		return fmt.Sprintf("Planning task %s FAILED (status %q). Nothing was executed.\n\n%s", snap.ID, snap.Status, body)
+	}
+	return fmt.Sprintf("Task %s planned — NOTHING WAS EXECUTED.\n\n%s\n\nReview this with the user. To carry it out, call agent_run_followup with task_id=%s.",
+		snap.ID, body, snap.ID)
+}
+
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		return s[:i]
@@ -259,6 +289,9 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if strings.TrimSpace(in.Prompt) == "" {
 			return textResult("error: prompt is required"), task.Snapshot{}, fmt.Errorf("prompt is required")
 		}
+		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
+			return textResult("error: " + err.Error()), task.Snapshot{}, err
+		}
 		a, cwd, emsg, err := resolveTarget(reg, cfg, in.Agent, in.Cwd)
 		if err != nil {
 			return textResult("error: " + emsg), task.Snapshot{}, err
@@ -276,11 +309,48 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
+		Name: "agent_plan_task",
+		Description: "Ask the agent to PLAN a task WITHOUT executing it: it inspects the code and proposes the steps it would take, but changes nothing and runs no commands. " +
+			"Use this first for anything risky or destructive, show the plan to the user, then call agent_run_followup with the returned task_id to actually carry it out. " +
+			"Fails if the selected agent cannot guarantee plan-only execution.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in startInput) (*mcp.CallToolResult, task.Snapshot, error) {
+		if strings.TrimSpace(in.Prompt) == "" {
+			return textResult("error: prompt is required"), task.Snapshot{}, fmt.Errorf("prompt is required")
+		}
+		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
+			return textResult("error: " + err.Error()), task.Snapshot{}, err
+		}
+		a, cwd, emsg, err := resolveTarget(reg, cfg, in.Agent, in.Cwd)
+		if err != nil {
+			return textResult("error: " + emsg), task.Snapshot{}, err
+		}
+		// Fail closed: never fall back to executing when plan-only was requested.
+		if !agent.CanPlan(a) {
+			msg := fmt.Sprintf("agent %q cannot guarantee plan-only execution, so refusing to run: it would carry the task out instead of planning it", a.Name())
+			return textResult("error: " + msg), task.Snapshot{}, fmt.Errorf("%s", msg)
+		}
+		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+			Prompt:    in.Prompt,
+			Model:     in.Model,
+			ExtraArgs: in.ExtraArgs,
+			PlanOnly:  true,
+		}, newProgressSink(ctx, req))
+		if err != nil {
+			return textResult("error: " + err.Error()), task.Snapshot{}, err
+		}
+		snap := t.Snapshot()
+		return textResult(planText(snap)), snap, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_run_followup",
 		Description: "Continue a finished task's session with a new instruction and WAIT for it to finish, streaming live progress (same seamless mode as agent_run_task). Resumes the same agent conversation.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in followupInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
 			return textResult("error: prompt is required"), task.Snapshot{}, fmt.Errorf("prompt is required")
+		}
+		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
+			return textResult("error: " + err.Error()), task.Snapshot{}, err
 		}
 		t, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.ExtraArgs, newProgressSink(ctx, req))
 		if err != nil {
@@ -296,6 +366,9 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in startInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
 			return textResult("error: prompt is required"), task.Snapshot{}, fmt.Errorf("prompt is required")
+		}
+		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
+			return textResult("error: " + err.Error()), task.Snapshot{}, err
 		}
 		a, cwd, emsg, err := resolveTarget(reg, cfg, in.Agent, in.Cwd)
 		if err != nil {
@@ -362,6 +435,9 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if strings.TrimSpace(in.Prompt) == "" {
 			return textResult("error: prompt is required"), task.Snapshot{}, fmt.Errorf("prompt is required")
 		}
+		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
+			return textResult("error: " + err.Error()), task.Snapshot{}, err
+		}
 		t, err := mgr.Followup(in.TaskID, in.Prompt, in.ExtraArgs)
 		if err != nil {
 			return textResult("error: " + err.Error()), task.Snapshot{}, err
@@ -397,10 +473,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		for _, a := range reg.All() {
 			ok, detail := a.Available()
 			infos = append(infos, agentInfo{
-				Name:      a.Name(),
-				Available: ok,
-				Detail:    detail,
-				IsDefault: a.Name() == cfg.DefaultAgent,
+				Name:             a.Name(),
+				Available:        ok,
+				Detail:           detail,
+				IsDefault:        a.Name() == cfg.DefaultAgent,
+				SupportsPlanOnly: agent.CanPlan(a),
 			})
 		}
 		return textResult(fmt.Sprintf("Default agent: %s", cfg.DefaultAgent)),
@@ -426,11 +503,21 @@ Configuration (environment variables):
   CLI_AGENT_MCP_CLAUDE_BIN         Claude Code launcher                 (default: claude)
   CLI_AGENT_MCP_CURSOR_BIN         Cursor launcher fallback             (default: cursor-agent)
   CLI_AGENT_MCP_PERMISSION_MODE    Claude --permission-mode             (default: acceptEdits)
+                                     acceptEdits|auto|bypassPermissions|manual|dontAsk|plan
   CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS  Extra Claude flags (';'-separated)
   CLI_AGENT_MCP_CURSOR_EXTRA_ARGS  Extra Cursor flags (';'-separated)
   CLI_AGENT_MCP_DEFAULT_CWD        Default working directory
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
+
+Bounding what the worker may do (recommended over a permissive mode):
+  CLI_AGENT_MCP_ALLOWED_TOOLS      Claude --allowedTools allowlist, patterns supported.
+                                   e.g. "Bash(git *),Bash(npm test),Edit,Read"
+  CLI_AGENT_MCP_DISALLOWED_TOOLS   Claude --disallowedTools denylist.
+  CLI_AGENT_MCP_ALLOW_EXTRA_ARGS   Let callers pass arbitrary agent flags via the
+                                   tool's extra_args   (default: false)
+                                   Keep this OFF: the caller is a model, and extra
+                                   flags can override the permission policy above.
 
 Custom agent (drive any CLI without writing Go):
   CLI_AGENT_MCP_CUSTOM_BIN         The agent's executable
