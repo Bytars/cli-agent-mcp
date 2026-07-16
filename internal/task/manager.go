@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/andresh0816/cli-agent-mcp/internal/agent"
+	"github.com/andresh0816/cli-agent-mcp/internal/audit"
 )
 
 // Status is the lifecycle state of a task's most recent turn.
@@ -66,6 +67,7 @@ type Task struct {
 	canceledRequested bool
 
 	adapter agent.Adapter
+	audit   *audit.Logger
 }
 
 // Snapshot is an immutable view of a Task for serialization.
@@ -119,6 +121,41 @@ func (t *Task) Snapshot() Snapshot {
 	return t.snapshot()
 }
 
+// WatchFrom blocks until new output appears past `since`, the task finishes, or
+// timeout elapses (or ctx is cancelled) — then returns the new lines and state.
+// It is the primitive for supervised "director" mode: an orchestrator watches a
+// backgrounded task in near-real-time and decides whether to let it continue or
+// cancel it, without busy-polling.
+func (t *Task) WatchFrom(ctx context.Context, since int, timeout time.Duration) (lines []string, newSince, total int, status Status, running bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		t.mu.Lock()
+		total = len(t.lines)
+		status = t.status
+		running = t.running
+		if since < 0 {
+			since = 0
+		}
+		if since > total {
+			since = total
+		}
+		ready := total > since || !running || time.Now().After(deadline)
+		if ready {
+			out := make([]string, total-since)
+			copy(out, t.lines[since:total])
+			t.mu.Unlock()
+			return out, total, total, status, running
+		}
+		t.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return nil, since, total, status, running
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+}
+
 // Output returns lines[since:since+max]. since is 0-based; max<=0 means "all".
 func (t *Task) Output(since, max int) (from, to, total int, text string) {
 	t.mu.Lock()
@@ -150,6 +187,7 @@ type Manager struct {
 	order    []string
 	maxTasks int
 	counter  atomic.Uint64
+	audit    *audit.Logger
 }
 
 // NewManager builds a task manager retaining up to maxTasks tasks.
@@ -159,6 +197,9 @@ func NewManager(maxTasks int) *Manager {
 	}
 	return &Manager{tasks: make(map[string]*Task), maxTasks: maxTasks}
 }
+
+// SetAudit attaches an audit logger; nil or a disabled logger is fine.
+func (m *Manager) SetAudit(a *audit.Logger) { m.audit = a }
 
 func newID(n uint64) string {
 	var b [4]byte
@@ -217,6 +258,7 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*T
 		Cwd:       cwd,
 		Model:     spec.Model,
 		adapter:   a,
+		audit:     m.audit,
 		status:    StatusRunning,
 		startedAt: time.Now(),
 	}
@@ -243,6 +285,7 @@ func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd str
 		Cwd:       cwd,
 		Model:     spec.Model,
 		adapter:   a,
+		audit:     m.audit,
 		status:    StatusRunning,
 		startedAt: time.Now(),
 	}
@@ -347,7 +390,8 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	t.exitCode = nil
 	t.endedAt = time.Time{}
 	turnStart := len(t.lines)
-	t.turns = append(t.turns, TurnInfo{Prompt: spec.Prompt, StartLine: turnStart, StartedAt: time.Now()})
+	turnStarted := time.Now()
+	t.turns = append(t.turns, TurnInfo{Prompt: spec.Prompt, StartLine: turnStart, StartedAt: turnStarted})
 	t.mu.Unlock()
 
 	fail := func(msg string) {
@@ -369,6 +413,17 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	}
 	cmd.Dir = spec.Cwd
 	// cmd.Env left nil → child inherits our full environment (VPN, SSH agent).
+	configureCancel(cmd) // make cancellation kill the whole process tree
+
+	t.audit.Log("turn_start", map[string]any{
+		"task_id":   t.ID,
+		"agent":     t.AgentName,
+		"cwd":       spec.Cwd,
+		"prompt":    spec.Prompt,
+		"plan_only": spec.PlanOnly,
+		"resume":    spec.SessionID != "",
+		"command":   cmd.Args,
+	})
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -420,7 +475,23 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 			t.resultText = t.lastText
 		}
 	}
+	endStatus := t.status
+	endErr := t.isError
+	endResult := t.resultText
+	var endExit int
+	if t.exitCode != nil {
+		endExit = *t.exitCode
+	}
 	t.mu.Unlock()
+
+	t.audit.Log("turn_end", map[string]any{
+		"task_id":     t.ID,
+		"status":      string(endStatus),
+		"is_error":    endErr,
+		"exit_code":   endExit,
+		"duration_ms": time.Since(turnStarted).Milliseconds(),
+		"result":      truncateStr(endResult, 500),
+	})
 }
 
 const (
@@ -431,6 +502,13 @@ const (
 func useOutputAsResult(a agent.Adapter) bool {
 	r, ok := a.(agent.ResultFromOutput)
 	return ok && r.UseOutputAsResult()
+}
+
+func truncateStr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 // tailLines joins the last maxLines lines, capped at maxChars from the end.
@@ -487,6 +565,13 @@ func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup)
 					}
 				}
 				t.mu.Unlock()
+				if ev.ToolName != "" {
+					t.audit.Log("tool_use", map[string]any{
+						"task_id": t.ID,
+						"tool":    ev.ToolName,
+						"input":   ev.ToolInput,
+					})
+				}
 				if sink != nil {
 					sink(ev)
 				}
@@ -538,6 +623,7 @@ func (m *Manager) Cancel(id string) (Snapshot, error) {
 	t.canceledRequested = true
 	cancel := t.cancel
 	t.mu.Unlock()
+	t.audit.Log("cancel", map[string]any{"task_id": t.ID})
 	if cancel != nil {
 		cancel()
 	}

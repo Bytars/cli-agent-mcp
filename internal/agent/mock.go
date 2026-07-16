@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // MockAdapter is a self-contained agent used for testing the full
@@ -42,6 +45,11 @@ func (a *MockAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, err
 	if spec.PlanOnly {
 		args = append(args, "--plan")
 	}
+	// A "sleep:<ms>" prompt makes the mock run long enough to exercise
+	// cancellation / watching against a still-running task.
+	if ms, ok := strings.CutPrefix(spec.Prompt, "sleep:"); ok {
+		args = append(args, "--sleep-ms", ms)
+	}
 	return exec.CommandContext(ctx, a.selfExe, args...), nil
 }
 
@@ -52,6 +60,7 @@ func (a *MockAdapter) ParseLine(line string) Event { return parseClaudeStreamLin
 func RunMock(args []string) int {
 	prompt := "no prompt"
 	planOnly := false
+	sleepMs := 0
 	for i := 0; i < len(args); i++ {
 		if args[i] == "-p" && i+1 < len(args) {
 			prompt = args[i+1]
@@ -59,12 +68,22 @@ func RunMock(args []string) int {
 		if args[i] == "--plan" {
 			planOnly = true
 		}
+		if args[i] == "--sleep-ms" && i+1 < len(args) {
+			sleepMs, _ = strconv.Atoi(args[i+1])
+		}
 	}
 	emit := func(v any) {
 		b, _ := json.Marshal(v)
 		fmt.Fprintln(os.Stdout, string(b))
 	}
 	emit(map[string]any{"type": "system", "subtype": "init", "session_id": "mock-session-1"})
+
+	// Simulate a long-running turn (used to test cancellation / watching). If
+	// the parent kills us mid-sleep, no result is ever emitted — exactly what an
+	// interrupted real agent looks like.
+	if sleepMs > 0 {
+		time.Sleep(time.Duration(sleepMs) * time.Millisecond)
+	}
 
 	// Plan-only: propose, execute nothing.
 	if planOnly {

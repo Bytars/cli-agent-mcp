@@ -19,10 +19,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/andresh0816/cli-agent-mcp/internal/agent"
+	"github.com/andresh0816/cli-agent-mcp/internal/audit"
 	"github.com/andresh0816/cli-agent-mcp/internal/config"
 	"github.com/andresh0816/cli-agent-mcp/internal/task"
 )
@@ -63,6 +65,16 @@ func main() {
 	)
 	mgr := task.NewManager(cfg.MaxTasks)
 
+	auditLog, err := audit.New(cfg.AuditLog)
+	if err != nil {
+		log.Fatalf("opening audit log %q: %v", cfg.AuditLog, err)
+	}
+	defer auditLog.Close()
+	mgr.SetAudit(auditLog)
+	if auditLog.Enabled() {
+		log.Printf("audit log: %s", cfg.AuditLog)
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "--list-agents" {
 		for _, a := range reg.All() {
 			ok, detail := a.Available()
@@ -98,14 +110,16 @@ PREFERRED (seamless, no polling):
 
 IMPORTANT — you cannot stop the worker once it starts. Progress notifications are informational and arrive after each step has already run, so there is no way to veto an action mid-task. For anything risky, destructive, or hard to undo (deleting data, touching production, force-pushing, changing infrastructure), call agent_plan_task FIRST: it makes the agent propose its steps while executing nothing. Show that plan to the user, and only then call agent_run_followup on the returned task_id to execute it.
 
-ADVANCED (parallel / fire-and-forget):
-- agent_start_task — start a task in the background, returns a task_id immediately. Use only to run multiple agents at once or to kick something off and check later.
-- agent_task_status / agent_get_output — poll status and read the transcript of a backgrounded task.
-- agent_send_followup — non-blocking follow-up on a backgrounded task.
+DIRECTOR MODE (you supervise and can interrupt):
+When the user wants you actively watching — or the task is risky — run it in the background and steer it yourself:
+1. agent_start_task — start the task, get a task_id (returns immediately).
+2. agent_watch — blocks until new output arrives, returns what the worker just did. Between calls YOU are active and reasoning, so this is where you judge whether it's on track. Pass back next_since_line each call, and keep looping while running is true.
+3. If it goes off the rails, agent_cancel_task stops it immediately (kills the whole process tree). To redirect, cancel and agent_start_task a corrected task, or agent_send_followup once it has finished.
+This is the way to "watch it like the user would and stop it if it drifts." Prefer it over agent_run_task whenever supervision matters.
 
-Utility: agent_cancel_task, agent_list_tasks, agent_list_agents.
+Also: agent_task_status / agent_get_output (poll/read on demand), agent_list_tasks, agent_list_agents.
 
-Long tasks may take minutes; agent_run_task keeps the connection alive via progress updates, so just let it run.`
+Honest limits: agent_run_task's progress notifications are informational and post-hoc — you cannot veto a step mid-call. The worker runs one turn to completion, so you cannot inject a prompt into a turn already in flight; you steer between turns (cancel + restart, or follow-up). Interruption is stopping the process, not undoing what already ran — so for destructive work, agent_plan_task first.`
 
 // ---- tool input types ---------------------------------------------------
 
@@ -133,6 +147,12 @@ type outputInput struct {
 	MaxLines  int    `json:"max_lines,omitempty" jsonschema:"Maximum number of lines to return. 0 means all."`
 }
 
+type watchInput struct {
+	TaskID         string `json:"task_id" jsonschema:"The backgrounded task id to watch."`
+	SinceLine      int    `json:"since_line,omitempty" jsonschema:"Line index to watch from. Pass the next_since_line returned by the previous call to get only new output."`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"How long to wait for new output before returning (default 25, max 55)."`
+}
+
 // ---- tool output types --------------------------------------------------
 
 type outputResult struct {
@@ -142,6 +162,14 @@ type outputResult struct {
 	ToLine     int    `json:"to_line"`
 	TotalLines int    `json:"total_lines"`
 	Text       string `json:"text"`
+}
+
+type watchResult struct {
+	TaskID       string `json:"task_id"`
+	Status       string `json:"status"`
+	Running      bool   `json:"running"`
+	NewSinceLine int    `json:"next_since_line"`
+	Text         string `json:"text"`
 }
 
 type listResult struct {
@@ -429,6 +457,44 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
+		Name: "agent_watch",
+		Description: "Supervise a backgrounded task in near-real-time. Blocks until new output arrives or the task ends, then returns the new transcript lines. " +
+			"This is how you DIRECT a worker: start it with agent_start_task, then loop calling agent_watch (passing back next_since_line each time) to read what it's doing as it happens. " +
+			"If you see it going off the rails, call agent_cancel_task to stop it immediately; to steer, cancel and start a corrected task, or agent_send_followup once it finishes. " +
+			"Keep looping while running is true.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in watchInput) (*mcp.CallToolResult, watchResult, error) {
+		t, ok := mgr.Get(in.TaskID)
+		if !ok {
+			return textResult("error: unknown task " + in.TaskID), watchResult{}, fmt.Errorf("unknown task %q", in.TaskID)
+		}
+		timeout := in.TimeoutSeconds
+		if timeout <= 0 {
+			timeout = 25
+		}
+		if timeout > 55 {
+			timeout = 55
+		}
+		lines, newSince, _, status, running := t.WatchFrom(ctx, in.SinceLine, time.Duration(timeout)*time.Second)
+		text := strings.Join(lines, "\n")
+		res := watchResult{
+			TaskID:       t.ID,
+			Status:       string(status),
+			Running:      running,
+			NewSinceLine: newSince,
+			Text:         text,
+		}
+		body := text
+		if body == "" {
+			if running {
+				body = fmt.Sprintf("(no new output yet; task still running — call agent_watch again with since_line=%d)", newSince)
+			} else {
+				body = fmt.Sprintf("(task %s; no more output)", status)
+			}
+		}
+		return textResult(body), res, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_send_followup",
 		Description: "Continue a finished task's session with a new instruction (resumes the same agent conversation). Fails if the task is still running.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in followupInput) (*mcp.CallToolResult, task.Snapshot, error) {
@@ -509,6 +575,7 @@ Configuration (environment variables):
   CLI_AGENT_MCP_DEFAULT_CWD        Default working directory
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
+  CLI_AGENT_MCP_AUDIT_LOG          Path to a JSONL audit log of what the worker did
 
 Bounding what the worker may do (recommended over a permissive mode):
   CLI_AGENT_MCP_ALLOWED_TOOLS      Claude --allowedTools allowlist, patterns supported.

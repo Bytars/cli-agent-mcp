@@ -72,6 +72,10 @@ type Config struct {
 
 	// MaxTasks caps the number of tasks retained in memory.
 	MaxTasks int
+
+	// AuditLog is a file path for a JSONL audit trail of everything the worker
+	// was asked to do. Empty disables it.
+	AuditLog string
 }
 
 func getenv(key, def string) string {
@@ -146,5 +150,6 @@ func Load() Config {
 		DefaultCwd:      getenv("CLI_AGENT_MCP_DEFAULT_CWD", ""),
 		AllowedCwds:     allowed,
 		MaxTasks:        maxTasks,
+		AuditLog:        getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
 	}
 }
