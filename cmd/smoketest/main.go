@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,6 +79,36 @@ func main() {
 		fmt.Printf("status=%s\n", jsonField(res, "status"))
 		fmt.Printf("RESULT:\n%s\n", textContent(res))
 		fmt.Println("PLAN-ONLY DONE")
+		return
+	}
+
+	// SMOKE_ONLY=cancel starts a long-running task and interrupts it, proving the
+	// worker actually stops before it would have finished.
+	if os.Getenv("SMOKE_ONLY") == "cancel" {
+		fmt.Println("\n== agent_cancel_task (interrupt a running task) ==")
+		st := callTool(ctx, session, "agent_start_task", map[string]any{
+			"prompt": "sleep:10000", // mock would run ~10s if left alone
+			"agent":  agentName,
+			"cwd":    cwd,
+		})
+		id := jsonField(st, "task_id")
+		fmt.Printf("  started %s (would run ~10s)\n", id)
+		time.Sleep(700 * time.Millisecond) // let it get going
+		start := time.Now()
+		cr := callTool(ctx, session, "agent_cancel_task", map[string]any{"task_id": id})
+		// Give the run goroutine a beat to finalize, then read status.
+		time.Sleep(400 * time.Millisecond)
+		final := callTool(ctx, session, "agent_task_status", map[string]any{"task_id": id})
+		elapsed := time.Since(start)
+		fmt.Printf("  cancel returned status=%s; final status=%s after %v\n",
+			jsonField(cr, "status"), jsonField(final, "status"), elapsed.Round(time.Millisecond))
+		if jsonField(final, "status") != "canceled" {
+			log.Fatalf("FAIL: expected status canceled, got %q", jsonField(final, "status"))
+		}
+		if elapsed > 5*time.Second {
+			log.Fatalf("FAIL: cancel took too long (%v) — the process was not really interrupted", elapsed)
+		}
+		fmt.Println("CANCEL-ONLY DONE (interrupt worked)")
 		return
 	}
 
@@ -148,6 +179,42 @@ func main() {
 		if !strings.Contains(planResult, "PLAN") {
 			log.Fatalf("FAIL: expected a plan in the result, got %q", planResult)
 		}
+	}
+
+	// 0d. director mode: start in the background and watch it live.
+	fmt.Println("\n== agent_watch (director-mode supervise loop) ==")
+	ws := callTool(ctx, session, "agent_start_task", map[string]any{
+		"prompt": prompt,
+		"agent":  agentName,
+		"cwd":    cwd,
+	})
+	wtask := jsonField(ws, "task_id")
+	since := 0
+	iters := 0
+	running := "true"
+	sawOutput := false
+	for i := 0; i < 60; i++ {
+		wr := callTool(ctx, session, "agent_watch", map[string]any{
+			"task_id":         wtask,
+			"since_line":      since,
+			"timeout_seconds": 5,
+		})
+		iters++
+		if txt := textContent(wr); strings.TrimSpace(txt) != "" && !strings.HasPrefix(txt, "(") {
+			sawOutput = true
+		}
+		since = toInt(jsonField(wr, "next_since_line"))
+		running = jsonField(wr, "running")
+		if running == "false" {
+			break
+		}
+	}
+	fmt.Printf("  watched %d call(s); final running=%s, next_since_line=%d, saw_output=%v\n", iters, running, since, sawOutput)
+	if running != "false" {
+		log.Fatal("FAIL: agent_watch never observed the task finishing")
+	}
+	if !sawOutput {
+		log.Fatal("FAIL: agent_watch returned no worker output")
 	}
 
 	// 1. start a task
@@ -266,6 +333,14 @@ func jsonField(res *mcp.CallToolResult, key string) string {
 		}
 	}
 	return ""
+}
+
+func toInt(s string) int {
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0
+	}
+	return int(f)
 }
 
 func firstLine(s string) string {

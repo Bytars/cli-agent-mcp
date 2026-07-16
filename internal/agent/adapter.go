@@ -38,6 +38,8 @@ type Event struct {
 	Final      bool   // true when this is the terminal result event
 	FinalError bool   // for a final event: whether the run reported an error
 	FinalText  string // for a final event: the summarized result text
+	ToolName   string // when the worker invoked a tool, its name (for the audit trail)
+	ToolInput  string // the tool's input, compact JSON, truncated (for the audit trail)
 }
 
 // Adapter knows how to launch and interpret one specific CLI agent.

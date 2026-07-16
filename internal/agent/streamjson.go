@@ -21,9 +21,22 @@ type claudeMessage struct {
 		Type    string          `json:"type"`
 		Text    string          `json:"text"`     // text blocks
 		Name    string          `json:"name"`     // tool_use blocks
+		Input   json.RawMessage `json:"input"`    // tool_use input
 		Content json.RawMessage `json:"content"`  // tool_result output: string or []block
 		IsError bool            `json:"is_error"` // tool_result blocks
 	} `json:"content"`
+}
+
+// truncateJSON renders raw JSON compactly and caps its length for the audit log.
+func truncateJSON(raw json.RawMessage, max int) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	s := strings.Join(strings.Fields(string(raw)), " ")
+	if len(s) > max {
+		return s[:max] + "…"
+	}
+	return s
 }
 
 // parseClaudeStreamLine interprets one JSONL line emitted by Claude Code (and,
@@ -62,6 +75,10 @@ func parseClaudeStreamLine(line string) Event {
 					case "tool_use":
 						if c.Name != "" {
 							part = "⚙ using " + c.Name
+							// Capture structured tool use for the audit trail
+							// (keep the last one if several are in a message).
+							ev.ToolName = c.Name
+							ev.ToolInput = truncateJSON(c.Input, 400)
 						}
 					}
 					appendPart(&b, part)

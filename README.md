@@ -68,6 +68,11 @@ newline-delimited output. That gives a clean programmatic contract:
 - **Parallel / fire-and-forget.** `agent_start_task` returns a `task_id`
   immediately and runs in the background, so you can launch several workers at
   once and collect them with `agent_task_status` / `agent_get_output` later.
+- **Director / supervised.** Start in the background, then loop `agent_watch`
+  (a long-poll that returns the moment new output arrives) so the orchestrating
+  model reads the transcript *as it happens* and can `agent_cancel_task` the
+  instant it drifts. This is the closest thing to "the model watches over the
+  worker's shoulder and stops it." See [Director mode](#director-mode-supervise--interrupt).
 
 ## Tools
 
@@ -76,7 +81,8 @@ newline-delimited output. That gives a clean programmatic contract:
 | **`agent_run_task`** | **Preferred.** Delegate a task and wait, streaming live progress; returns the result inline. |
 | **`agent_plan_task`** | Have the agent **propose** a plan without executing anything. Use before risky work, then follow up to execute. |
 | **`agent_run_followup`** | Continue a session and wait, with the same live streaming. |
-| `agent_start_task` | Delegate without waiting; returns a `task_id` (background). For parallel/fire-and-forget. |
+| `agent_start_task` | Delegate without waiting; returns a `task_id` (background). For parallel or supervised use. |
+| **`agent_watch`** | Long-poll a backgrounded task: blocks until new output or completion, returns the new lines. The supervise-and-interrupt primitive. |
 | `agent_task_status` | Poll status (`running`/`done`/`failed`/`canceled`) and read the result of a backgrounded task. |
 | `agent_get_output` | Fetch the streamed transcript (supports incremental `since_line`/`max_lines`). |
 | `agent_send_followup` | Non-blocking follow-up on a backgrounded task. |
@@ -178,6 +184,7 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_DEFAULT_CWD` | server's cwd | Working directory when a call omits `cwd`. **Set this.** |
 | `CLI_AGENT_MCP_ALLOWED_CWDS` | — | If set, every task `cwd` must live under one of these roots (`;`-separated). |
 | `CLI_AGENT_MCP_MAX_TASKS` | `100` | Max retained tasks in memory. |
+| `CLI_AGENT_MCP_AUDIT_LOG` | — | Path to a JSONL audit log of what the worker did. See [Audit log](#audit-log). |
 | `CLI_AGENT_MCP_CUSTOM_BIN` | — | Executable for the custom agent (see below). |
 | `CLI_AGENT_MCP_CUSTOM_ARGS` | — | Argument template for the custom agent, `;`-separated. |
 | `CLI_AGENT_MCP_CUSTOM_NAME` | `custom` | Name to expose the custom agent as. |
@@ -224,6 +231,62 @@ becomes the task result.
 For a first-class integration (session resume, rich tool events), implement the
 small `agent.Adapter` interface in [`internal/agent`](internal/agent/adapter.go)
 — see `claude.go` for a fully-featured example. PRs welcome.
+
+## Director mode: supervise & interrupt
+
+The natural question is: *can the orchestrating model (e.g. Claude Desktop)
+watch the worker and stop it if it goes wrong, the way a human driving the CLI
+would?* Yes — but **not inside a blocking `agent_run_task` call.** During that
+call the model is suspended awaiting the result; the progress notifications go to
+the human's UI, not into the model's reasoning, so it can't intervene.
+
+To put the model in the director's seat, run the task in the background and let
+it supervise:
+
+1. `agent_start_task` → get a `task_id` (returns immediately).
+2. Loop `agent_watch` with the `task_id`, passing back the `next_since_line` it
+   returns each time. `agent_watch` blocks until new output arrives (or the task
+   ends), so the model reads the transcript *as it happens*. **Between calls the
+   model is active and reasoning** — that's where it judges whether the worker is
+   on track.
+3. If it drifts, `agent_cancel_task` stops it immediately — this kills the whole
+   process tree, not just the launcher, so nothing is left running.
+
+The server's tool instructions teach this flow, so a capable client will do it on
+its own when supervision matters.
+
+**Honest limits.** This is *observe-and-interrupt*, not *pre-approve*: the model
+reacts to a step after seeing it in the transcript, and interruption stops what's
+next — it can't undo what already ran. And because a worker turn runs to
+completion, you can't inject a prompt mid-turn; you steer *between* turns (cancel
+and restart with a corrected prompt, or `agent_send_followup`). That mirrors how
+a human drives one of these agents by hand. For anything destructive, combine
+this with `agent_plan_task` so judgment happens *before* execution.
+
+## Audit log
+
+Set `CLI_AGENT_MCP_AUDIT_LOG` to a file path to record an append-only JSONL trail
+of everything the worker was asked to do — useful when a headless agent can reach
+real infrastructure:
+
+```json
+"CLI_AGENT_MCP_AUDIT_LOG": "/var/log/cli-agent-mcp/audit.jsonl"
+```
+
+Each line is one event:
+
+- `turn_start` — task id, agent, cwd, the prompt, and the **exact command line
+  executed** (so you can see which permission mode and tool policy were applied).
+- `tool_use` — each tool the worker invoked, with its input (e.g. the actual
+  shell command it ran).
+- `turn_end` — status, exit code, duration, and a snippet of the result.
+- `cancel` — when a task was interrupted.
+
+```json
+{"ts":"2026-07-16T02:22:26Z","event":"turn_start","task_id":"task-1-…","agent":"claude","cwd":"/code/app","prompt":"run the tests","command":["claude","-p","run the tests","--output-format","stream-json","--verbose","--permission-mode","acceptEdits"]}
+{"ts":"2026-07-16T02:22:31Z","event":"tool_use","task_id":"task-1-…","tool":"Bash","input":"{\"command\":\"npm test\"}"}
+{"ts":"2026-07-16T02:22:44Z","event":"turn_end","task_id":"task-1-…","status":"done","exit_code":0,"duration_ms":13000}
+```
 
 ## ⚠️ Permissions & safety
 
@@ -346,7 +409,11 @@ internal/agent/
   mock.go                   built-in mock agent
   streamjson.go             Claude/mock stream-json parser
   tolerant.go               schema-tolerant parser for other agents
-internal/task/manager.go    task manager (spawn, pump, complete, resume, stream)
+internal/task/
+  manager.go                task manager (spawn, pump, complete, resume, stream, watch)
+  kill_windows.go           process-tree kill on cancel (Windows)
+  kill_other.go             process-group kill on cancel (Unix)
+internal/audit/audit.go     append-only JSONL audit trail
 cmd/smoketest/              end-to-end test via the MCP client
 ```
 
