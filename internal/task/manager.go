@@ -53,7 +53,8 @@ type Task struct {
 	mu                sync.Mutex
 	status            Status
 	sessionID         string
-	lines             []string
+	lines             []string // raw output lines
+	display           []string // aligned with lines: compact rendering, "" = noise
 	resultText        string
 	lastText          string // last human-facing text event of the current turn
 	isError           bool
@@ -65,6 +66,7 @@ type Task struct {
 	running           bool
 	cancel            context.CancelFunc
 	canceledRequested bool
+	timedOut          bool
 
 	adapter agent.Adapter
 	audit   *audit.Logger
@@ -126,7 +128,7 @@ func (t *Task) Snapshot() Snapshot {
 // It is the primitive for supervised "director" mode: an orchestrator watches a
 // backgrounded task in near-real-time and decides whether to let it continue or
 // cancel it, without busy-polling.
-func (t *Task) WatchFrom(ctx context.Context, since int, timeout time.Duration) (lines []string, newSince, total int, status Status, running bool) {
+func (t *Task) WatchFrom(ctx context.Context, since int, timeout time.Duration, compact bool) (text string, newSince, total int, status Status, running bool) {
 	deadline := time.Now().Add(timeout)
 	for {
 		t.mu.Lock()
@@ -141,8 +143,7 @@ func (t *Task) WatchFrom(ctx context.Context, since int, timeout time.Duration) 
 		}
 		ready := total > since || !running || time.Now().After(deadline)
 		if ready {
-			out := make([]string, total-since)
-			copy(out, t.lines[since:total])
+			out := t.joinRange(since, total, compact)
 			t.mu.Unlock()
 			return out, total, total, status, running
 		}
@@ -150,14 +151,16 @@ func (t *Task) WatchFrom(ctx context.Context, since int, timeout time.Duration) 
 
 		select {
 		case <-ctx.Done():
-			return nil, since, total, status, running
+			return "", since, total, status, running
 		case <-time.After(150 * time.Millisecond):
 		}
 	}
 }
 
 // Output returns lines[since:since+max]. since is 0-based; max<=0 means "all".
-func (t *Task) Output(since, max int) (from, to, total int, text string) {
+// When compact, noisy lines are dropped and each is rendered human-readably;
+// `since`/`total` always index the raw stream so the contract is stable.
+func (t *Task) Output(since, max int, compact bool) (from, to, total int, text string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	total = len(t.lines)
@@ -171,7 +174,21 @@ func (t *Task) Output(since, max int) (from, to, total int, text string) {
 	if max > 0 && since+max < end {
 		end = since + max
 	}
-	return since, end, total, strings.Join(t.lines[since:end], "\n")
+	return since, end, total, t.joinRange(since, end, compact)
+}
+
+// joinRange renders lines[from:to] as compact display or raw JSONL. Caller holds mu.
+func (t *Task) joinRange(from, to int, compact bool) string {
+	if !compact {
+		return strings.Join(t.lines[from:to], "\n")
+	}
+	var kept []string
+	for i := from; i < to && i < len(t.display); i++ {
+		if s := strings.TrimSpace(t.display[i]); s != "" {
+			kept = append(kept, t.display[i])
+		}
+	}
+	return strings.Join(kept, "\n")
 }
 
 // EventSink receives each parsed stdout event of a running turn, in order. It
@@ -188,6 +205,7 @@ type Manager struct {
 	maxTasks int
 	counter  atomic.Uint64
 	audit    *audit.Logger
+	timeout  time.Duration
 }
 
 // NewManager builds a task manager retaining up to maxTasks tasks.
@@ -200,6 +218,9 @@ func NewManager(maxTasks int) *Manager {
 
 // SetAudit attaches an audit logger; nil or a disabled logger is fine.
 func (m *Manager) SetAudit(a *audit.Logger) { m.audit = a }
+
+// SetTaskTimeout sets a per-turn timeout; zero disables it.
+func (m *Manager) SetTaskTimeout(d time.Duration) { m.timeout = d }
 
 func newID(n uint64) string {
 	var b [4]byte
@@ -303,8 +324,8 @@ func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd str
 
 // FollowupStreaming resumes a finished task's session with a new prompt, running
 // synchronously and forwarding events to sink.
-func (m *Manager) FollowupStreaming(ctx context.Context, id, prompt string, extraArgs []string, sink EventSink) (*Task, error) {
-	t, spec, err := m.prepareFollowup(id, prompt, extraArgs)
+func (m *Manager) FollowupStreaming(ctx context.Context, id, prompt string, allowedTools, extraArgs []string, sink EventSink) (*Task, error) {
+	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
 	if err != nil {
 		return nil, err
 	}
@@ -338,7 +359,7 @@ func (m *Manager) evictLocked() {
 // prepareFollowup validates that a task can be resumed and builds the RunSpec
 // for the next turn. It fails if the task is still running or never captured a
 // session id.
-func (m *Manager) prepareFollowup(id, prompt string, extraArgs []string) (*Task, agent.RunSpec, error) {
+func (m *Manager) prepareFollowup(id, prompt string, allowedTools, extraArgs []string) (*Task, agent.RunSpec, error) {
 	t, ok := m.Get(id)
 	if !ok {
 		return nil, agent.RunSpec{}, fmt.Errorf("unknown task %q", id)
@@ -357,17 +378,18 @@ func (m *Manager) prepareFollowup(id, prompt string, extraArgs []string) (*Task,
 		return nil, agent.RunSpec{}, errors.New("no session id captured for this task; cannot resume (start a new task instead)")
 	}
 	return t, agent.RunSpec{
-		Prompt:    prompt,
-		Cwd:       cwd,
-		Model:     model,
-		SessionID: session,
-		ExtraArgs: extraArgs,
+		Prompt:       prompt,
+		Cwd:          cwd,
+		Model:        model,
+		SessionID:    session,
+		AllowedTools: allowedTools,
+		ExtraArgs:    extraArgs,
 	}, nil
 }
 
 // Followup resumes a task's session with a new prompt, asynchronously.
-func (m *Manager) Followup(id, prompt string, extraArgs []string) (*Task, error) {
-	t, spec, err := m.prepareFollowup(id, prompt, extraArgs)
+func (m *Manager) Followup(id, prompt string, allowedTools, extraArgs []string) (*Task, error) {
+	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
 	if err != nil {
 		return nil, err
 	}
@@ -383,6 +405,7 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	t.status = StatusRunning
 	t.running = true
 	t.canceledRequested = false
+	t.timedOut = false
 	t.runErr = ""
 	t.resultText = ""
 	t.lastText = ""
@@ -401,7 +424,7 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		t.status = StatusFailed
 		t.runErr = msg
 		t.endedAt = time.Now()
-		t.appendLine("[error] " + msg)
+		t.appendLine("[error] "+msg, "✗ "+msg)
 		t.mu.Unlock()
 		cancel()
 	}
@@ -440,6 +463,19 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		return
 	}
 
+	// Safety net: a headless worker can hang forever (e.g. blocked on a
+	// permission prompt with no approver). If a timeout is configured, kill the
+	// process tree and mark the turn as timed out.
+	if m.timeout > 0 {
+		timer := time.AfterFunc(m.timeout, func() {
+			t.mu.Lock()
+			t.timedOut = true
+			t.mu.Unlock()
+			cancel()
+		})
+		defer timer.Stop()
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go t.pump(stdout, false, sink, &wg)
@@ -456,6 +492,9 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		t.exitCode = &code
 	}
 	switch {
+	case t.timedOut:
+		t.status = StatusFailed
+		t.runErr = fmt.Sprintf("timed out after %s (the agent may be blocked on a permission prompt with no approver; pre-approve the tool via allowed_tools / CLI_AGENT_MCP_ALLOWED_TOOLS)", m.timeout)
 	case t.canceledRequested:
 		t.status = StatusCanceled
 	case waitErr == nil && !t.isError:
@@ -523,9 +562,31 @@ func tailLines(lines []string, maxLines, maxChars int) string {
 	return s
 }
 
-// appendLine adds a line. Caller holds t.mu.
-func (t *Task) appendLine(line string) {
-	t.lines = append(t.lines, line)
+// appendLine adds a raw line and its compact rendering (which may be ""). The
+// two slices stay the same length so a raw line index also indexes its display
+// entry. Caller holds t.mu.
+func (t *Task) appendLine(raw, display string) {
+	t.lines = append(t.lines, raw)
+	t.display = append(t.display, display)
+}
+
+// renderEvent produces the compact, human-facing rendering of a parsed event,
+// or "" if the line is noise (init/config/rate-limit chatter).
+func renderEvent(ev agent.Event) string {
+	switch {
+	case ev.Final:
+		if ev.FinalError {
+			return "✗ " + ev.FinalText
+		}
+		return "✓ " + ev.FinalText
+	case ev.ToolName != "":
+		if ev.Text != "" {
+			return ev.Text
+		}
+		return "⚙ using " + ev.ToolName
+	default:
+		return ev.Text
+	}
 }
 
 // pump reads a stream line by line, parsing agent stdout for structured events.
@@ -543,7 +604,7 @@ func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup)
 		if line != "" {
 			if isErr {
 				t.mu.Lock()
-				t.appendLine("[stderr] " + line)
+				t.appendLine("[stderr] "+line, "⚠ "+strings.TrimSpace(line))
 				t.mu.Unlock()
 				if sink != nil {
 					sink(agent.Event{Raw: line, Text: "⚠ " + strings.TrimSpace(line)})
@@ -551,7 +612,7 @@ func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup)
 			} else {
 				ev := t.adapter.ParseLine(line)
 				t.mu.Lock()
-				t.appendLine(line)
+				t.appendLine(line, renderEvent(ev))
 				if ev.SessionID != "" {
 					t.sessionID = ev.SessionID
 				}

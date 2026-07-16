@@ -72,6 +72,46 @@ func TestClaudeCommand_PlanOnlyOverridesPermissionMode(t *testing.T) {
 	}
 }
 
+// A per-run allowed_tools request is merged with the server allowlist, and must
+// never be able to inject a CLI flag (values are joined into one argument, and
+// flag-looking entries are dropped).
+func TestClaudeCommand_PerRunAllowedTools(t *testing.T) {
+	a := NewClaudeAdapter("claude", "acceptEdits", "Read", "", nil)
+	args := argsFor(t, a, RunSpec{
+		Prompt:       "x",
+		AllowedTools: []string{"PowerShell", "Bash(git *)", "--dangerously-skip-permissions", ""},
+	})
+
+	// Server allowlist + safe per-run entries, comma-joined; the flag-looking
+	// and empty entries dropped.
+	if !hasFlagValue(args, "--allowedTools", "Read,PowerShell,Bash(git *)") {
+		t.Errorf("per-run allowed_tools not merged safely: %v", args)
+	}
+	if hasFlag(args, "--dangerously-skip-permissions") {
+		t.Errorf("allowed_tools injected a flag: %v", args)
+	}
+}
+
+func TestMergeAllowed(t *testing.T) {
+	cases := []struct {
+		configured string
+		perRun     []string
+		want       string
+	}{
+		{"", nil, ""},
+		{"Read,Edit", nil, "Read,Edit"},
+		{"", []string{"PowerShell"}, "PowerShell"},
+		{"Read", []string{"Bash(git *)"}, "Read,Bash(git *)"},
+		{"Read", []string{"--evil", "", "  ", "Edit"}, "Read,Edit"}, // sanitized
+		{" Read , Write ", nil, "Read,Write"},                       // trimmed
+	}
+	for _, c := range cases {
+		if got := mergeAllowed(c.configured, c.perRun); got != c.want {
+			t.Errorf("mergeAllowed(%q, %v) = %q, want %q", c.configured, c.perRun, got, c.want)
+		}
+	}
+}
+
 func TestClaudeCommand_ToolPolicy(t *testing.T) {
 	a := NewClaudeAdapter("claude", "acceptEdits", "Bash(git *),Edit", "Bash(rm *)", nil)
 	args := argsFor(t, a, RunSpec{Prompt: "x"})
