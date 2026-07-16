@@ -78,11 +78,21 @@ func RunMock(args []string) int {
 	}
 	emit(map[string]any{"type": "system", "subtype": "init", "session_id": "mock-session-1"})
 
-	// Simulate a long-running turn (used to test cancellation / watching). If
+	// Simulate a long-running turn (used to test cancellation / watching). It
+	// emits a few lines spaced across the sleep so watchers see live output; if
 	// the parent kills us mid-sleep, no result is ever emitted — exactly what an
 	// interrupted real agent looks like.
 	if sleepMs > 0 {
-		time.Sleep(time.Duration(sleepMs) * time.Millisecond)
+		const steps = 3
+		for i := 0; i < steps; i++ {
+			time.Sleep(time.Duration(sleepMs/steps) * time.Millisecond)
+			emit(map[string]any{
+				"type": "assistant",
+				"message": map[string]any{
+					"content": []map[string]any{{"type": "text", "text": fmt.Sprintf("working... step %d/%d", i+1, steps)}},
+				},
+			})
+		}
 	}
 
 	// Plan-only: propose, execute nothing.
