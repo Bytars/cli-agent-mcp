@@ -185,6 +185,8 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_ALLOWED_CWDS` | — | If set, every task `cwd` must live under one of these roots (`;`-separated). |
 | `CLI_AGENT_MCP_MAX_TASKS` | `100` | Max retained tasks in memory. |
 | `CLI_AGENT_MCP_AUDIT_LOG` | — | Path to a JSONL audit log of what the worker did. See [Audit log](#audit-log). |
+| `CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS` | `0` (off) | Kill a turn that runs longer than this — a safety net for a worker hung on a permission prompt. |
+| `CLI_AGENT_MCP_COMPACT` | `true` | `agent_get_output`/`agent_watch` return a filtered, readable transcript instead of raw JSONL (pass `raw: true` on a call to override). |
 | `CLI_AGENT_MCP_CUSTOM_BIN` | — | Executable for the custom agent (see below). |
 | `CLI_AGENT_MCP_CUSTOM_ARGS` | — | Argument template for the custom agent, `;`-separated. |
 | `CLI_AGENT_MCP_CUSTOM_NAME` | `custom` | Name to expose the custom agent as. |
@@ -337,6 +339,26 @@ cannot override it.
 > tools (removes prompts), but tools not on it still run. Treat it as "run these
 > without ceremony," never as "only these are allowed." Verified: with
 > `--allowedTools "Bash(git status)"`, the worker still happily ran `git log`.
+
+### Avoid headless stalls: pre-approving tools
+
+A tool the worker hasn't been trusted for yet can **stall a headless run** — it
+waits for an approval no one is there to give. Pre-approving via `--allowedTools`
+fixes that (that's what pre-approval is *for*). Two ways, neither of which needs
+the `extra_args` escape hatch:
+
+- **Operator default (all tasks):** set `CLI_AGENT_MCP_ALLOWED_TOOLS` in the
+  server env, e.g. `"PowerShell,Bash,Edit,Read"`.
+- **Per task:** pass `allowed_tools` on `agent_run_task` / `agent_start_task` /
+  `agent_plan_task` / the follow-ups, e.g. `["Bash(git *)","PowerShell"]`. The
+  server merges it with its own allowlist and joins everything into a single
+  argument, so a value can never be smuggled in as a CLI flag — and the deny
+  policy still wins. This is the safe way for a client to request scoped
+  permissions without opening `extra_args`.
+
+Belt and suspenders: set `CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS` so a run that stalls
+anyway is killed with a clear "timed out — possibly blocked on a permission
+prompt" error instead of hanging forever.
 
 Because a denylist is inherently incomplete, it is one layer — combine it with the
 directory boundary, plan-first, director-mode supervision, and the audit log

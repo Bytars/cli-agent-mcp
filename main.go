@@ -74,8 +74,12 @@ func main() {
 	}
 	defer auditLog.Close()
 	mgr.SetAudit(auditLog)
+	mgr.SetTaskTimeout(cfg.TaskTimeout)
 	if auditLog.Enabled() {
 		log.Printf("audit log: %s", cfg.AuditLog)
+	}
+	if cfg.TaskTimeout > 0 {
+		log.Printf("task timeout: %s", cfg.TaskTimeout)
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "--list-agents" {
@@ -111,6 +115,8 @@ PREFERRED (seamless, no polling):
 - agent_run_task — delegate a task and WAIT; the tool streams live progress notifications while the agent works, then returns the final result inline. Use this by default.
 - agent_run_followup — continue the same session with another instruction, same streaming behavior.
 
+If a task needs to run shell commands (git, tests, ssh, etc.) and seems to stall, the headless worker is likely waiting for a tool approval no one can give. Pass allowed_tools to pre-approve them, e.g. allowed_tools: ["Bash(git *)","PowerShell","Edit"]. This only pre-approves; the server's deny policy still applies. (Do not ask for extra_args — it's disabled by design.)
+
 IMPORTANT — you cannot stop the worker once it starts. Progress notifications are informational and arrive after each step has already run, so there is no way to veto an action mid-task. For anything risky, destructive, or hard to undo (deleting data, touching production, force-pushing, changing infrastructure), call agent_plan_task FIRST: it makes the agent propose its steps while executing nothing. Show that plan to the user, and only then call agent_run_followup on the returned task_id to execute it.
 
 DIRECTOR MODE (you supervise and can interrupt):
@@ -127,11 +133,12 @@ Honest limits: agent_run_task's progress notifications are informational and pos
 // ---- tool input types ---------------------------------------------------
 
 type startInput struct {
-	Prompt    string   `json:"prompt" jsonschema:"The task or instruction to delegate to the CLI agent."`
-	Agent     string   `json:"agent,omitempty" jsonschema:"Which agent to use (e.g. claude, cursor, custom, mock). Call agent_list_agents to see what this server has available. Defaults to the server's configured default."`
-	Cwd       string   `json:"cwd,omitempty" jsonschema:"Absolute working directory for the agent. Defaults to the server's configured default."`
-	Model     string   `json:"model,omitempty" jsonschema:"Optional model override passed to the agent."`
-	ExtraArgs []string `json:"extra_args,omitempty" jsonschema:"Extra CLI flags appended verbatim to this run."`
+	Prompt       string   `json:"prompt" jsonschema:"The task or instruction to delegate to the CLI agent."`
+	Agent        string   `json:"agent,omitempty" jsonschema:"Which agent to use (e.g. claude, cursor, custom, mock). Call agent_list_agents to see what this server has available. Defaults to the server's configured default."`
+	Cwd          string   `json:"cwd,omitempty" jsonschema:"Absolute working directory for the agent. Defaults to the server's configured default."`
+	Model        string   `json:"model,omitempty" jsonschema:"Optional model override passed to the agent."`
+	AllowedTools []string `json:"allowed_tools,omitempty" jsonschema:"Tools to pre-approve for this run so the headless worker doesn't stall waiting for approval it can't get (Claude Code --allowedTools). Patterns supported, e.g. [\"Bash(git *)\",\"Edit\",\"PowerShell\"]. This only pre-approves; the server's deny policy still applies."`
+	ExtraArgs    []string `json:"extra_args,omitempty" jsonschema:"Extra CLI flags appended verbatim to this run (disabled by default on the server)."`
 }
 
 type idInput struct {
@@ -139,21 +146,24 @@ type idInput struct {
 }
 
 type followupInput struct {
-	TaskID    string   `json:"task_id" jsonschema:"The task id whose session to continue."`
-	Prompt    string   `json:"prompt" jsonschema:"The next instruction for the agent, continuing the same session."`
-	ExtraArgs []string `json:"extra_args,omitempty" jsonschema:"Extra CLI flags appended verbatim to this run."`
+	TaskID       string   `json:"task_id" jsonschema:"The task id whose session to continue."`
+	Prompt       string   `json:"prompt" jsonschema:"The next instruction for the agent, continuing the same session."`
+	AllowedTools []string `json:"allowed_tools,omitempty" jsonschema:"Tools to pre-approve for this run (Claude Code --allowedTools). Only pre-approves; the server's deny policy still applies."`
+	ExtraArgs    []string `json:"extra_args,omitempty" jsonschema:"Extra CLI flags appended verbatim to this run (disabled by default on the server)."`
 }
 
 type outputInput struct {
 	TaskID    string `json:"task_id" jsonschema:"The task id to read output from."`
 	SinceLine int    `json:"since_line,omitempty" jsonschema:"0-based line index to start from (for incremental reads)."`
 	MaxLines  int    `json:"max_lines,omitempty" jsonschema:"Maximum number of lines to return. 0 means all."`
+	Raw       bool   `json:"raw,omitempty" jsonschema:"Return the raw JSONL transcript instead of the compact, filtered view."`
 }
 
 type watchInput struct {
 	TaskID         string `json:"task_id" jsonschema:"The backgrounded task id to watch."`
 	SinceLine      int    `json:"since_line,omitempty" jsonschema:"Line index to watch from. Pass the next_since_line returned by the previous call to get only new output."`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"How long to wait for new output before returning (default 25, max 55)."`
+	Raw            bool   `json:"raw,omitempty" jsonschema:"Return the raw JSONL transcript instead of the compact, filtered view."`
 }
 
 // ---- tool output types --------------------------------------------------
@@ -328,9 +338,10 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return textResult("error: " + emsg), task.Snapshot{}, err
 		}
 		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
-			Prompt:    in.Prompt,
-			Model:     in.Model,
-			ExtraArgs: in.ExtraArgs,
+			Prompt:       in.Prompt,
+			Model:        in.Model,
+			AllowedTools: in.AllowedTools,
+			ExtraArgs:    in.ExtraArgs,
 		}, newProgressSink(ctx, req))
 		if err != nil {
 			return textResult("error: " + err.Error()), task.Snapshot{}, err
@@ -361,10 +372,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return textResult("error: " + msg), task.Snapshot{}, fmt.Errorf("%s", msg)
 		}
 		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
-			Prompt:    in.Prompt,
-			Model:     in.Model,
-			ExtraArgs: in.ExtraArgs,
-			PlanOnly:  true,
+			Prompt:       in.Prompt,
+			Model:        in.Model,
+			AllowedTools: in.AllowedTools,
+			ExtraArgs:    in.ExtraArgs,
+			PlanOnly:     true,
 		}, newProgressSink(ctx, req))
 		if err != nil {
 			return textResult("error: " + err.Error()), task.Snapshot{}, err
@@ -383,7 +395,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
 			return textResult("error: " + err.Error()), task.Snapshot{}, err
 		}
-		t, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.ExtraArgs, newProgressSink(ctx, req))
+		t, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs, newProgressSink(ctx, req))
 		if err != nil {
 			return textResult("error: " + err.Error()), task.Snapshot{}, err
 		}
@@ -406,9 +418,10 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return textResult("error: " + emsg), task.Snapshot{}, err
 		}
 		t, err := mgr.StartTask(a, cwd, agent.RunSpec{
-			Prompt:    in.Prompt,
-			Model:     in.Model,
-			ExtraArgs: in.ExtraArgs,
+			Prompt:       in.Prompt,
+			Model:        in.Model,
+			AllowedTools: in.AllowedTools,
+			ExtraArgs:    in.ExtraArgs,
 		})
 		if err != nil {
 			return textResult("error: " + err.Error()), task.Snapshot{}, err
@@ -442,7 +455,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if !ok {
 			return textResult("error: unknown task " + in.TaskID), outputResult{}, fmt.Errorf("unknown task %q", in.TaskID)
 		}
-		from, to, total, text := t.Output(in.SinceLine, in.MaxLines)
+		from, to, total, text := t.Output(in.SinceLine, in.MaxLines, cfg.Compact && !in.Raw)
 		snap := t.Snapshot()
 		res := outputResult{
 			TaskID:     snap.ID,
@@ -477,8 +490,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if timeout > 55 {
 			timeout = 55
 		}
-		lines, newSince, _, status, running := t.WatchFrom(ctx, in.SinceLine, time.Duration(timeout)*time.Second)
-		text := strings.Join(lines, "\n")
+		text, newSince, _, status, running := t.WatchFrom(ctx, in.SinceLine, time.Duration(timeout)*time.Second, cfg.Compact && !in.Raw)
 		res := watchResult{
 			TaskID:       t.ID,
 			Status:       string(status),
@@ -507,7 +519,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
 			return textResult("error: " + err.Error()), task.Snapshot{}, err
 		}
-		t, err := mgr.Followup(in.TaskID, in.Prompt, in.ExtraArgs)
+		t, err := mgr.Followup(in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs)
 		if err != nil {
 			return textResult("error: " + err.Error()), task.Snapshot{}, err
 		}
@@ -579,6 +591,12 @@ Configuration (environment variables):
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
   CLI_AGENT_MCP_AUDIT_LOG          Path to a JSONL audit log of what the worker did
+  CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS  Kill a turn that runs longer than this — a
+                                   safety net for a worker hung on a permission
+                                   prompt.                              (default: 0 = off)
+  CLI_AGENT_MCP_COMPACT            Return a filtered, readable transcript from
+                                   agent_get_output/agent_watch instead of raw
+                                   JSONL.                               (default: true)
 
 Bounding what the worker may do:
   A headless run executes tool calls by default. To BLOCK dangerous ones use the

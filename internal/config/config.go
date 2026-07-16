@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config is the fully-resolved server configuration.
@@ -79,6 +80,16 @@ type Config struct {
 	// AuditLog is a file path for a JSONL audit trail of everything the worker
 	// was asked to do. Empty disables it.
 	AuditLog string
+
+	// TaskTimeout, if > 0, cancels any turn that runs longer than this. It is a
+	// safety net against a worker that hangs — e.g. blocked on a permission
+	// prompt with no human to approve it. Zero means no timeout.
+	TaskTimeout time.Duration
+
+	// Compact controls whether agent_get_output / agent_watch return a filtered,
+	// human-readable transcript by default (dropping the noisy init/config dump)
+	// rather than raw JSONL.
+	Compact bool
 }
 
 func getenv(key, def string) string {
@@ -130,6 +141,13 @@ func Load() Config {
 		}
 	}
 
+	var taskTimeout time.Duration
+	if v := os.Getenv("CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			taskTimeout = time.Duration(n) * time.Second
+		}
+	}
+
 	allowed := splitList("CLI_AGENT_MCP_ALLOWED_CWDS")
 	for i, p := range allowed {
 		if abs, err := filepath.Abs(p); err == nil {
@@ -154,5 +172,7 @@ func Load() Config {
 		AllowedCwds:     allowed,
 		MaxTasks:        maxTasks,
 		AuditLog:        getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
+		TaskTimeout:     taskTimeout,
+		Compact:         getbool("CLI_AGENT_MCP_COMPACT", true),
 	}
 }

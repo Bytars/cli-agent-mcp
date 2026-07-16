@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strings"
 )
 
 // ClaudeAdapter drives Claude Code in headless (`-p`) mode with streaming JSON.
@@ -62,9 +63,14 @@ func (a *ClaudeAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 	case a.PermissionMode != "":
 		args = append(args, "--permission-mode", a.PermissionMode)
 	}
-	// Tool policy: server-side bounds on what the headless worker may do.
-	if a.AllowedTools != "" {
-		args = append(args, "--allowedTools", a.AllowedTools)
+	// Tool policy. --allowedTools PRE-APPROVES tools (avoids headless deadlocks
+	// where a tool would otherwise wait for approval no one can give); it does
+	// not restrict. We merge the server's configured allowlist with any per-run
+	// request, joined into a single argument so a value can never be parsed as a
+	// flag (no injection via allowed_tools). --disallowedTools is the real deny
+	// gate and is server-only.
+	if allowed := mergeAllowed(a.AllowedTools, spec.AllowedTools); allowed != "" {
+		args = append(args, "--allowedTools", allowed)
 	}
 	if a.DisallowedTools != "" {
 		args = append(args, "--disallowedTools", a.DisallowedTools)
@@ -83,4 +89,26 @@ func (a *ClaudeAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 
 func (a *ClaudeAdapter) ParseLine(line string) Event {
 	return parseClaudeStreamLine(line)
+}
+
+// mergeAllowed combines the server-configured allowlist (a comma-separated
+// string) with a per-run list, into one comma-joined value. Entries that look
+// like flags (start with '-') or are blank are dropped, so nothing passed here
+// can turn into a CLI flag.
+func mergeAllowed(configured string, perRun []string) string {
+	var out []string
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || strings.HasPrefix(s, "-") {
+			return
+		}
+		out = append(out, s)
+	}
+	for _, s := range strings.Split(configured, ",") {
+		add(s)
+	}
+	for _, s := range perRun {
+		add(s)
+	}
+	return strings.Join(out, ",")
 }

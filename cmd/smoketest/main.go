@@ -82,6 +82,33 @@ func main() {
 		return
 	}
 
+	// SMOKE_ONLY=timeout proves a hung task is killed by the server timeout
+	// (run the server with CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS set).
+	if os.Getenv("SMOKE_ONLY") == "timeout" {
+		fmt.Println("\n== task timeout (anti-deadlock) ==")
+		st := callTool(ctx, session, "agent_start_task", map[string]any{
+			"prompt": "sleep:15000",
+			"agent":  agentName,
+			"cwd":    cwd,
+		})
+		id := jsonField(st, "task_id")
+		var status string
+		for i := 0; i < 60; i++ {
+			s := callTool(ctx, session, "agent_task_status", map[string]any{"task_id": id})
+			status = jsonField(s, "status")
+			if status != "running" {
+				fmt.Printf("  final status=%s\n  error=%s\n", status, jsonField(s, "error"))
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if status != "failed" {
+			log.Fatalf("FAIL: expected timed-out task to be failed, got %q", status)
+		}
+		fmt.Println("TIMEOUT-ONLY DONE")
+		return
+	}
+
 	// SMOKE_ONLY=cancel starts a long-running task and interrupts it, proving the
 	// worker actually stops before it would have finished.
 	if os.Getenv("SMOKE_ONLY") == "cancel" {

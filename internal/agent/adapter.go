@@ -21,12 +21,13 @@ import (
 
 // RunSpec fully describes one turn to run against an agent.
 type RunSpec struct {
-	Prompt    string   // the instruction/task text
-	Cwd       string   // working directory for the child process
-	Model     string   // optional model override
-	SessionID string   // when set, resume this session instead of starting fresh
-	ExtraArgs []string // extra flags appended verbatim
-	PlanOnly  bool     // propose a plan without executing anything
+	Prompt       string   // the instruction/task text
+	Cwd          string   // working directory for the child process
+	Model        string   // optional model override
+	SessionID    string   // when set, resume this session instead of starting fresh
+	ExtraArgs    []string // extra flags appended verbatim
+	AllowedTools []string // per-run tools to pre-approve (merged with server policy)
+	PlanOnly     bool     // propose a plan without executing anything
 }
 
 // Event is the adapter's interpretation of a single line of agent stdout.
