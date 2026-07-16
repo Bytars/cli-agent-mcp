@@ -30,6 +30,25 @@ type Config struct {
 	// governs how autonomous it is. See README for the safety trade-offs.
 	PermissionMode string
 
+	// AllowedTools / DisallowedTools are passed to Claude Code's --allowedTools
+	// and --disallowedTools. They support patterns (e.g. "Bash(git *),Edit") and
+	// are the precise way to bound what a headless worker may do — far better
+	// than the blunt choice between "can't run anything" and "can run anything".
+	// This is server-side policy: tool callers cannot override it.
+	AllowedTools    string
+	DisallowedTools string
+
+	// AllowExtraArgs controls whether tool calls may append arbitrary CLI flags
+	// to the agent through the `extra_args` parameter.
+	//
+	// It defaults to FALSE, and that default is a security boundary: the client
+	// driving this server is itself a model, and `extra_args` is appended after
+	// the flags configured here. Left open, a caller could pass
+	// --dangerously-skip-permissions (or its own --allowedTools) and silently
+	// void the policy the operator configured. Only enable it when you trust the
+	// caller as much as you trust your own shell.
+	AllowExtraArgs bool
+
 	// ClaudeExtraArgs / CursorExtraArgs are appended verbatim to every launch,
 	// letting the user tune flags without a rebuild.
 	ClaudeExtraArgs []string
@@ -60,6 +79,20 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// getbool parses a permissive boolean env value, falling back to def.
+func getbool(key string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "":
+		return def
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }
 
 // splitArgs splits a whitespace/semicolon-separated env value into args. It is
@@ -102,6 +135,9 @@ func Load() Config {
 		ClaudeBin:       getenv("CLI_AGENT_MCP_CLAUDE_BIN", "claude"),
 		CursorBin:       getenv("CLI_AGENT_MCP_CURSOR_BIN", "cursor-agent"),
 		PermissionMode:  getenv("CLI_AGENT_MCP_PERMISSION_MODE", "acceptEdits"),
+		AllowedTools:    getenv("CLI_AGENT_MCP_ALLOWED_TOOLS", ""),
+		DisallowedTools: getenv("CLI_AGENT_MCP_DISALLOWED_TOOLS", ""),
+		AllowExtraArgs:  getbool("CLI_AGENT_MCP_ALLOW_EXTRA_ARGS", false),
 		ClaudeExtraArgs: splitList("CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS"),
 		CursorExtraArgs: splitList("CLI_AGENT_MCP_CURSOR_EXTRA_ARGS"),
 		CustomName:      getenv("CLI_AGENT_MCP_CUSTOM_NAME", "custom"),

@@ -74,6 +74,7 @@ newline-delimited output. That gives a clean programmatic contract:
 | Tool | Purpose |
 |------|---------|
 | **`agent_run_task`** | **Preferred.** Delegate a task and wait, streaming live progress; returns the result inline. |
+| **`agent_plan_task`** | Have the agent **propose** a plan without executing anything. Use before risky work, then follow up to execute. |
 | **`agent_run_followup`** | Continue a session and wait, with the same live streaming. |
 | `agent_start_task` | Delegate without waiting; returns a `task_id` (background). For parallel/fire-and-forget. |
 | `agent_task_status` | Poll status (`running`/`done`/`failed`/`canceled`) and read the result of a backgrounded task. |
@@ -168,7 +169,10 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_DEFAULT_AGENT` | `claude` | Agent used when a call omits `agent`. |
 | `CLI_AGENT_MCP_CLAUDE_BIN` | `claude` | Claude Code launcher (name in PATH or absolute path). |
 | `CLI_AGENT_MCP_CURSOR_BIN` | `cursor-agent` | Cursor launcher, used if the bundled runtime isn't auto-detected. |
-| `CLI_AGENT_MCP_PERMISSION_MODE` | `acceptEdits` | Claude Code `--permission-mode`. See the safety note below. |
+| `CLI_AGENT_MCP_PERMISSION_MODE` | `acceptEdits` | Claude Code `--permission-mode`: `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`. |
+| `CLI_AGENT_MCP_ALLOWED_TOOLS` | — | Claude Code `--allowedTools` allowlist, patterns supported (e.g. `Bash(git *),Edit`). **The best way to bound a headless worker.** |
+| `CLI_AGENT_MCP_DISALLOWED_TOOLS` | — | Claude Code `--disallowedTools` denylist. |
+| `CLI_AGENT_MCP_ALLOW_EXTRA_ARGS` | `false` | Allow callers to pass raw agent flags via `extra_args`. **Keep off** — see safety. |
 | `CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS` | — | Extra Claude flags, `;`-separated. |
 | `CLI_AGENT_MCP_CURSOR_EXTRA_ARGS` | — | Extra Cursor flags, `;`-separated. |
 | `CLI_AGENT_MCP_DEFAULT_CWD` | server's cwd | Working directory when a call omits `cwd`. **Set this.** |
@@ -223,28 +227,80 @@ small `agent.Adapter` interface in [`internal/agent`](internal/agent/adapter.go)
 
 ## ⚠️ Permissions & safety
 
-The worker runs **headless — there is no human at the terminal to approve tool
-prompts.** For Claude Code, `--permission-mode` decides how autonomous it is:
+Read this section before pointing the server at anything you care about.
 
-- `acceptEdits` (default) — auto-approves file edits, but **commands (Bash/SSH)
-  still require approval**, so a task that must run commands may stall or skip them.
-- `bypassPermissions` — runs everything without prompting. This is often what's
-  needed for *"log into the server and run X"* workflows, **but it means one AI
-  can make another AI run arbitrary commands on your machine and infrastructure.**
-  Enable it deliberately.
-- `plan` / `default` — more conservative.
+### The client cannot stop the worker
 
-Recommended hardening:
+Once a task starts, **the MCP client is a spectator, not a gatekeeper.** Progress
+notifications are informational and arrive *after* each step has already run —
+there is no approval hook, and the calling model is blocked awaiting the result
+rather than watching. In normal CLI use *you* are the approval gate; running the
+agent headless removes that gate. Nothing replaces it automatically.
 
-- Set `CLI_AGENT_MCP_ALLOWED_CWDS` to restrict where tasks can run.
-- Keep `CLI_AGENT_MCP_DEFAULT_CWD` pointed at a specific project.
-- Start with `acceptEdits`; move to `bypassPermissions` only once you trust the flow.
+So the controls that matter are the ones you configure **here**, plus planning.
+
+### Plan first for anything risky
+
+`agent_plan_task` runs the agent in plan-only mode: it inspects and proposes,
+but **executes nothing**. Review the plan, then call `agent_run_followup` with
+the returned `task_id` to carry it out. This turns *fire-and-pray* into
+*propose → review → execute*, and is the only way to get judgment in the loop
+before an action happens.
+
+It **fails closed**: agents that can't guarantee plan-only (`cursor`, `custom`)
+refuse the call rather than executing. `agent_list_agents` reports
+`supports_plan_only` per agent.
+
+### Bound what the worker may do
+
+Prefer a precise allowlist over a permissive mode:
+
+```json
+"CLI_AGENT_MCP_ALLOWED_TOOLS": "Read,Grep,Glob,Edit,Bash(git *),Bash(npm test)"
+```
+
+`--allowedTools` / `--disallowedTools` support patterns, so you can grant exactly
+`Bash(git *)` instead of choosing between *no commands at all* and *every
+command*. This is server-side policy — tool callers cannot override it.
+
+For Claude Code, `--permission-mode` (`CLI_AGENT_MCP_PERMISSION_MODE`) accepts
+`acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`:
+
+- `acceptEdits` (default) — auto-approves file edits, but **commands still need
+  approval**, so a task that must run commands may stall or skip them.
+- `bypassPermissions` — runs everything, no prompts. Often what's wanted for
+  *"log into the server and run X"*, **but it means one AI can make another AI
+  run arbitrary commands on your machine and infrastructure.** If you need this,
+  pair it with `CLI_AGENT_MCP_ALLOWED_TOOLS` rather than leaving it wide open.
+
+### `extra_args` is disabled by default — keep it that way
+
+The `extra_args` tool parameter appends raw flags to the agent, *after* the flags
+configured above. Left open, a caller could pass
+`--dangerously-skip-permissions` and void your entire policy. Since the caller is
+itself a model — one that may be reading untrusted web pages, issues, or emails —
+it is off by default and calls using it are refused. Only set
+`CLI_AGENT_MCP_ALLOW_EXTRA_ARGS=true` if you trust the caller as much as your own
+shell.
+
+### Prompt injection is the sharp edge
+
+If the orchestrating model processes untrusted content, that content can shape
+the prompt it delegates — and the worker itself reads files and pages that may
+carry injected instructions. The blast radius is whatever the host machine can
+reach, including private infrastructure. Bound it deliberately:
+
+- `CLI_AGENT_MCP_ALLOWED_CWDS` — restrict where tasks may run.
+- `CLI_AGENT_MCP_ALLOWED_TOOLS` — restrict what they may do.
+- `CLI_AGENT_MCP_DEFAULT_CWD` — pin a specific project.
+- Plan first; keep `extra_args` off.
 
 ## Development
 
 ```bash
 go build ./...        # compile
 go vet ./...          # static checks
+go test ./...         # unit tests (incl. permission/flag construction)
 gofmt -l .            # formatting (must be empty)
 
 # End-to-end test over real MCP stdio using the built-in mock agent —

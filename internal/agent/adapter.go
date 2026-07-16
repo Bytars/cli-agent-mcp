@@ -26,6 +26,7 @@ type RunSpec struct {
 	Model     string   // optional model override
 	SessionID string   // when set, resume this session instead of starting fresh
 	ExtraArgs []string // extra flags appended verbatim
+	PlanOnly  bool     // propose a plan without executing anything
 }
 
 // Event is the adapter's interpretation of a single line of agent stdout.
@@ -64,6 +65,22 @@ type Adapter interface {
 // result instead of leaving it empty.
 type ResultFromOutput interface {
 	UseOutputAsResult() bool
+}
+
+// PlanCapable is an optional interface for adapters whose agent can run a
+// plan-only turn: propose the steps it *would* take, executing nothing.
+//
+// This must fail closed. Callers are required to check it before honouring
+// RunSpec.PlanOnly, because an adapter that silently ignored PlanOnly would
+// execute the task when the caller explicitly asked it not to.
+type PlanCapable interface {
+	SupportsPlanOnly() bool
+}
+
+// CanPlan reports whether a is able to honour RunSpec.PlanOnly.
+func CanPlan(a Adapter) bool {
+	p, ok := a.(PlanCapable)
+	return ok && p.SupportsPlanOnly()
 }
 
 // Registry is the set of adapters known to the server.

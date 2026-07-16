@@ -35,6 +35,9 @@ jobs:
       - name: Build
         run: go build ./...
 
+      - name: Test
+        run: go test ./...
+
       - name: Smoke test (mock agent, end-to-end over MCP stdio)
         run: |
           go build -o cli-agent-mcp .
