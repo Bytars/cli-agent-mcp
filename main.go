@@ -67,7 +67,10 @@ func main() {
 
 	auditLog, err := audit.New(cfg.AuditLog)
 	if err != nil {
-		log.Fatalf("opening audit log %q: %v", cfg.AuditLog, err)
+		// A broken audit sink must not take the whole server down; degrade to
+		// no audit and keep serving.
+		log.Printf("warning: audit log %q disabled: %v", cfg.AuditLog, err)
+		auditLog = &audit.Logger{}
 	}
 	defer auditLog.Close()
 	mgr.SetAudit(auditLog)
