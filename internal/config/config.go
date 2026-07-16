@@ -31,10 +31,13 @@ type Config struct {
 	PermissionMode string
 
 	// AllowedTools / DisallowedTools are passed to Claude Code's --allowedTools
-	// and --disallowedTools. They support patterns (e.g. "Bash(git *),Edit") and
-	// are the precise way to bound what a headless worker may do — far better
-	// than the blunt choice between "can't run anything" and "can run anything".
-	// This is server-side policy: tool callers cannot override it.
+	// and --disallowedTools (patterns supported, e.g. "Bash(git push:*),Edit").
+	//
+	// Important, verified against Claude Code 2.1.207: a headless `-p` run
+	// EXECUTES tool calls by default, and --allowedTools is ADDITIVE (it only
+	// pre-approves / removes prompts) — it does NOT act as an exclusive allowlist.
+	// The reliable restriction is DisallowedTools, which hard-denies matching
+	// tools/commands. This is server-side policy tool callers cannot override.
 	AllowedTools    string
 	DisallowedTools string
 

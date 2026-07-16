@@ -580,14 +580,17 @@ Configuration (environment variables):
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
   CLI_AGENT_MCP_AUDIT_LOG          Path to a JSONL audit log of what the worker did
 
-Bounding what the worker may do (recommended over a permissive mode):
-  CLI_AGENT_MCP_ALLOWED_TOOLS      Claude --allowedTools allowlist, patterns supported.
-                                   e.g. "Bash(git *),Bash(npm test),Edit,Read"
-  CLI_AGENT_MCP_DISALLOWED_TOOLS   Claude --disallowedTools denylist.
+Bounding what the worker may do:
+  A headless run executes tool calls by default. To BLOCK dangerous ones use the
+  denylist — the allowlist is additive (pre-approve only), NOT an exclusive gate.
+  CLI_AGENT_MCP_DISALLOWED_TOOLS   Claude --disallowedTools — the real deny gate.
+                                   e.g. "Bash(rm:*),Bash(git push:*),Bash(sudo:*)"
+  CLI_AGENT_MCP_ALLOWED_TOOLS      Claude --allowedTools — pre-approves tools (does
+                                   not restrict). e.g. "Read,Edit,Bash(git status)"
   CLI_AGENT_MCP_ALLOW_EXTRA_ARGS   Let callers pass arbitrary agent flags via the
                                    tool's extra_args   (default: false)
                                    Keep this OFF: the caller is a model, and extra
-                                   flags can override the permission policy above.
+                                   flags can override the policy above.
 
 Custom agent (drive any CLI without writing Go):
   CLI_AGENT_MCP_CUSTOM_BIN         The agent's executable
