@@ -119,12 +119,10 @@ If a task needs to run shell commands (git, tests, ssh, etc.) and seems to stall
 
 IMPORTANT — you cannot stop the worker once it starts. Progress notifications are informational and arrive after each step has already run, so there is no way to veto an action mid-task. For anything risky, destructive, or hard to undo (deleting data, touching production, force-pushing, changing infrastructure), call agent_plan_task FIRST: it makes the agent propose its steps while executing nothing. Show that plan to the user, and only then call agent_run_followup on the returned task_id to execute it.
 
-DIRECTOR MODE (you supervise and can interrupt):
-When the user wants you actively watching — or the task is risky — run it in the background and steer it yourself:
+BACKGROUND MODE (a tracked task you watch):
 1. agent_start_task — start the task, get a task_id (returns immediately).
-2. agent_watch — blocks until new output arrives, returns what the worker just did. Between calls YOU are active and reasoning, so this is where you judge whether it's on track. Pass back next_since_line each call, and keep looping while running is true.
-3. If it goes off the rails, agent_cancel_task stops it immediately (kills the whole process tree). To redirect, cancel and agent_start_task a corrected task, or agent_send_followup once it has finished.
-This is the way to "watch it like the user would and stop it if it drifts." Prefer it over agent_run_task whenever supervision matters.
+2. agent_watch — call it ONCE. By default (until="done") it blocks in this single call until the task finishes, streaming live progress to the user the whole time. Do NOT poll it in a loop; just make the one call and wait for it to return the result. Use this when you want the task tracked/backgrounded but still wait for it.
+3. Only if you need to actively supervise and possibly interrupt: call agent_watch with until="change" (returns on each new chunk so you can judge it), and agent_cancel_task if it drifts (kills the whole process tree). To redirect: cancel and start a corrected task, or agent_send_followup once finished.
 
 Also: agent_task_status / agent_get_output (poll/read on demand), agent_list_tasks, agent_list_agents.
 
@@ -161,8 +159,9 @@ type outputInput struct {
 
 type watchInput struct {
 	TaskID         string `json:"task_id" jsonschema:"The backgrounded task id to watch."`
+	Until          string `json:"until,omitempty" jsonschema:"When to return: \"done\" (default) blocks in a SINGLE call until the task finishes, streaming live progress the whole time; \"change\" returns as soon as there's new output so you can peek and possibly interrupt."`
 	SinceLine      int    `json:"since_line,omitempty" jsonschema:"Line index to watch from. Pass the next_since_line returned by the previous call to get only new output."`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"How long to wait for new output before returning (default 25, max 55)."`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"For until=\"change\": how long to wait for new output before returning (default 25, max 55)."`
 	Raw            bool   `json:"raw,omitempty" jsonschema:"Return the raw JSONL transcript instead of the compact, filtered view."`
 }
 
@@ -474,39 +473,83 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "agent_watch",
-		Description: "Supervise a backgrounded task in near-real-time. Blocks until new output arrives or the task ends, then returns the new transcript lines. " +
-			"This is how you DIRECT a worker: start it with agent_start_task, then loop calling agent_watch (passing back next_since_line each time) to read what it's doing as it happens. " +
-			"If you see it going off the rails, call agent_cancel_task to stop it immediately; to steer, cancel and start a corrected task, or agent_send_followup once it finishes. " +
-			"Keep looping while running is true.",
+		Description: "Watch a backgrounded task (from agent_start_task), streaming its live progress to the user. " +
+			"By default (until=\"done\") a SINGLE call blocks until the task finishes and streams progress the whole time — so you do NOT need to call this repeatedly. Use it right after agent_start_task and just wait. " +
+			"Use until=\"change\" instead when you want to actively supervise: it returns as soon as there's new output so you can judge it and call agent_cancel_task if it's going wrong (then loop, passing back next_since_line). " +
+			"To steer, cancel and start a corrected task, or agent_send_followup once it has finished.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in watchInput) (*mcp.CallToolResult, watchResult, error) {
 		t, ok := mgr.Get(in.TaskID)
 		if !ok {
 			return textResult("error: unknown task " + in.TaskID), watchResult{}, fmt.Errorf("unknown task %q", in.TaskID)
 		}
-		timeout := in.TimeoutSeconds
-		if timeout <= 0 {
-			timeout = 25
+		compact := cfg.Compact && !in.Raw
+
+		// Stream each new line to the client as a progress notification, so a
+		// single long-blocking watch still shows real-time activity.
+		token := req.Params.GetProgressToken()
+		var seq float64
+		emit := func(msg string) {
+			msg = strings.TrimSpace(msg)
+			if token == nil || msg == "" {
+				return
+			}
+			seq++
+			_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+				ProgressToken: token, Message: truncate(msg, 500), Progress: seq,
+			})
 		}
-		if timeout > 55 {
-			timeout = 55
-		}
-		text, newSince, _, status, running := t.WatchFrom(ctx, in.SinceLine, time.Duration(timeout)*time.Second, cfg.Compact && !in.Raw)
-		res := watchResult{
-			TaskID:       t.ID,
-			Status:       string(status),
-			Running:      running,
-			NewSinceLine: newSince,
-			Text:         text,
-		}
-		body := text
-		if body == "" {
-			if running {
-				body = fmt.Sprintf("(no new output yet; task still running — call agent_watch again with since_line=%d)", newSince)
-			} else {
-				body = fmt.Sprintf("(task %s; no more output)", status)
+		emitChunk := func(text string) {
+			for _, line := range strings.Split(text, "\n") {
+				emit(line)
 			}
 		}
-		return textResult(body), res, nil
+
+		// until="change": return on the first new output (interruptible supervision).
+		if strings.EqualFold(in.Until, "change") {
+			timeout := in.TimeoutSeconds
+			if timeout <= 0 {
+				timeout = 25
+			}
+			if timeout > 55 {
+				timeout = 55
+			}
+			text, newSince, _, status, running := t.WatchFrom(ctx, in.SinceLine, time.Duration(timeout)*time.Second, compact)
+			emitChunk(text)
+			body := text
+			if body == "" {
+				if running {
+					body = fmt.Sprintf("(no new output yet; still running — watch again from since_line=%d, or just use until=\"done\")", newSince)
+				} else {
+					body = fmt.Sprintf("(task %s; no more output)", status)
+				}
+			}
+			return textResult(body), watchResult{TaskID: t.ID, Status: string(status), Running: running, NewSinceLine: newSince, Text: text}, nil
+		}
+
+		// until="done" (default): one call, block until the task finishes.
+		since := in.SinceLine
+		start := time.Now()
+		var status task.Status
+		running := true
+		for {
+			text, newSince, _, st, run := t.WatchFrom(ctx, since, 10*time.Second, compact)
+			status, running, since = st, run, newSince
+			if text != "" {
+				emitChunk(text)
+			} else if run {
+				emit(fmt.Sprintf("… still running (%s)", time.Since(start).Round(time.Second)))
+			}
+			if !run || ctx.Err() != nil {
+				break
+			}
+		}
+		snap := t.Snapshot()
+		final := snap.Result
+		if final == "" {
+			final = fmt.Sprintf("(no textual result; status=%s)", status)
+		}
+		return textResult(fmt.Sprintf("Task %s finished with status %q.\n\n%s", snap.ID, status, final)),
+			watchResult{TaskID: snap.ID, Status: string(status), Running: running, NewSinceLine: since, Text: final}, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

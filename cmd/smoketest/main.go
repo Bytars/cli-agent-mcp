@@ -82,6 +82,39 @@ func main() {
 		return
 	}
 
+	// SMOKE_ONLY=watchstream proves a SINGLE until=done watch call streams live
+	// progress while it blocks, and returns only when the task is done.
+	if os.Getenv("SMOKE_ONLY") == "watchstream" {
+		fmt.Println("\n== agent_watch until=done streams live in ONE call ==")
+		st := callTool(ctx, session, "agent_start_task", map[string]any{
+			"prompt": "sleep:4500", "agent": agentName, "cwd": cwd,
+		})
+		id := jsonField(st, "task_id")
+		before := progressLen(&progressMu, &progressMsgs)
+		wp := &mcp.CallToolParams{Name: "agent_watch", Arguments: map[string]any{"task_id": id}}
+		wp.SetProgressToken("watch-1")
+		start := time.Now()
+		res, err := session.CallTool(ctx, wp)
+		if err != nil {
+			log.Fatalf("agent_watch: %v", err)
+		}
+		elapsed := time.Since(start)
+		streamed := progressLen(&progressMu, &progressMsgs) - before
+		fmt.Printf("  single call blocked %v, status=%s, streamed %d progress updates\n",
+			elapsed.Round(time.Millisecond), jsonField(res, "status"), streamed)
+		if jsonField(res, "running") != "false" {
+			log.Fatal("FAIL: until=done returned while still running")
+		}
+		if elapsed < 3*time.Second {
+			log.Fatal("FAIL: until=done returned too early (didn't actually wait for completion)")
+		}
+		if streamed < 2 {
+			log.Fatalf("FAIL: expected live progress during the wait, got %d", streamed)
+		}
+		fmt.Println("WATCHSTREAM-ONLY DONE")
+		return
+	}
+
 	// SMOKE_ONLY=timeout proves a hung task is killed by the server timeout
 	// (run the server with CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS set).
 	if os.Getenv("SMOKE_ONLY") == "timeout" {
@@ -208,41 +241,30 @@ func main() {
 		}
 	}
 
-	// 0d. director mode: start in the background and watch it live.
-	fmt.Println("\n== agent_watch (director-mode supervise loop) ==")
+	// 0d. background mode: start, then a SINGLE agent_watch that waits to completion.
+	fmt.Println("\n== agent_watch until=done (single call, waits to completion) ==")
 	ws := callTool(ctx, session, "agent_start_task", map[string]any{
 		"prompt": prompt,
 		"agent":  agentName,
 		"cwd":    cwd,
 	})
 	wtask := jsonField(ws, "task_id")
-	since := 0
-	iters := 0
-	running := "true"
-	sawOutput := false
-	for i := 0; i < 60; i++ {
-		wr := callTool(ctx, session, "agent_watch", map[string]any{
-			"task_id":         wtask,
-			"since_line":      since,
-			"timeout_seconds": 5,
-		})
-		iters++
-		if txt := textContent(wr); strings.TrimSpace(txt) != "" && !strings.HasPrefix(txt, "(") {
-			sawOutput = true
-		}
-		since = toInt(jsonField(wr, "next_since_line"))
-		running = jsonField(wr, "running")
-		if running == "false" {
-			break
-		}
-	}
-	fmt.Printf("  watched %d call(s); final running=%s, next_since_line=%d, saw_output=%v\n", iters, running, since, sawOutput)
+	wr := callTool(ctx, session, "agent_watch", map[string]any{"task_id": wtask}) // until defaults to "done"
+	running := jsonField(wr, "running")
+	wstatus := jsonField(wr, "status")
+	fmt.Printf("  one call → running=%s status=%s\n  result=%s\n", running, wstatus, firstLine(jsonField(wr, "text")))
 	if running != "false" {
-		log.Fatal("FAIL: agent_watch never observed the task finishing")
+		log.Fatal("FAIL: a single until=done agent_watch must return only when the task has finished")
 	}
-	if !sawOutput {
-		log.Fatal("FAIL: agent_watch returned no worker output")
+	if wstatus != "done" && agentName == "mock" {
+		log.Fatalf("FAIL: expected status done, got %q", wstatus)
 	}
+
+	// until=change should return promptly with a chunk (interruptible supervision).
+	fmt.Println("\n== agent_watch until=change (peek) ==")
+	ws2 := callTool(ctx, session, "agent_start_task", map[string]any{"prompt": prompt, "agent": agentName, "cwd": cwd})
+	cr := callTool(ctx, session, "agent_watch", map[string]any{"task_id": jsonField(ws2, "task_id"), "until": "change"})
+	fmt.Printf("  change → running=%s next_since_line=%s\n", jsonField(cr, "running"), jsonField(cr, "next_since_line"))
 
 	// 1. start a task
 	fmt.Println("\n== agent_start_task ==")
@@ -360,6 +382,12 @@ func jsonField(res *mcp.CallToolResult, key string) string {
 		}
 	}
 	return ""
+}
+
+func progressLen(mu *sync.Mutex, msgs *[]string) int {
+	mu.Lock()
+	defer mu.Unlock()
+	return len(*msgs)
 }
 
 func toInt(s string) int {
