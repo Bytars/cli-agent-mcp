@@ -66,6 +66,21 @@ func main() {
 		fmt.Printf("  - %s\n", t.Name)
 	}
 
+	// SMOKE_ONLY=plan isolates a single plan-only call, so a caller can prove the
+	// agent executed nothing (e.g. by checking the filesystem afterward).
+	if os.Getenv("SMOKE_ONLY") == "plan" {
+		fmt.Println("\n== agent_plan_task (ONLY) ==")
+		res := callTool(ctx, session, "agent_plan_task", map[string]any{
+			"prompt": prompt,
+			"agent":  agentName,
+			"cwd":    cwd,
+		})
+		fmt.Printf("status=%s\n", jsonField(res, "status"))
+		fmt.Printf("RESULT:\n%s\n", textContent(res))
+		fmt.Println("PLAN-ONLY DONE")
+		return
+	}
+
 	// 0. streaming run with live progress notifications
 	fmt.Println("\n== agent_run_task (streaming, no polling) ==")
 	runParams := &mcp.CallToolParams{Name: "agent_run_task", Arguments: map[string]any{
