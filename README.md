@@ -281,6 +281,10 @@ Each line is one event:
   executed** (so you can see which permission mode and tool policy were applied).
 - `tool_use` — each tool the worker invoked, with its input (e.g. the actual
   shell command it ran).
+- `tool_result` — the outcome of each tool call (`is_error` + output). A command
+  that failed with **no output** (e.g. an executable killed by security software)
+  is recorded explicitly rather than vanishing, and shows up in the transcript as
+  `↳ ✗ (failed with no output — possibly blocked by security software / sandbox)`.
 - `turn_end` — status, exit code, duration, and a snippet of the result.
 - `cancel` — when a task was interrupted.
 

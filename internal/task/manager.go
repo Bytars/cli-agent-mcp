@@ -633,6 +633,13 @@ func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup)
 						"input":   ev.ToolInput,
 					})
 				}
+				if ev.IsToolResult {
+					t.audit.Log("tool_result", map[string]any{
+						"task_id":  t.ID,
+						"is_error": ev.ToolResultError,
+						"output":   truncateStr(strings.TrimPrefix(ev.Text, "↳ "), 500),
+					})
+				}
 				if sink != nil {
 					sink(ev)
 				}

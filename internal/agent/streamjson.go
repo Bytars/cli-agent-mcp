@@ -97,9 +97,20 @@ func parseClaudeStreamLine(line string) Event {
 					if c.Type != "tool_result" {
 						continue
 					}
+					ev.IsToolResult = true
+					if c.IsError {
+						ev.ToolResultError = true
+					}
 					last := lastNonEmptyLine(rawToText(c.Content))
 					if last == "" {
-						continue
+						// Surface silent failures: a command that failed with no
+						// output (e.g. killed by security software) would otherwise
+						// vanish from the transcript. Make it explicit.
+						if c.IsError {
+							last = "(failed with no output — possibly blocked by security software / sandbox)"
+						} else {
+							continue
+						}
 					}
 					prefix := "↳ "
 					if c.IsError {
