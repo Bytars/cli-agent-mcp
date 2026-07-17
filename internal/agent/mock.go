@@ -50,6 +50,11 @@ func (a *MockAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, err
 	if ms, ok := strings.CutPrefix(spec.Prompt, "sleep:"); ok {
 		args = append(args, "--sleep-ms", ms)
 	}
+	// A "failtool" prompt makes the mock emit a tool that fails with no output,
+	// simulating a command silently killed by security software.
+	if strings.HasPrefix(spec.Prompt, "failtool") {
+		args = append(args, "--fail-tool")
+	}
 	return exec.CommandContext(ctx, a.selfExe, args...), nil
 }
 
@@ -60,6 +65,7 @@ func (a *MockAdapter) ParseLine(line string) Event { return parseClaudeStreamLin
 func RunMock(args []string) int {
 	prompt := "no prompt"
 	planOnly := false
+	failTool := false
 	sleepMs := 0
 	for i := 0; i < len(args); i++ {
 		if args[i] == "-p" && i+1 < len(args) {
@@ -67,6 +73,9 @@ func RunMock(args []string) int {
 		}
 		if args[i] == "--plan" {
 			planOnly = true
+		}
+		if args[i] == "--fail-tool" {
+			failTool = true
 		}
 		if args[i] == "--sleep-ms" && i+1 < len(args) {
 			sleepMs, _ = strconv.Atoi(args[i+1])
@@ -93,6 +102,28 @@ func RunMock(args []string) int {
 				},
 			})
 		}
+	}
+
+	// Simulate a command silently killed (exit error, no output) — like OpenSSH
+	// blocked by security software on a locked-down machine.
+	if failTool {
+		emit(map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"content": []map[string]any{{"type": "tool_use", "id": "t1", "name": "Bash", "input": map[string]any{"command": "ssh -V"}}},
+			},
+		})
+		emit(map[string]any{
+			"type": "user",
+			"message": map[string]any{
+				"content": []map[string]any{{"type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": []map[string]any{}}},
+			},
+		})
+		emit(map[string]any{
+			"type": "result", "subtype": "success", "session_id": "mock-session-1",
+			"is_error": false, "result": "The ssh command failed silently.",
+		})
+		return 0
 	}
 
 	// Plan-only: propose, execute nothing.
