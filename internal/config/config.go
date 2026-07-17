@@ -58,6 +58,12 @@ type Config struct {
 	ClaudeExtraArgs []string
 	CursorExtraArgs []string
 
+	// AppendSystemPrompt is added to Claude Code's system prompt on every task
+	// (--append-system-prompt). Use it for standing, machine-specific guidance —
+	// e.g. "for SSH to internal servers use the full Windows OpenSSH path, the
+	// bare ssh can't reach the 1Password agent".
+	AppendSystemPrompt string
+
 	// CustomName / CustomBin / CustomArgs configure the generic adapter, which
 	// can drive any CLI agent without writing Go. CustomArgs is a template whose
 	// entries may contain {{prompt}}, {{cwd}}, {{model}} and {{session}}.
@@ -156,23 +162,24 @@ func Load() Config {
 	}
 
 	return Config{
-		DefaultAgent:    getenv("CLI_AGENT_MCP_DEFAULT_AGENT", "claude"),
-		ClaudeBin:       getenv("CLI_AGENT_MCP_CLAUDE_BIN", "claude"),
-		CursorBin:       getenv("CLI_AGENT_MCP_CURSOR_BIN", "cursor-agent"),
-		PermissionMode:  getenv("CLI_AGENT_MCP_PERMISSION_MODE", "acceptEdits"),
-		AllowedTools:    getenv("CLI_AGENT_MCP_ALLOWED_TOOLS", ""),
-		DisallowedTools: getenv("CLI_AGENT_MCP_DISALLOWED_TOOLS", ""),
-		AllowExtraArgs:  getbool("CLI_AGENT_MCP_ALLOW_EXTRA_ARGS", false),
-		ClaudeExtraArgs: splitList("CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS"),
-		CursorExtraArgs: splitList("CLI_AGENT_MCP_CURSOR_EXTRA_ARGS"),
-		CustomName:      getenv("CLI_AGENT_MCP_CUSTOM_NAME", "custom"),
-		CustomBin:       getenv("CLI_AGENT_MCP_CUSTOM_BIN", ""),
-		CustomArgs:      splitList("CLI_AGENT_MCP_CUSTOM_ARGS"),
-		DefaultCwd:      getenv("CLI_AGENT_MCP_DEFAULT_CWD", ""),
-		AllowedCwds:     allowed,
-		MaxTasks:        maxTasks,
-		AuditLog:        getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
-		TaskTimeout:     taskTimeout,
-		Compact:         getbool("CLI_AGENT_MCP_COMPACT", true),
+		DefaultAgent:       getenv("CLI_AGENT_MCP_DEFAULT_AGENT", "claude"),
+		ClaudeBin:          getenv("CLI_AGENT_MCP_CLAUDE_BIN", "claude"),
+		CursorBin:          getenv("CLI_AGENT_MCP_CURSOR_BIN", "cursor-agent"),
+		PermissionMode:     getenv("CLI_AGENT_MCP_PERMISSION_MODE", "acceptEdits"),
+		AllowedTools:       getenv("CLI_AGENT_MCP_ALLOWED_TOOLS", ""),
+		DisallowedTools:    getenv("CLI_AGENT_MCP_DISALLOWED_TOOLS", ""),
+		AllowExtraArgs:     getbool("CLI_AGENT_MCP_ALLOW_EXTRA_ARGS", false),
+		ClaudeExtraArgs:    splitList("CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS"),
+		CursorExtraArgs:    splitList("CLI_AGENT_MCP_CURSOR_EXTRA_ARGS"),
+		AppendSystemPrompt: getenv("CLI_AGENT_MCP_APPEND_SYSTEM_PROMPT", ""),
+		CustomName:         getenv("CLI_AGENT_MCP_CUSTOM_NAME", "custom"),
+		CustomBin:          getenv("CLI_AGENT_MCP_CUSTOM_BIN", ""),
+		CustomArgs:         splitList("CLI_AGENT_MCP_CUSTOM_ARGS"),
+		DefaultCwd:         getenv("CLI_AGENT_MCP_DEFAULT_CWD", ""),
+		AllowedCwds:        allowed,
+		MaxTasks:           maxTasks,
+		AuditLog:           getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
+		TaskTimeout:        taskTimeout,
+		Compact:            getbool("CLI_AGENT_MCP_COMPACT", true),
 	}
 }

@@ -58,7 +58,7 @@ func main() {
 	cfg := config.Load()
 
 	reg := agent.NewRegistry(
-		agent.NewClaudeAdapter(cfg.ClaudeBin, cfg.PermissionMode, cfg.AllowedTools, cfg.DisallowedTools, cfg.ClaudeExtraArgs),
+		agent.NewClaudeAdapter(cfg.ClaudeBin, cfg.PermissionMode, cfg.AllowedTools, cfg.DisallowedTools, cfg.AppendSystemPrompt, cfg.ClaudeExtraArgs),
 		agent.NewCursorAdapter(cfg.CursorBin, cfg.CursorExtraArgs),
 		agent.NewCustomAdapter(cfg.CustomName, cfg.CustomBin, cfg.CustomArgs),
 		agent.NewMockAdapter(),
@@ -630,6 +630,10 @@ Configuration (environment variables):
                                      acceptEdits|auto|bypassPermissions|manual|dontAsk|plan
   CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS  Extra Claude flags (';'-separated)
   CLI_AGENT_MCP_CURSOR_EXTRA_ARGS  Extra Cursor flags (';'-separated)
+  CLI_AGENT_MCP_APPEND_SYSTEM_PROMPT  Standing guidance added to every task's system
+                                   prompt. e.g. tell the worker to use the full
+                                   Windows OpenSSH path for internal SSH (the bare
+                                   'ssh' can't reach the 1Password agent).
   CLI_AGENT_MCP_DEFAULT_CWD        Default working directory
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)

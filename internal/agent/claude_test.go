@@ -37,7 +37,7 @@ func hasFlag(args []string, flag string) bool {
 }
 
 func TestClaudeCommand_Defaults(t *testing.T) {
-	a := NewClaudeAdapter("claude", "acceptEdits", "", "", nil)
+	a := NewClaudeAdapter("claude", "acceptEdits", "", "", "", nil)
 	args := argsFor(t, a, RunSpec{Prompt: "do a thing"})
 
 	if !hasFlagValue(args, "-p", "do a thing") {
@@ -58,7 +58,7 @@ func TestClaudeCommand_Defaults(t *testing.T) {
 // silently ran under bypassPermissions would execute the very thing the caller
 // asked it to only propose.
 func TestClaudeCommand_PlanOnlyOverridesPermissionMode(t *testing.T) {
-	a := NewClaudeAdapter("claude", "bypassPermissions", "", "", nil)
+	a := NewClaudeAdapter("claude", "bypassPermissions", "", "", "", nil)
 	args := argsFor(t, a, RunSpec{Prompt: "delete prod", PlanOnly: true})
 
 	if !hasFlagValue(args, "--permission-mode", "plan") {
@@ -76,7 +76,7 @@ func TestClaudeCommand_PlanOnlyOverridesPermissionMode(t *testing.T) {
 // never be able to inject a CLI flag (values are joined into one argument, and
 // flag-looking entries are dropped).
 func TestClaudeCommand_PerRunAllowedTools(t *testing.T) {
-	a := NewClaudeAdapter("claude", "acceptEdits", "Read", "", nil)
+	a := NewClaudeAdapter("claude", "acceptEdits", "Read", "", "", nil)
 	args := argsFor(t, a, RunSpec{
 		Prompt:       "x",
 		AllowedTools: []string{"PowerShell", "Bash(git *)", "--dangerously-skip-permissions", ""},
@@ -113,7 +113,7 @@ func TestMergeAllowed(t *testing.T) {
 }
 
 func TestClaudeCommand_ToolPolicy(t *testing.T) {
-	a := NewClaudeAdapter("claude", "acceptEdits", "Bash(git *),Edit", "Bash(rm *)", nil)
+	a := NewClaudeAdapter("claude", "acceptEdits", "Bash(git *),Edit", "Bash(rm *)", "", nil)
 	args := argsFor(t, a, RunSpec{Prompt: "x"})
 
 	if !hasFlagValue(args, "--allowedTools", "Bash(git *),Edit") {
@@ -125,7 +125,7 @@ func TestClaudeCommand_ToolPolicy(t *testing.T) {
 }
 
 func TestClaudeCommand_OmitsEmptyToolPolicy(t *testing.T) {
-	a := NewClaudeAdapter("claude", "acceptEdits", "", "", nil)
+	a := NewClaudeAdapter("claude", "acceptEdits", "", "", "", nil)
 	args := argsFor(t, a, RunSpec{Prompt: "x"})
 
 	if hasFlag(args, "--allowedTools") || hasFlag(args, "--disallowedTools") {
@@ -133,8 +133,22 @@ func TestClaudeCommand_OmitsEmptyToolPolicy(t *testing.T) {
 	}
 }
 
+func TestClaudeCommand_AppendSystemPrompt(t *testing.T) {
+	guidance := "use the full Windows OpenSSH path for internal SSH"
+	a := NewClaudeAdapter("claude", "acceptEdits", "", "", guidance, nil)
+	args := argsFor(t, a, RunSpec{Prompt: "x"})
+	if !hasFlagValue(args, "--append-system-prompt", guidance) {
+		t.Errorf("append-system-prompt not passed: %v", args)
+	}
+
+	b := NewClaudeAdapter("claude", "acceptEdits", "", "", "", nil)
+	if hasFlag(argsFor(t, b, RunSpec{Prompt: "x"}), "--append-system-prompt") {
+		t.Error("empty append prompt should not emit the flag")
+	}
+}
+
 func TestClaudeCommand_Resume(t *testing.T) {
-	a := NewClaudeAdapter("claude", "acceptEdits", "", "", nil)
+	a := NewClaudeAdapter("claude", "acceptEdits", "", "", "", nil)
 	args := argsFor(t, a, RunSpec{Prompt: "next", SessionID: "sess-123"})
 
 	if !hasFlagValue(args, "--resume", "sess-123") {
@@ -143,7 +157,7 @@ func TestClaudeCommand_Resume(t *testing.T) {
 }
 
 func TestClaudeCommand_EmptyPromptRejected(t *testing.T) {
-	a := NewClaudeAdapter("claude", "acceptEdits", "", "", nil)
+	a := NewClaudeAdapter("claude", "acceptEdits", "", "", "", nil)
 	if _, err := a.Command(context.Background(), RunSpec{Prompt: ""}); err == nil {
 		t.Error("expected an error for an empty prompt")
 	}
@@ -152,7 +166,7 @@ func TestClaudeCommand_EmptyPromptRejected(t *testing.T) {
 // Plan capability must be explicit, and must fail closed for agents that cannot
 // guarantee it — otherwise agent_plan_task would execute the task.
 func TestCanPlan(t *testing.T) {
-	if !CanPlan(NewClaudeAdapter("claude", "acceptEdits", "", "", nil)) {
+	if !CanPlan(NewClaudeAdapter("claude", "acceptEdits", "", "", "", nil)) {
 		t.Error("claude should support plan-only")
 	}
 	if !CanPlan(NewMockAdapter()) {
