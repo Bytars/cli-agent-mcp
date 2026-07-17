@@ -179,6 +179,7 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_DISALLOWED_TOOLS` | — | Claude Code `--disallowedTools` (patterns, e.g. `Bash(rm:*),Bash(git push:*)`). **The reliable deny gate for a headless worker.** |
 | `CLI_AGENT_MCP_ALLOWED_TOOLS` | — | Claude Code `--allowedTools` — pre-approves tools; **additive, does not restrict.** |
 | `CLI_AGENT_MCP_ALLOW_EXTRA_ARGS` | `false` | Allow callers to pass raw agent flags via `extra_args`. **Keep off** — see safety. |
+| `CLI_AGENT_MCP_APPEND_SYSTEM_PROMPT` | — | Standing guidance added to every task's system prompt (Claude `--append-system-prompt`). See [Windows + 1Password SSH](#windows--1password-ssh). |
 | `CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS` | — | Extra Claude flags, `;`-separated. |
 | `CLI_AGENT_MCP_CURSOR_EXTRA_ARGS` | — | Extra Cursor flags, `;`-separated. |
 | `CLI_AGENT_MCP_DEFAULT_CWD` | server's cwd | Working directory when a call omits `cwd`. **Set this.** |
@@ -293,6 +294,33 @@ Each line is one event:
 {"ts":"2026-07-16T02:22:31Z","event":"tool_use","task_id":"task-1-…","tool":"Bash","input":"{\"command\":\"npm test\"}"}
 {"ts":"2026-07-16T02:22:44Z","event":"turn_end","task_id":"task-1-…","status":"done","exit_code":0,"duration_ms":13000}
 ```
+
+## Windows + 1Password SSH
+
+A gotcha worth documenting, since delegating internal-server work over SSH is a
+core use case. On Windows there are two OpenSSH clients:
+
+- **Windows OpenSSH** (`C:\Windows\System32\OpenSSH\ssh.exe`) — talks to the
+  1Password SSH agent over its named pipe. **This one works.**
+- **Git-bash / MSYS OpenSSH** (`/usr/bin/ssh`) — uses Unix-socket agent
+  semantics and **cannot open the Windows named pipe**, so it never sees your
+  1Password keys (`get_agent_identities: ... No such file or directory`).
+
+The catch: a worker's `Bash` tool runs `bash -c`, where a bare `ssh` resolves to
+**git-bash's** client → no keys → `Permission denied (publickey,password)`, even
+though `ssh` works fine in a normal terminal. (`IdentityAgent \\.\pipe\...` in
+`~/.ssh/config` does **not** fix git-bash ssh — MSYS can't open that pipe.)
+
+Fix: tell the worker to always use the full Windows path. Set once, applies to
+every task:
+
+```json
+"CLI_AGENT_MCP_APPEND_SYSTEM_PROMPT": "For any SSH/scp to internal servers, always invoke the Windows OpenSSH client by its full path C:\\Windows\\System32\\OpenSSH\\ssh.exe (and scp.exe) — the bare 'ssh' resolves to git-bash OpenSSH which cannot reach the 1Password SSH agent. Use -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new."
+```
+
+Verified: with this in place, a plain task like *"connect to root@bastion and
+report its hostname"* makes the worker reach for the Windows client and
+authenticate through 1Password with no further hand-holding.
 
 ## ⚠️ Permissions & safety
 

@@ -13,11 +13,12 @@ type ClaudeAdapter struct {
 	PermissionMode  string   // --permission-mode value
 	AllowedTools    string   // --allowedTools value (patterns, e.g. "Bash(git *),Edit")
 	DisallowedTools string   // --disallowedTools value
+	AppendPrompt    string   // --append-system-prompt value (standing guidance)
 	ExtraArgs       []string // appended verbatim
 }
 
 // NewClaudeAdapter constructs a Claude Code adapter.
-func NewClaudeAdapter(bin, permissionMode, allowedTools, disallowedTools string, extraArgs []string) *ClaudeAdapter {
+func NewClaudeAdapter(bin, permissionMode, allowedTools, disallowedTools, appendPrompt string, extraArgs []string) *ClaudeAdapter {
 	if bin == "" {
 		bin = "claude"
 	}
@@ -26,6 +27,7 @@ func NewClaudeAdapter(bin, permissionMode, allowedTools, disallowedTools string,
 		PermissionMode:  permissionMode,
 		AllowedTools:    allowedTools,
 		DisallowedTools: disallowedTools,
+		AppendPrompt:    appendPrompt,
 		ExtraArgs:       extraArgs,
 	}
 }
@@ -74,6 +76,9 @@ func (a *ClaudeAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 	}
 	if a.DisallowedTools != "" {
 		args = append(args, "--disallowedTools", a.DisallowedTools)
+	}
+	if a.AppendPrompt != "" {
+		args = append(args, "--append-system-prompt", a.AppendPrompt)
 	}
 	if spec.Model != "" {
 		args = append(args, "--model", spec.Model)
