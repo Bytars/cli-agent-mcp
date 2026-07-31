@@ -80,7 +80,7 @@ func (a *CustomAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 		}
 	}
 	args = append(args, spec.ExtraArgs...)
-	return buildCommand(ctx, a.Bin, args), nil
+	return buildCommand(ctx, a.Bin, args)
 }
 
 func (a *CustomAdapter) ParseLine(line string) Event {

@@ -47,6 +47,18 @@ func main() {
 		case "--help", "-h", "help":
 			printHelp()
 			return
+		case "--list-agents":
+			// Handled further down, once the registry exists.
+		default:
+			// Anything else that looks like a flag is a typo, not a request to
+			// serve: without this the process would drop into server mode and
+			// hang on stdin with no diagnostic. Usage goes to stderr — stdout is
+			// the MCP wire.
+			if strings.HasPrefix(os.Args[1], "-") {
+				fmt.Fprintf(os.Stderr, "cli-agent-mcp: unknown flag %q\n\n", os.Args[1])
+				fmt.Fprint(os.Stderr, helpText())
+				os.Exit(2)
+			}
 		}
 	}
 
@@ -207,6 +219,35 @@ func textResult(msg string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: msg}}}
 }
 
+// errResult reports a tool-level failure the way the MCP spec prescribes: a
+// successful call whose result carries IsError plus the full explanation.
+//
+// Handlers must return it with a nil error. The SDK's typed-handler wrapper
+// throws the *mcp.CallToolResult away whenever the handler also returns a
+// non-nil error, replacing it with err.Error() alone — so the rich message
+// (which agent is unavailable, why extra_args was refused, what to set) would
+// never reach the client.
+func errResult(msg string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{&mcp.TextContent{Text: "error: " + msg}},
+	}
+}
+
+// ptr returns a pointer to v, for the SDK's optional *bool annotation fields.
+func ptr[T any](v T) *T { return &v }
+
+// readOnlyTool / mutatingTool are the annotation hints shared by the tools of
+// each kind. Read-only tools only inspect this server's own task state;
+// mutating ones launch or kill a worker that can touch anything the host can.
+func readOnlyTool() *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: ptr(false)}
+}
+
+func mutatingTool() *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{DestructiveHint: ptr(true), OpenWorldHint: ptr(true)}
+}
+
 // checkExtraArgs enforces the extra_args policy. It fails closed: `extra_args`
 // is appended after the operator's configured flags, so allowing it by default
 // would let the calling model hand the agent e.g.
@@ -280,6 +321,24 @@ func newProgressSink(ctx context.Context, req *mcp.CallToolRequest) task.EventSi
 	}
 }
 
+// outcomeDetail surfaces the diagnostic fields the result text alone hides: the
+// process exit code and the run error. Without them a run that produced no
+// output reports only "status=failed" and the actual cause stays invisible.
+// Returns "" when there is nothing to add.
+func outcomeDetail(snap task.Snapshot) string {
+	var parts []string
+	if snap.ExitCode != nil {
+		parts = append(parts, fmt.Sprintf("exit_code=%d", *snap.ExitCode))
+	}
+	if snap.Error != "" {
+		parts = append(parts, "error: "+snap.Error)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " " + strings.Join(parts, "; ") + "."
+}
+
 // finishText builds the inline text returned when a streaming run completes.
 func finishText(snap task.Snapshot) string {
 	body := snap.Result
@@ -290,7 +349,7 @@ func finishText(snap task.Snapshot) string {
 	if snap.IsError || snap.Status == task.StatusFailed {
 		header = fmt.Sprintf("Task %s FAILED (status %q).", snap.ID, snap.Status)
 	}
-	return header + "\n\n" + body
+	return header + outcomeDetail(snap) + "\n\n" + body
 }
 
 // planText frames the outcome of a plan-only run, making it unmistakable that
@@ -301,10 +360,11 @@ func planText(snap task.Snapshot) string {
 		body = fmt.Sprintf("(agent produced no plan text; status=%s)", snap.Status)
 	}
 	if snap.IsError || snap.Status == task.StatusFailed {
-		return fmt.Sprintf("Planning task %s FAILED (status %q). Nothing was executed.\n\n%s", snap.ID, snap.Status, body)
+		return fmt.Sprintf("Planning task %s FAILED (status %q).%s Nothing was executed.\n\n%s",
+			snap.ID, snap.Status, outcomeDetail(snap), body)
 	}
-	return fmt.Sprintf("Task %s planned — NOTHING WAS EXECUTED.\n\n%s\n\nReview this with the user. To carry it out, call agent_run_followup with task_id=%s.",
-		snap.ID, body, snap.ID)
+	return fmt.Sprintf("Task %s planned (status %q) — NOTHING WAS EXECUTED.%s\n\n%s\n\nReview this with the user. To carry it out, call agent_run_followup with task_id=%s.",
+		snap.ID, snap.Status, outcomeDetail(snap), body, snap.ID)
 }
 
 func firstLine(s string) string {
@@ -325,16 +385,17 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_run_task",
 		Description: "Delegate a task to a local headless CLI agent (Claude Code or Cursor) and WAIT for it to finish, streaming live progress notifications as the agent works. This is the seamless, in-line mode — no polling — so it feels like you did the work yourself. Use agent_start_task instead only when you want fire-and-forget or several tasks running in parallel.",
+		Annotations: mutatingTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in startInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
-			return textResult("error: prompt is required"), task.Snapshot{}, fmt.Errorf("prompt is required")
+			return errResult("prompt is required"), task.Snapshot{}, nil
 		}
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		a, cwd, emsg, err := resolveTarget(reg, cfg, in.Agent, in.Cwd)
 		if err != nil {
-			return textResult("error: " + emsg), task.Snapshot{}, err
+			return errResult(emsg), task.Snapshot{}, nil
 		}
 		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
 			Prompt:       in.Prompt,
@@ -343,7 +404,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			ExtraArgs:    in.ExtraArgs,
 		}, newProgressSink(ctx, req))
 		if err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
 		return textResult(finishText(snap)), snap, nil
@@ -354,21 +415,24 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		Description: "Ask the agent to PLAN a task WITHOUT executing it: it inspects the code and proposes the steps it would take, but changes nothing and runs no commands. " +
 			"Use this first for anything risky or destructive, show the plan to the user, then call agent_run_followup with the returned task_id to actually carry it out. " +
 			"Fails if the selected agent cannot guarantee plan-only execution.",
+		// Plan-only changes nothing on disk, but it still spawns a worker and
+		// creates a tracked task, so it is not a read-only call.
+		Annotations: mutatingTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in startInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
-			return textResult("error: prompt is required"), task.Snapshot{}, fmt.Errorf("prompt is required")
+			return errResult("prompt is required"), task.Snapshot{}, nil
 		}
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		a, cwd, emsg, err := resolveTarget(reg, cfg, in.Agent, in.Cwd)
 		if err != nil {
-			return textResult("error: " + emsg), task.Snapshot{}, err
+			return errResult(emsg), task.Snapshot{}, nil
 		}
 		// Fail closed: never fall back to executing when plan-only was requested.
 		if !agent.CanPlan(a) {
 			msg := fmt.Sprintf("agent %q cannot guarantee plan-only execution, so refusing to run: it would carry the task out instead of planning it", a.Name())
-			return textResult("error: " + msg), task.Snapshot{}, fmt.Errorf("%s", msg)
+			return errResult(msg), task.Snapshot{}, nil
 		}
 		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
 			Prompt:       in.Prompt,
@@ -378,7 +442,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			PlanOnly:     true,
 		}, newProgressSink(ctx, req))
 		if err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
 		return textResult(planText(snap)), snap, nil
@@ -387,16 +451,17 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_run_followup",
 		Description: "Continue a finished task's session with a new instruction and WAIT for it to finish, streaming live progress (same seamless mode as agent_run_task). Resumes the same agent conversation.",
+		Annotations: mutatingTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in followupInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
-			return textResult("error: prompt is required"), task.Snapshot{}, fmt.Errorf("prompt is required")
+			return errResult("prompt is required"), task.Snapshot{}, nil
 		}
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		t, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs, newProgressSink(ctx, req))
 		if err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
 		return textResult(finishText(snap)), snap, nil
@@ -405,16 +470,17 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_start_task",
 		Description: "Delegate a task to a local headless CLI agent (Claude Code or Cursor) WITHOUT waiting. Returns a task_id immediately; runs in the background. Use for fire-and-forget or running several agents in parallel, then poll agent_task_status. For the seamless single-task experience, prefer agent_run_task.",
+		Annotations: mutatingTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in startInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
-			return textResult("error: prompt is required"), task.Snapshot{}, fmt.Errorf("prompt is required")
+			return errResult("prompt is required"), task.Snapshot{}, nil
 		}
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		a, cwd, emsg, err := resolveTarget(reg, cfg, in.Agent, in.Cwd)
 		if err != nil {
-			return textResult("error: " + emsg), task.Snapshot{}, err
+			return errResult(emsg), task.Snapshot{}, nil
 		}
 		t, err := mgr.StartTask(a, cwd, agent.RunSpec{
 			Prompt:       in.Prompt,
@@ -423,7 +489,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			ExtraArgs:    in.ExtraArgs,
 		})
 		if err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
 		msg := fmt.Sprintf("Started task %s on agent %q in %s. Poll agent_task_status until status is \"done\" or \"failed\".", snap.ID, snap.Agent, snap.Cwd)
@@ -433,10 +499,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_task_status",
 		Description: "Get the current status and result of a delegated task. Poll this until status is \"done\" or \"failed\".",
+		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in idInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		t, ok := mgr.Get(in.TaskID)
 		if !ok {
-			return textResult("error: unknown task " + in.TaskID), task.Snapshot{}, fmt.Errorf("unknown task %q", in.TaskID)
+			return errResult("unknown task " + in.TaskID), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
 		msg := fmt.Sprintf("Task %s: status=%s", snap.ID, snap.Status)
@@ -449,10 +516,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_get_output",
 		Description: "Fetch the streamed transcript of a task (raw agent output lines). Use since_line/max_lines for incremental reads on long tasks.",
+		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in outputInput) (*mcp.CallToolResult, outputResult, error) {
 		t, ok := mgr.Get(in.TaskID)
 		if !ok {
-			return textResult("error: unknown task " + in.TaskID), outputResult{}, fmt.Errorf("unknown task %q", in.TaskID)
+			return errResult("unknown task " + in.TaskID), outputResult{}, nil
 		}
 		from, to, total, text := t.Output(in.SinceLine, in.MaxLines, cfg.Compact && !in.Raw)
 		snap := t.Snapshot()
@@ -477,10 +545,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			"By default (until=\"done\") a SINGLE call blocks until the task finishes and streams progress the whole time — so you do NOT need to call this repeatedly. Use it right after agent_start_task and just wait. " +
 			"Use until=\"change\" instead when you want to actively supervise: it returns as soon as there's new output so you can judge it and call agent_cancel_task if it's going wrong (then loop, passing back next_since_line). " +
 			"To steer, cancel and start a corrected task, or agent_send_followup once it has finished.",
+		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in watchInput) (*mcp.CallToolResult, watchResult, error) {
 		t, ok := mgr.Get(in.TaskID)
 		if !ok {
-			return textResult("error: unknown task " + in.TaskID), watchResult{}, fmt.Errorf("unknown task %q", in.TaskID)
+			return errResult("unknown task " + in.TaskID), watchResult{}, nil
 		}
 		compact := cfg.Compact && !in.Raw
 
@@ -546,7 +615,9 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		snap := t.Snapshot()
 		final := snap.Result
 		if final == "" {
-			final = fmt.Sprintf("(no textual result; status=%s)", status)
+			// Without the exit code and error, a watcher that ends on a failure
+			// is told only that there was no text — the cause stays invisible.
+			final = fmt.Sprintf("(no textual result; status=%s)%s", status, outcomeDetail(snap))
 		}
 		return textResult(fmt.Sprintf("Task %s finished with status %q.\n\n%s", snap.ID, status, final)),
 			watchResult{TaskID: snap.ID, Status: string(status), Running: running, NewSinceLine: since, Text: final}, nil
@@ -555,16 +626,17 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_send_followup",
 		Description: "Continue a finished task's session with a new instruction (resumes the same agent conversation). Fails if the task is still running.",
+		Annotations: mutatingTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in followupInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
-			return textResult("error: prompt is required"), task.Snapshot{}, fmt.Errorf("prompt is required")
+			return errResult("prompt is required"), task.Snapshot{}, nil
 		}
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		t, err := mgr.Followup(in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs)
 		if err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
 		return textResult(fmt.Sprintf("Resumed task %s (session %s). Poll agent_task_status.", snap.ID, snap.SessionID)), snap, nil
@@ -573,10 +645,16 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_cancel_task",
 		Description: "Request cancellation of a running task (terminates the agent process).",
+		// Cancelling an already-cancelled task changes nothing further.
+		Annotations: &mcp.ToolAnnotations{
+			DestructiveHint: ptr(true),
+			IdempotentHint:  true,
+			OpenWorldHint:   ptr(false),
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in idInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		snap, err := mgr.Cancel(in.TaskID)
 		if err != nil {
-			return textResult("error: " + err.Error()), task.Snapshot{}, err
+			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		return textResult(fmt.Sprintf("Task %s: status=%s", snap.ID, snap.Status)), snap, nil
 	})
@@ -584,6 +662,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_list_tasks",
 		Description: "List all known tasks (newest first) with their status.",
+		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, listResult, error) {
 		tasks := mgr.List()
 		return textResult(fmt.Sprintf("%d task(s).", len(tasks))), listResult{Tasks: tasks}, nil
@@ -592,6 +671,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_list_agents",
 		Description: "List the CLI agents this server can drive and whether each is available on this machine.",
+		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, agentsResult, error) {
 		var infos []agentInfo
 		for _, a := range reg.All() {
@@ -607,10 +687,25 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		return textResult(fmt.Sprintf("Default agent: %s", cfg.DefaultAgent)),
 			agentsResult{DefaultAgent: cfg.DefaultAgent, Agents: infos}, nil
 	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "agent_diagnose",
+		Description: "Diagnostica la cadena de ejecución: identidad de paquete del proceso (MSIX en Windows), si el spawn de procesos hijos funciona, y cómo resuelve cada agente su binario. Usar cuando un agente falla sin explicación o con exit code sin salida.",
+		Annotations: readOnlyTool(),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, agent.DiagnosticReport, error) {
+		rep := agent.Diagnose(ctx, reg)
+		return textResult(rep.Text()), rep, nil
+	})
 }
 
 func printHelp() {
-	fmt.Print(`cli-agent-mcp ` + version + `
+	fmt.Print(helpText())
+}
+
+// helpText is the usage block, kept separate from printHelp so the unknown-flag
+// path can write it to stderr instead of stdout.
+func helpText() string {
+	return `cli-agent-mcp ` + version + `
 
 An MCP (stdio) server that lets an MCP client (e.g. Claude Desktop) drive a local
 headless CLI coding agent — Claude Code, Cursor, or any tool you configure — as a
@@ -668,5 +763,5 @@ Custom agent (drive any CLI without writing Go):
   Example:
     CLI_AGENT_MCP_CUSTOM_BIN=aider
     CLI_AGENT_MCP_CUSTOM_ARGS=--no-pretty;--yes;--message;{{prompt}}
-`)
+`
 }
