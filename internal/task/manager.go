@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/andresh0816/cli-agent-mcp/internal/agent"
 	"github.com/andresh0816/cli-agent-mcp/internal/audit"
@@ -55,6 +56,8 @@ type Task struct {
 	sessionID         string
 	lines             []string // raw output lines
 	display           []string // aligned with lines: compact rendering, "" = noise
+	fromStderr        []bool   // aligned with lines: this line came from stderr
+	truncated         bool     // transcript hit its cap; no more lines are kept
 	resultText        string
 	lastText          string // last human-facing text event of the current turn
 	isError           bool
@@ -180,7 +183,17 @@ func (t *Task) Output(since, max int, compact bool) (from, to, total int, text s
 // joinRange renders lines[from:to] as compact display or raw JSONL. Caller holds mu.
 func (t *Task) joinRange(from, to int, compact bool) string {
 	if !compact {
-		return strings.Join(t.lines[from:to], "\n")
+		// Raw mode promises the agent's JSONL transcript. stderr lines are not
+		// JSON, so emitting them here breaks any client that parses the result.
+		// They remain visible in compact mode and in the audit log.
+		var raw []string
+		for i := from; i < to && i < len(t.lines); i++ {
+			if i < len(t.fromStderr) && t.fromStderr[i] {
+				continue
+			}
+			raw = append(raw, t.lines[i])
+		}
+		return strings.Join(raw, "\n")
 	}
 	var kept []string
 	for i := from; i < to && i < len(t.display); i++ {
@@ -281,6 +294,7 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*T
 		adapter:   a,
 		audit:     m.audit,
 		status:    StatusRunning,
+		running:   true,
 		startedAt: time.Now(),
 	}
 	spec.Cwd = cwd
@@ -308,6 +322,7 @@ func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd str
 		adapter:   a,
 		audit:     m.audit,
 		status:    StatusRunning,
+		running:   true,
 		startedAt: time.Now(),
 	}
 	spec.Cwd = cwd
@@ -372,11 +387,18 @@ func (m *Manager) prepareFollowup(id, prompt string, allowedTools, extraArgs []s
 	session := t.sessionID
 	model := t.Model
 	cwd := t.Cwd
-	t.mu.Unlock()
-
 	if session == "" {
+		t.mu.Unlock()
 		return nil, agent.RunSpec{}, errors.New("no session id captured for this task; cannot resume (start a new task instead)")
 	}
+	// Claim the task before releasing the lock. Checking `running` here and
+	// letting runTurn set it later leaves a window in which two concurrent
+	// follow-ups both pass this guard and spawn a process against the same
+	// session: they interleave into one transcript, and the first to finish
+	// clears t.cancel, leaving the second unkillable.
+	t.running = true
+	t.status = StatusRunning
+	t.mu.Unlock()
 	return t, agent.RunSpec{
 		Prompt:       prompt,
 		Cwd:          cwd,
@@ -417,6 +439,9 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	t.turns = append(t.turns, TurnInfo{Prompt: spec.Prompt, StartLine: turnStart, StartedAt: turnStarted})
 	t.mu.Unlock()
 
+	// Every early-return path must still close the audit trail. Without this a
+	// turn that fails to spawn leaves a turn_start with no turn_end, which is
+	// exactly the case an operator most needs to see in the log.
 	fail := func(msg string) {
 		t.mu.Lock()
 		t.running = false
@@ -424,9 +449,16 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		t.status = StatusFailed
 		t.runErr = msg
 		t.endedAt = time.Now()
-		t.appendLine("[error] "+msg, "✗ "+msg)
+		t.appendLine("[error] "+msg, "✗ "+msg, false)
 		t.mu.Unlock()
 		cancel()
+		t.audit.Log("turn_end", map[string]any{
+			"task_id":     t.ID,
+			"status":      string(StatusFailed),
+			"is_error":    true,
+			"error":       msg,
+			"duration_ms": time.Since(turnStarted).Milliseconds(),
+		})
 	}
 
 	cmd, err := t.adapter.Command(ctx, spec)
@@ -436,7 +468,8 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	}
 	cmd.Dir = spec.Cwd
 	// cmd.Env left nil → child inherits our full environment (VPN, SSH agent).
-	configureCancel(cmd) // make cancellation kill the whole process tree
+	guard := newProcGuard(cmd) // cancellation must reach the whole process tree
+	defer guard.Close()
 
 	t.audit.Log("turn_start", map[string]any{
 		"task_id":   t.ID,
@@ -462,6 +495,7 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		fail("starting agent: " + err.Error())
 		return
 	}
+	guard.AfterStart(cmd)
 
 	// Safety net: a headless worker can hang forever (e.g. blocked on a
 	// permission prompt with no approver). If a timeout is configured, kill the
@@ -480,8 +514,24 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	wg.Add(2)
 	go t.pump(stdout, false, sink, &wg)
 	go t.pump(stderr, true, sink, &wg)
-	wg.Wait()
+
+	// Order matters. Waiting on the pumps first looks natural but hangs forever
+	// whenever the agent leaves a background process holding the inherited
+	// stdout handle: the pipe never reaches EOF, so the pumps never return, and
+	// cmd.Wait — the only thing that honours WaitDelay and force-closes the
+	// pipes — is never reached. Calling Wait first lets WaitDelay do its job,
+	// after which the pumps see EOF. The grace period below is a second
+	// backstop so a stuck reader can never strand the turn.
+	pumpsDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(pumpsDone)
+	}()
 	waitErr := cmd.Wait()
+	select {
+	case <-pumpsDone:
+	case <-time.After(pumpGrace):
+	}
 
 	t.mu.Lock()
 	t.running = false
@@ -536,6 +586,17 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 const (
 	maxResultLines = 200
 	maxResultChars = 8000
+
+	// A transcript is held in memory for the life of the task, twice over (raw
+	// plus rendered). MaxTasks caps how many tasks exist, not how large one can
+	// get: a single long run over a big repository could otherwise exhaust the
+	// process on its own.
+	maxTranscriptLines = 50000
+	maxLineBytes       = 64 * 1024
+
+	// How long to wait for the output readers after the process has exited and
+	// WaitDelay has already forced the pipes closed.
+	pumpGrace = 2 * time.Second
 )
 
 func useOutputAsResult(a agent.Adapter) bool {
@@ -543,11 +604,30 @@ func useOutputAsResult(a agent.Adapter) bool {
 	return ok && r.UseOutputAsResult()
 }
 
+// truncateStr cuts to at most max bytes without splitting a rune. Naive slicing
+// mangles the multi-byte characters this code emits itself (✓ ⚙ ↳ ⚠) and any
+// non-ASCII prompt, and json.Marshal then replaces the broken bytes with U+FFFD.
 func truncateStr(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "…"
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// truncateTail keeps at most max bytes from the end, on a rune boundary.
+func truncateTail(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	start := len(s) - max
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return "…" + s[start:]
 }
 
 // tailLines joins the last maxLines lines, capped at maxChars from the end.
@@ -555,19 +635,26 @@ func tailLines(lines []string, maxLines, maxChars int) string {
 	if len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:]
 	}
-	s := strings.TrimSpace(strings.Join(lines, "\n"))
-	if len(s) > maxChars {
-		s = "…" + s[len(s)-maxChars:]
-	}
-	return s
+	return truncateTail(strings.TrimSpace(strings.Join(lines, "\n")), maxChars)
 }
 
 // appendLine adds a raw line and its compact rendering (which may be ""). The
 // two slices stay the same length so a raw line index also indexes its display
 // entry. Caller holds t.mu.
-func (t *Task) appendLine(raw, display string) {
-	t.lines = append(t.lines, raw)
-	t.display = append(t.display, display)
+func (t *Task) appendLine(raw, display string, isErr bool) {
+	if t.truncated {
+		return
+	}
+	if len(t.lines) >= maxTranscriptLines {
+		t.truncated = true
+		t.lines = append(t.lines, "[transcript truncated: line limit reached]")
+		t.display = append(t.display, "⚠ transcript truncated (line limit reached)")
+		t.fromStderr = append(t.fromStderr, true)
+		return
+	}
+	t.lines = append(t.lines, truncateStr(raw, maxLineBytes))
+	t.display = append(t.display, truncateStr(display, maxLineBytes))
+	t.fromStderr = append(t.fromStderr, isErr)
 }
 
 // renderEvent produces the compact, human-facing rendering of a parsed event,
@@ -604,7 +691,7 @@ func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup)
 		if line != "" {
 			if isErr {
 				t.mu.Lock()
-				t.appendLine("[stderr] "+line, "⚠ "+strings.TrimSpace(line))
+				t.appendLine("[stderr] "+line, "⚠ "+strings.TrimSpace(line), true)
 				t.mu.Unlock()
 				if sink != nil {
 					sink(agent.Event{Raw: line, Text: "⚠ " + strings.TrimSpace(line)})
@@ -612,7 +699,7 @@ func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup)
 			} else {
 				ev := t.adapter.ParseLine(line)
 				t.mu.Lock()
-				t.appendLine(line, renderEvent(ev))
+				t.appendLine(line, renderEvent(ev), false)
 				if ev.SessionID != "" {
 					t.sessionID = ev.SessionID
 				}
@@ -695,7 +782,17 @@ func (m *Manager) Cancel(id string) (Snapshot, error) {
 	if cancel != nil {
 		cancel()
 	}
-	// Give the run goroutine a moment to transition.
-	time.Sleep(50 * time.Millisecond)
+	// Wait for the run goroutine to actually transition, rather than guessing at
+	// a fixed delay that a loaded machine will outrun.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		t.mu.Lock()
+		still := t.running
+		t.mu.Unlock()
+		if !still {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	return t.Snapshot(), nil
 }

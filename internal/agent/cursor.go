@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // CursorAdapter drives Cursor's headless agent (`cursor-agent -p`).
@@ -79,9 +81,32 @@ func detectCursorNode() (node, entry string) {
 		if len(versions) == 0 {
 			continue
 		}
-		// The zero-padded date form sorts correctly lexicographically; take the
-		// newest directory that actually contains the files.
-		sort.Sort(sort.Reverse(sort.StringSlice(versions)))
+		// Month and day are NOT zero-padded (the pattern accepts \d{1,2}), so a
+		// lexicographic sort ranks "2026.2.1" above "2026.10.1" and would pick a
+		// stale install from October onwards. Compare the numeric components
+		// instead, newest first, and fall back to string order for names that
+		// don't parse. Take the newest directory that actually has the files.
+		sort.Slice(versions, func(i, j int) bool {
+			yi, mi, di, oki := parseCursorVersion(versions[i])
+			yj, mj, dj, okj := parseCursorVersion(versions[j])
+			if oki != okj {
+				return oki // parseable names win over unparseable ones
+			}
+			if oki && okj {
+				if yi != yj {
+					return yi > yj
+				}
+				if mi != mj {
+					return mi > mj
+				}
+				if di != dj {
+					return di > dj
+				}
+			}
+			// Same date (or neither parsed): descending string order, which also
+			// makes the ordering total and therefore deterministic.
+			return versions[i] > versions[j]
+		})
 		for _, v := range versions {
 			n := filepath.Join(versionsDir, v, nodeBinaryName())
 			idx := filepath.Join(versionsDir, v, "index.js")
@@ -91,6 +116,30 @@ func detectCursorNode() (node, entry string) {
 		}
 	}
 	return "", ""
+}
+
+// parseCursorVersion extracts the numeric year/month/day prefix of a
+// cursor-agent version directory name (e.g. "2026.10.1-abc123" or
+// "2026.10.1-01-02-03-abc123"). ok is false when the name does not have the
+// expected three-component numeric head.
+func parseCursorVersion(name string) (y, m, d int, ok bool) {
+	head := name
+	if i := strings.IndexByte(head, '-'); i >= 0 {
+		head = head[:i]
+	}
+	parts := strings.Split(head, ".")
+	if len(parts) != 3 {
+		return 0, 0, 0, false
+	}
+	var nums [3]int
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		nums[i] = n
+	}
+	return nums[0], nums[1], nums[2], true
 }
 
 func fileExists(p string) bool {
@@ -131,9 +180,9 @@ func (a *CursorAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 	if a.node != "" {
 		// node.exe index.js <args...> — a clean .exe invocation, no wrapper.
 		full := append([]string{a.entry}, args...)
-		return buildCommand(ctx, a.node, full), nil
+		return buildCommand(ctx, a.node, full)
 	}
-	return buildCommand(ctx, a.Bin, args), nil
+	return buildCommand(ctx, a.Bin, args)
 }
 
 // ParseLine is tolerant of Cursor's exact schema: it extracts a session id and a

@@ -14,6 +14,8 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -102,18 +104,33 @@ func NewRegistry(adapters ...Adapter) *Registry {
 		if a == nil {
 			continue
 		}
-		if _, exists := r.byName[a.Name()]; !exists {
-			r.order = append(r.order, a.Name())
+		// Look-ups normalise the name, so registration must too — otherwise an
+		// adapter named "Aider" is listed as available but can never be reached.
+		key := normalizeName(a.Name())
+		if key == "" {
+			log.Printf("cli-agent-mcp: ignoring adapter with an empty name")
+			continue
 		}
-		r.byName[a.Name()] = a
+		if prev, exists := r.byName[key]; exists {
+			// Silently replacing a built-in would drop its whole policy
+			// (permission mode, disallowed tools) with no trace.
+			log.Printf("cli-agent-mcp: adapter name %q is already registered by %T; keeping the first and ignoring %T", key, prev, a)
+			continue
+		}
+		r.order = append(r.order, key)
+		r.byName[key] = a
 	}
 	return r
 }
 
 // Get returns the adapter for name, or nil.
 func (r *Registry) Get(name string) Adapter {
-	return r.byName[strings.ToLower(strings.TrimSpace(name))]
+	return r.byName[normalizeName(name)]
 }
+
+// normalizeName is the single definition of adapter-name identity, used by both
+// registration and look-up so the two can never disagree.
+func normalizeName(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
 // Names returns the registered adapter names in registration order.
 func (r *Registry) Names() []string {
@@ -131,28 +148,97 @@ func (r *Registry) All() []Adapter {
 	return out
 }
 
-// buildCommand creates an *exec.Cmd for bin+args, transparently handling
-// Windows script wrappers so adapters can treat every launcher uniformly.
+// buildCommand creates an *exec.Cmd for bin+args, resolving Windows script
+// wrappers so adapters can treat every launcher uniformly.
 //
-//   - .exe / no ext : executed directly (Go quotes args correctly).
-//   - .ps1          : run via `powershell -NoProfile -ExecutionPolicy Bypass -File`.
-//   - .cmd / .bat   : run via `cmd /c`.
+//   - npm-style shim : resolved to `node.exe entry.js ...` and run directly.
+//   - .exe / no ext  : executed directly (Go quotes args correctly).
+//   - .ps1 / .cmd    : last resort, via an interpreter anchored to System32, and
+//     only when no argument contains a character that a second parser could
+//     reinterpret. Otherwise it returns an actionable error.
 //
-// Prefer resolving to a real .exe where possible (see the Cursor adapter, which
-// detects node.exe): direct execution avoids all cmd/powershell re-quoting.
-func buildCommand(ctx context.Context, bin string, args []string) *exec.Cmd {
+// Direct execution is always preferred: it keeps argv verbatim, avoids every
+// shell-quoting hazard, and removes an interpreter hop that packaged hosts
+// handle poorly.
+func buildCommand(ctx context.Context, bin string, args []string) (*exec.Cmd, error) {
 	resolved := bin
 	if p, err := exec.LookPath(bin); err == nil {
 		resolved = p
 	}
+
+	// Preferred path: if this is an npm-style script shim, run what it would
+	// have run. One process, argv passed verbatim, no shell parser involved.
+	if node, entry, ok := resolveScriptShim(resolved); ok {
+		full := append([]string{entry}, args...)
+		return hardenSpawn(exec.CommandContext(ctx, node, full...)), nil
+	}
+
 	switch strings.ToLower(filepath.Ext(resolved)) {
 	case ".ps1":
+		if bad := unsafeForShell(args); bad != "" {
+			return nil, shellArgError(resolved, bad, "PowerShell")
+		}
 		psArgs := append([]string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", resolved}, args...)
-		return exec.CommandContext(ctx, "powershell", psArgs...)
+		return hardenSpawn(exec.CommandContext(ctx, powershellPath(), psArgs...)), nil
 	case ".cmd", ".bat":
+		if bad := unsafeForShell(args); bad != "" {
+			return nil, shellArgError(resolved, bad, "cmd.exe")
+		}
 		cmdArgs := append([]string{"/c", resolved}, args...)
-		return exec.CommandContext(ctx, "cmd", cmdArgs...)
+		return hardenSpawn(exec.CommandContext(ctx, cmdPath(), cmdArgs...)), nil
 	default:
-		return exec.CommandContext(ctx, resolved, args...)
+		return hardenSpawn(exec.CommandContext(ctx, resolved, args...)), nil
 	}
+}
+
+// shellMetaChars are the characters we cannot round-trip safely through a
+// second parser. `"` terminates cmd.exe's quoting (it does not understand Go's
+// `\"`), and `%` / `!` are expanded even inside quotes.
+const shellMetaChars = "\"%!"
+
+// unsafeForShell returns the first argument that cannot be passed through an
+// interpreter without risk, or "" when all are safe.
+func unsafeForShell(args []string) string {
+	for _, a := range args {
+		if strings.ContainsAny(a, shellMetaChars) {
+			return a
+		}
+	}
+	return ""
+}
+
+func shellArgError(launcher, arg, interp string) error {
+	preview := arg
+	if len(preview) > 80 {
+		preview = preview[:80] + "…"
+	}
+	return fmt.Errorf(
+		"refusing to run %s through %s: an argument contains characters that cannot be quoted safely (%q).\n"+
+			"This launcher is a script shim and its Node entry point could not be resolved automatically.\n"+
+			"Point the agent at a real executable instead — e.g. set the *_BIN variable to node.exe or to the agent's .exe.\n"+
+			"Offending argument: %s",
+		filepath.Base(launcher), interp, shellMetaChars, preview)
+}
+
+// cmdPath and powershellPath anchor the interpreters to the system directory.
+// Resolving them through PATH invites hijacking, and under a packaged host the
+// PATH may contain app-execution aliases that behave differently from the real
+// binaries.
+func cmdPath() string {
+	if root := systemRoot(); root != "" {
+		if p := filepath.Join(root, "System32", "cmd.exe"); fileExists(p) {
+			return p
+		}
+	}
+	return "cmd"
+}
+
+func powershellPath() string {
+	if root := systemRoot(); root != "" {
+		p := filepath.Join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+		if fileExists(p) {
+			return p
+		}
+	}
+	return "powershell"
 }
