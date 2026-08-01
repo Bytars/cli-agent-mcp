@@ -95,6 +95,11 @@ type Config struct {
 	// was asked to do. Empty disables it.
 	AuditLog string
 
+	// StateDir is where the task registry and the instance lock live, so a
+	// restarted or second server instance can still see earlier tasks. Empty
+	// means the per-user default.
+	StateDir string
+
 	// TaskTimeout, if > 0, cancels any turn that runs longer than this. It is a
 	// safety net against a worker that hangs — e.g. blocked on a permission
 	// prompt with no human to approve it. Zero means no timeout.
@@ -201,6 +206,7 @@ func Load() Config {
 		AllowedCwds:        allowed,
 		MaxTasks:           maxTasks,
 		AuditLog:           getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
+		StateDir:           getenv("CLI_AGENT_MCP_STATE_DIR", ""),
 		TaskTimeout:        taskTimeout,
 		Compact:            getbool("CLI_AGENT_MCP_COMPACT", true),
 	}

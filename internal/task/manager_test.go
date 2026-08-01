@@ -3,6 +3,8 @@ package task
 import (
 	"strings"
 	"testing"
+
+	"github.com/andresh0816/cli-agent-mcp/internal/agent"
 )
 
 func TestTruncateStrKeepsRunesIntact(t *testing.T) {
@@ -93,7 +95,9 @@ func TestPrepareFollowupClaimsTaskUnderLock(t *testing.T) {
 	// against the same session. The claim must happen before the lock is
 	// released, so the second attempt is rejected.
 	m := NewManager(10)
-	tk := &Task{ID: "t1", status: StatusDone, sessionID: "sess-1"}
+	// The adapter matters only because prepareFollowup now refuses to resume a
+	// task whose agent is gone; every real task has one.
+	tk := &Task{ID: "t1", status: StatusDone, sessionID: "sess-1", adapter: agent.NewMockAdapter()}
 	m.tasks = map[string]*Task{"t1": tk}
 	m.order = []string{"t1"}
 
