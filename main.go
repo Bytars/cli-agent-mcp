@@ -134,7 +134,7 @@ IMPORTANT — you cannot stop the worker once it starts. Progress notifications 
 BACKGROUND MODE (a tracked task you watch):
 1. agent_start_task — start the task, get a task_id (returns immediately).
 2. agent_watch — call it ONCE. By default (until="done") it blocks in this single call until the task finishes, streaming live progress to the user the whole time. Do NOT poll it in a loop; just make the one call and wait for it to return the result. Use this when you want the task tracked/backgrounded but still wait for it.
-3. Only if you need to actively supervise and possibly interrupt: call agent_watch with until="change" (returns on each new chunk so you can judge it), and agent_cancel_task if it drifts (kills the whole process tree). To redirect: cancel and start a corrected task, or agent_send_followup once finished.
+3. Only if you need to actively supervise and possibly interrupt: call agent_watch with until="change" (returns on each new chunk so you can judge it), and agent_cancel_task if it drifts (terminates the worker and the process tree it created; a process the worker deliberately detached via ShellExecute can outlive it). To redirect: cancel and start a corrected task, or agent_send_followup once finished.
 
 Also: agent_task_status / agent_get_output (poll/read on demand), agent_list_tasks, agent_list_agents.
 
@@ -690,7 +690,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_diagnose",
-		Description: "Diagnose the execution chain: whether this process has package identity (MSIX on Windows), whether spawning child processes works, and how each agent resolves its binary. Use this when an agent fails without explanation or exits non-zero with no output.",
+		Description: "Diagnostica la cadena de ejecución: identidad de paquete del proceso (MSIX en Windows), si el spawn de procesos hijos funciona, y cómo resuelve cada agente su binario. Usar cuando un agente falla sin explicación o con exit code sin salida.",
 		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, agent.DiagnosticReport, error) {
 		rep := agent.Diagnose(ctx, reg)

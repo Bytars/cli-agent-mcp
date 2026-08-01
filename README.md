@@ -254,9 +254,16 @@ it supervise:
    on track.
 3. If it drifts, `agent_cancel_task` stops it immediately. On Windows the turn
    runs inside a Job Object created with `KILL_ON_JOB_CLOSE`, and on Unix in its
-   own process group, so cancelling reaches every descendant — not just the
-   launcher. (Job membership is inherited, which is why this holds even when the
-   agent's launcher has already exited and its children were reparented.)
+   own process group, so cancelling reaches the tree the worker created — not
+   just the launcher, and including grandchildren whose intermediate parent has
+   already exited, which is where `taskkill /T` used to lose them.
+
+   The boundary, measured rather than assumed: a process the worker *detaches*
+   through ShellExecuteEx — PowerShell's `Start-Process` does this by default —
+   is created by the shell rather than by us. It never joins the job, and no
+   parentage-based mechanism can reach it. In testing, such a grandchild was
+   still alive and writing after its turn ended. Cancellation is containment of
+   the worker, not a guarantee that nothing it ever launched can outlive it.
 
 The server's tool instructions teach this flow, so a capable client will do it on
 its own when supervision matters.
