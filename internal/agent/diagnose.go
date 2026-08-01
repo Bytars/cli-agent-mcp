@@ -51,6 +51,7 @@ type DiagnosticReport struct {
 	PackageName   string        `json:"package_name,omitempty"`
 	SpawnProbes   []SpawnProbe  `json:"spawn_probes"`
 	Adapters      []AdapterDiag `json:"adapters"`
+	EnvRepaired   []string      `json:"env_repaired,omitempty"`
 	Notes         []string      `json:"notes,omitempty"`
 	SpawnWorks    bool          `json:"spawn_works"`
 	SilentFailure bool          `json:"silent_failure_detected"`
@@ -64,6 +65,7 @@ func Diagnose(ctx context.Context, reg *Registry) DiagnosticReport {
 		rep.Executable = exe
 	}
 	rep.Packaged, rep.PackageName = packageIdentity()
+	_, rep.EnvRepaired = RepairedEnviron()
 
 	for _, p := range probeCommands() {
 		rep.SpawnProbes = append(rep.SpawnProbes, runProbe(ctx, p.name, p.bin, p.args))
@@ -183,6 +185,13 @@ func buildNotes(r DiagnosticReport) []string {
 			n = append(n, "Adapter "+a.Name+": the launcher is a script shim and was resolved to its real runtime. It runs directly, with no intermediate interpreter.")
 		}
 	}
+	if len(r.EnvRepaired) > 0 {
+		n = append(n, "The launching client did not pass these standard environment variables: "+
+			strings.Join(r.EnvRepaired, ", ")+". They have been restored for spawned agents. "+
+			"An absent ProgramData is the one that matters most: Microsoft's Windows OpenSSH "+
+			"resolves its system config from it before logging starts, so ssh.exe exits 255 "+
+			"writing nothing at all when it is missing.")
+	}
 	if r.SpawnWorks && !r.SilentFailure {
 		n = append(n, "Child process spawning works normally in this context.")
 	}
@@ -199,6 +208,10 @@ func (r DiagnosticReport) Text() string {
 		fmt.Fprintf(&b, "packaged   : YES — %s\n", r.PackageName)
 	} else {
 		fmt.Fprintf(&b, "packaged   : no\n")
+	}
+
+	if len(r.EnvRepaired) > 0 {
+		fmt.Fprintf(&b, "env repaired: %s\n", strings.Join(r.EnvRepaired, ", "))
 	}
 
 	fmt.Fprintf(&b, "\n=== Spawn probes ===\n")

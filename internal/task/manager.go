@@ -467,18 +467,26 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		return
 	}
 	cmd.Dir = spec.Cwd
-	// cmd.Env left nil → child inherits our full environment (VPN, SSH agent).
+	// The child inherits our environment — that is the point: whatever the host
+	// can reach (VPN routes, an SSH agent, credentials) becomes available to the
+	// worker with no extra wiring. But some MCP clients launch this server with a
+	// curated environment that is missing standard system variables, and the
+	// worker inherits the hole too. Restore what is missing first; see
+	// agent.RepairedEnviron for why an absent %ProgramData% is not cosmetic.
+	env, repaired := agent.RepairedEnviron()
+	cmd.Env = env
 	guard := newProcGuard(cmd) // cancellation must reach the whole process tree
 	defer guard.Close()
 
 	t.audit.Log("turn_start", map[string]any{
-		"task_id":   t.ID,
-		"agent":     t.AgentName,
-		"cwd":       spec.Cwd,
-		"prompt":    spec.Prompt,
-		"plan_only": spec.PlanOnly,
-		"resume":    spec.SessionID != "",
-		"command":   cmd.Args,
+		"task_id":      t.ID,
+		"agent":        t.AgentName,
+		"cwd":          spec.Cwd,
+		"prompt":       spec.Prompt,
+		"plan_only":    spec.PlanOnly,
+		"resume":       spec.SessionID != "",
+		"command":      cmd.Args,
+		"env_repaired": repaired,
 	})
 
 	stdout, err := cmd.StdoutPipe()
