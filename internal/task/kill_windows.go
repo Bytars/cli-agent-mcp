@@ -18,8 +18,17 @@ import (
 // `taskkill /F /T` walks the tree by parent PID, which means it only works if
 // every intermediate process is still alive to be walked. Agents exit their
 // launcher early all the time, and the grandchildren are then reparented and
-// survive. A Job Object has no such hole: membership is inherited by every
-// descendant, and terminating the job terminates all of them atomically.
+// survive. A Job Object closes that particular hole: membership is inherited
+// through normal process creation, so terminating the job also terminates
+// descendants whose intermediate parent has already exited.
+//
+// What it does NOT cover, measured rather than assumed: a process launched via
+// ShellExecuteEx — which is what PowerShell's `Start-Process` does by default —
+// is created by the shell, not by us. It never joins our job, and it is not our
+// descendant in any sense Windows tracks. A worker that deliberately detaches a
+// process that way escapes this containment, as it would escape any
+// parentage-based mechanism, taskkill included. Verified: a Start-Process
+// grandchild was still running and writing after its turn ended.
 //
 // taskkill is kept as a fallback for the case where the job cannot be created
 // or assigned, so behaviour never regresses below what it was.
