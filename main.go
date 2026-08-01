@@ -690,7 +690,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_diagnose",
-		Description: "Diagnostica la cadena de ejecución: identidad de paquete del proceso (MSIX en Windows), si el spawn de procesos hijos funciona, y cómo resuelve cada agente su binario. Usar cuando un agente falla sin explicación o con exit code sin salida.",
+		Description: "Diagnose the execution chain: whether this process has package identity (MSIX on Windows), whether spawning child processes works, and how each agent resolves its binary. Use this when an agent fails without explanation or exits non-zero with no output.",
 		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, agent.DiagnosticReport, error) {
 		rep := agent.Diagnose(ctx, reg)
