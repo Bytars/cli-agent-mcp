@@ -298,48 +298,61 @@ Each line is one event:
 {"ts":"2026-07-16T02:22:44Z","event":"turn_end","task_id":"task-1-…","status":"done","exit_code":0,"duration_ms":13000}
 ```
 
-## Packaged hosts (MSIX) — read this before debugging a silent failure
+## The inherited environment — read this before debugging a silent failure
 
-Some MCP clients ship as **packaged applications**. Claude Desktop on Windows is
-one: it installs to `C:\Program Files\WindowsApps\` with MSIX package identity.
-Every process it launches — this server included — inherits that identity, along
-with filesystem virtualization and an environment with no console.
+An MCP client launches this server as a child process, and some clients hand it
+a **curated environment** rather than the one a login shell would have. Claude
+Desktop on Windows is one: the environment it passes omits `ProgramData`,
+`ComSpec`, `OS`, `COMPUTERNAME` and `SESSIONNAME`, and reduces `PATHEXT` to
+`.CPL`.
 
-That matters here because this server's entire job is launching child processes.
-Under a packaged host, some binaries die during start-up **with a non-zero exit
-code and nothing written to stdout or stderr**. There is no error message to
-read, because the process never got far enough to produce one. Debugging that
-from the symptoms alone is expensive; the same 255-with-no-output looks
-identical whether the cause is a missing binary, a blocked network, or the
-package sandbox.
+That looks cosmetic. It is not.
 
-So: **when an agent fails without explaining itself, call `agent_diagnose`
-first.** It reports, without running anything you supplied:
+Microsoft's Win32 build of OpenSSH resolves its system configuration directory
+from `%ProgramData%` during platform initialisation — before it parses arguments
+and before its logging subsystem exists. With the variable absent, `ssh.exe`
+exits **255 having written nothing to stdout or stderr**. Not even `ssh -V`
+prints its banner, and `-E logfile` produces no file. The identical binary works
+perfectly from an interactive shell.
 
-- whether this process has package identity, and which package;
-- whether spawning a child process works at all here, using harmless probes;
-- whether any probe showed the silent-failure signature (exit code, no output);
-- how each configured agent resolves its binary, and what would actually run.
+This was measured, not guessed. Adding `ProgramData` alone flips the exit code
+from 255 to 0; adding `ALLUSERSPROFILE` alone does not. Before that was found,
+four plausible explanations had to be eliminated one at a time — MSIX package
+identity, a missing console, code-signing policy, and the runtime doing the
+spawning. All four were wrong. A silent failure gives you nothing to reason
+from, so it invites confident stories that fit the symptoms and miss the cause.
 
-If `spawn_works` is false, no amount of configuration will help — run the server
-from an unpackaged host (a terminal, or the Claude Code CLI) instead.
+Two consequences shaped the design here:
+
+**The server repairs the environment before spawning.** `agent.RepairedEnviron`
+restores well-known system variables that are missing, then the task manager
+passes that to the worker. It never overrides a variable the host did set, and
+it only injects a path after confirming that path exists — a wrong guess becomes
+a no-op instead of a new failure mode. Whatever it had to restore is recorded in
+the `turn_start` audit event.
+
+**`agent_diagnose` reports the hole directly.** It lists which standard
+variables the launching client failed to pass, alongside package identity, spawn
+probes, and how each agent resolves its binary. When a worker fails without
+explaining itself, that is the first call to make — it turns hours of
+elimination into one tool call.
+
+`PATHEXT` deserves a note of its own: with a reduced value, PATH look-ups stop
+finding executables. `where ssh` reports nothing even when `ssh.exe` is sitting
+on `PATH`, which is a very effective way to send an investigation in the wrong
+direction.
 
 ### Script shims are resolved, not shelled
 
 `npm i -g @anthropic-ai/claude-code` installs `claude.cmd` on Windows: a batch
 script whose only purpose is to find Node and hand it a `.js` file. Running that
-through `cmd /c` is avoided for two independent reasons.
-
-The first is quoting. Go escapes arguments for `CommandLineToArgvW`, but
-`cmd.exe` parses with different rules and does not recognise `\"`. A prompt
-containing a double quote could therefore close the quoted region early and let
-the remainder be read as shell syntax — and prompts here are model-generated,
-so that is reachable input. Go's CVE-2024-24576 mitigation does not cover this
-shape: it triggers when the *target* is a `.bat`/`.cmd`, and here the target is
-`cmd.exe` itself.
-
-The second is the packaged-host problem above: every extra interpreter hop is
-another process that can die without saying why.
+through `cmd /c` is avoided because of quoting. Go escapes arguments for
+`CommandLineToArgvW`, but `cmd.exe` parses with different rules and does not
+recognise `\"`. A prompt containing a double quote could therefore close the
+quoted region early and let the remainder be read as shell syntax — and prompts
+here are model-generated, so that is reachable input. Go's CVE-2024-24576
+mitigation does not cover this shape: it triggers when the *target* is a
+`.bat`/`.cmd`, and here the target is `cmd.exe` itself.
 
 So the server reads the shim, extracts the Node runtime and entry point it would
 have used, and runs `node.exe entry.js …` directly — one process, argv passed
