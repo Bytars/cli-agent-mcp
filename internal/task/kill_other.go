@@ -8,11 +8,13 @@ import (
 	"time"
 )
 
-// configureCancel makes cancelling a task kill the agent's whole process group,
-// not just the direct child, so an interrupt actually stops everything the
-// worker spawned (shells for tool calls, subprocesses, etc.).
-func configureCancel(cmd *exec.Cmd) {
-	// Put the child in its own process group so we can signal the whole group.
+// procGuard owns the OS resources used to terminate a child and its descendants.
+// On Unix a process group is enough: the child leads its own group and a signal
+// to the negated pid reaches every member.
+type procGuard struct{}
+
+// newProcGuard prepares cancellation for cmd. It must be called before Start.
+func newProcGuard(cmd *exec.Cmd) *procGuard {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
@@ -26,4 +28,11 @@ func configureCancel(cmd *exec.Cmd) {
 		// Negative pid signals the whole process group.
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
+	return &procGuard{}
 }
+
+// AfterStart has nothing to do once the group is set at spawn time.
+func (g *procGuard) AfterStart(cmd *exec.Cmd) {}
+
+// Close has no resources to release.
+func (g *procGuard) Close() {}

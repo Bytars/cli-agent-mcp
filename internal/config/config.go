@@ -6,12 +6,20 @@
 package config
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// warnInvalid reports a misconfigured environment variable. It goes through the
+// standard logger, which main points at stderr — never stdout, which is the MCP
+// wire. A bad value is never fatal: the default is applied and the server runs.
+func warnInvalid(key, value, reason string, def any) {
+	log.Printf("warning: %s=%q %s; using default %v", key, value, reason, def)
+}
 
 // Config is the fully-resolved server configuration.
 type Config struct {
@@ -105,9 +113,12 @@ func getenv(key, def string) string {
 	return def
 }
 
-// getbool parses a permissive boolean env value, falling back to def.
+// getbool parses a permissive boolean env value, falling back to def. An
+// unrecognized value is reported on stderr rather than swallowed, so a typo
+// like CLI_AGENT_MCP_ALLOW_EXTRA_ARGS=tru doesn't silently mean something else.
 func getbool(key string, def bool) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	switch strings.ToLower(raw) {
 	case "":
 		return def
 	case "1", "true", "yes", "on":
@@ -115,6 +126,7 @@ func getbool(key string, def bool) bool {
 	case "0", "false", "no", "off":
 		return false
 	default:
+		warnInvalid(key, raw, "is not a recognized boolean (1/true/yes/on, 0/false/no/off)", def)
 		return def
 	}
 }
@@ -142,14 +154,24 @@ func splitList(key string) []string {
 func Load() Config {
 	maxTasks := 100
 	if v := os.Getenv("CLI_AGENT_MCP_MAX_TASKS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		switch n, err := strconv.Atoi(v); {
+		case err != nil:
+			warnInvalid("CLI_AGENT_MCP_MAX_TASKS", v, "is not an integer", maxTasks)
+		case n <= 0:
+			warnInvalid("CLI_AGENT_MCP_MAX_TASKS", v, "must be greater than 0", maxTasks)
+		default:
 			maxTasks = n
 		}
 	}
 
 	var taskTimeout time.Duration
 	if v := os.Getenv("CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		switch n, err := strconv.Atoi(v); {
+		case err != nil:
+			warnInvalid("CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS", v, "is not an integer", "no timeout")
+		case n <= 0:
+			warnInvalid("CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS", v, "must be greater than 0", "no timeout")
+		default:
 			taskTimeout = time.Duration(n) * time.Second
 		}
 	}

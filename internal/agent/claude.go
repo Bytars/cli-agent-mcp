@@ -89,7 +89,7 @@ func (a *ClaudeAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 	}
 	args = append(args, a.ExtraArgs...)
 	args = append(args, spec.ExtraArgs...)
-	return buildCommand(ctx, a.Bin, args), nil
+	return buildCommand(ctx, a.Bin, args)
 }
 
 func (a *ClaudeAdapter) ParseLine(line string) Event {

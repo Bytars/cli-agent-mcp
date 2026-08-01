@@ -252,8 +252,11 @@ it supervise:
    ends), so the model reads the transcript *as it happens*. **Between calls the
    model is active and reasoning** — that's where it judges whether the worker is
    on track.
-3. If it drifts, `agent_cancel_task` stops it immediately — this kills the whole
-   process tree, not just the launcher, so nothing is left running.
+3. If it drifts, `agent_cancel_task` stops it immediately. On Windows the turn
+   runs inside a Job Object created with `KILL_ON_JOB_CLOSE`, and on Unix in its
+   own process group, so cancelling reaches every descendant — not just the
+   launcher. (Job membership is inherited, which is why this holds even when the
+   agent's launcher has already exited and its children were reparented.)
 
 The server's tool instructions teach this flow, so a capable client will do it on
 its own when supervision matters.
@@ -294,6 +297,56 @@ Each line is one event:
 {"ts":"2026-07-16T02:22:31Z","event":"tool_use","task_id":"task-1-…","tool":"Bash","input":"{\"command\":\"npm test\"}"}
 {"ts":"2026-07-16T02:22:44Z","event":"turn_end","task_id":"task-1-…","status":"done","exit_code":0,"duration_ms":13000}
 ```
+
+## Packaged hosts (MSIX) — read this before debugging a silent failure
+
+Some MCP clients ship as **packaged applications**. Claude Desktop on Windows is
+one: it installs to `C:\Program Files\WindowsApps\` with MSIX package identity.
+Every process it launches — this server included — inherits that identity, along
+with filesystem virtualization and an environment with no console.
+
+That matters here because this server's entire job is launching child processes.
+Under a packaged host, some binaries die during start-up **with a non-zero exit
+code and nothing written to stdout or stderr**. There is no error message to
+read, because the process never got far enough to produce one. Debugging that
+from the symptoms alone is expensive; the same 255-with-no-output looks
+identical whether the cause is a missing binary, a blocked network, or the
+package sandbox.
+
+So: **when an agent fails without explaining itself, call `agent_diagnose`
+first.** It reports, without running anything you supplied:
+
+- whether this process has package identity, and which package;
+- whether spawning a child process works at all here, using harmless probes;
+- whether any probe showed the silent-failure signature (exit code, no output);
+- how each configured agent resolves its binary, and what would actually run.
+
+If `spawn_works` is false, no amount of configuration will help — run the server
+from an unpackaged host (a terminal, or the Claude Code CLI) instead.
+
+### Script shims are resolved, not shelled
+
+`npm i -g @anthropic-ai/claude-code` installs `claude.cmd` on Windows: a batch
+script whose only purpose is to find Node and hand it a `.js` file. Running that
+through `cmd /c` is avoided for two independent reasons.
+
+The first is quoting. Go escapes arguments for `CommandLineToArgvW`, but
+`cmd.exe` parses with different rules and does not recognise `\"`. A prompt
+containing a double quote could therefore close the quoted region early and let
+the remainder be read as shell syntax — and prompts here are model-generated,
+so that is reachable input. Go's CVE-2024-24576 mitigation does not cover this
+shape: it triggers when the *target* is a `.bat`/`.cmd`, and here the target is
+`cmd.exe` itself.
+
+The second is the packaged-host problem above: every extra interpreter hop is
+another process that can die without saying why.
+
+So the server reads the shim, extracts the Node runtime and entry point it would
+have used, and runs `node.exe entry.js …` directly — one process, argv passed
+verbatim, no shell parser anywhere. `agent_diagnose` shows this as
+`shim_resolved`. When a launcher cannot be resolved this way and an argument
+contains a character that could not survive a second parser (`"`, `%`, `!`), the
+run is refused with an actionable message rather than executed hopefully.
 
 ## Windows + 1Password SSH
 
