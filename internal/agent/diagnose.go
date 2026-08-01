@@ -129,13 +129,13 @@ type probeSpec struct {
 func probeCommands() []probeSpec {
 	if runtime.GOOS == "windows" {
 		return []probeSpec{
-			{"interprete del sistema", cmdPath(), []string{"/c", "ver"}},
-			{"node en PATH", "node", []string{"-v"}},
+			{"system interpreter", cmdPath(), []string{"/c", "ver"}},
+			{"node on PATH", "node", []string{"-v"}},
 		}
 	}
 	return []probeSpec{
-		{"shell del sistema", "/bin/sh", []string{"-c", "echo ok"}},
-		{"node en PATH", "node", []string{"-v"}},
+		{"system shell", "/bin/sh", []string{"-c", "echo ok"}},
+		{"node on PATH", "node", []string{"-v"}},
 	}
 }
 
@@ -170,21 +170,21 @@ func runProbe(ctx context.Context, name, bin string, args []string) SpawnProbe {
 func buildNotes(r DiagnosticReport) []string {
 	var n []string
 	if r.Packaged {
-		n = append(n, "Este proceso corre con identidad de paquete ("+r.PackageName+"). Los procesos hijos la heredan, junto con su virtualizacion de sistema de archivos y su entorno sin consola.")
+		n = append(n, "This process runs with package identity ("+r.PackageName+"). Child processes inherit it, along with its filesystem virtualization and its console-less environment.")
 	}
 	if !r.SpawnWorks {
-		n = append(n, "NINGUNA sonda de spawn tuvo exito: lanzar procesos hijos no funciona en este contexto. Un agente CLI no puede operar asi. Ejecuta el servidor desde un host sin empaquetar (por ejemplo el CLI de Claude Code en una terminal).")
+		n = append(n, "NO spawn probe succeeded: launching child processes does not work in this context. A CLI agent cannot operate this way. Run the server from an unpackaged host (for example the Claude Code CLI in a terminal).")
 	}
 	if r.SilentFailure {
-		n = append(n, "Al menos una sonda fallo con exit code y SIN salida en stdout ni stderr. Ese es el sintoma exacto del arranque abortado bajo empaquetado: el binario muere antes de poder reportar la causa.")
+		n = append(n, "At least one probe failed with an exit code and NO output on stdout or stderr. That is the exact symptom of a startup aborted under packaging: the binary dies before it can report the cause.")
 	}
 	for _, a := range r.Adapters {
 		if a.ShimFixed {
-			n = append(n, "Adapter "+a.Name+": el launcher es un shim de script y se resolvio a su runtime real. Se ejecuta directo, sin interprete intermedio.")
+			n = append(n, "Adapter "+a.Name+": the launcher is a script shim and was resolved to its real runtime. It runs directly, with no intermediate interpreter.")
 		}
 	}
 	if r.SpawnWorks && !r.SilentFailure {
-		n = append(n, "El spawn de procesos hijos funciona con normalidad en este contexto.")
+		n = append(n, "Child process spawning works normally in this context.")
 	}
 	return n
 }
@@ -192,45 +192,45 @@ func buildNotes(r DiagnosticReport) []string {
 // Text renders the report for a human reading the tool result.
 func (r DiagnosticReport) Text() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "=== Entorno ===\n")
+	fmt.Fprintf(&b, "=== Environment ===\n")
 	fmt.Fprintf(&b, "os/arch    : %s/%s\n", r.OS, r.Arch)
-	fmt.Fprintf(&b, "ejecutable : %s\n", r.Executable)
+	fmt.Fprintf(&b, "executable : %s\n", r.Executable)
 	if r.Packaged {
-		fmt.Fprintf(&b, "empaquetado: SI — %s\n", r.PackageName)
+		fmt.Fprintf(&b, "packaged   : YES — %s\n", r.PackageName)
 	} else {
-		fmt.Fprintf(&b, "empaquetado: no\n")
+		fmt.Fprintf(&b, "packaged   : no\n")
 	}
 
-	fmt.Fprintf(&b, "\n=== Sondas de spawn ===\n")
+	fmt.Fprintf(&b, "\n=== Spawn probes ===\n")
 	for _, p := range r.SpawnProbes {
 		status := "OK"
 		if !p.OK {
-			status = fmt.Sprintf("FALLO exit=%d", p.ExitCode)
+			status = fmt.Sprintf("FAILED exit=%d", p.ExitCode)
 			if p.Silent {
-				status += " SIN SALIDA"
+				status += " NO OUTPUT"
 			}
 		}
 		fmt.Fprintf(&b, "  %-24s %-22s %s\n", p.Name, status, firstLine(p.Output, p.Err))
 	}
 
-	fmt.Fprintf(&b, "\n=== Agentes ===\n")
+	fmt.Fprintf(&b, "\n=== Agents ===\n")
 	for _, a := range r.Adapters {
-		avail := "no disponible"
+		avail := "unavailable"
 		if a.Available {
-			avail = "disponible"
+			avail = "available"
 		}
 		fmt.Fprintf(&b, "  %-10s %-14s %s\n", a.Name, avail, a.Detail)
 		if a.RunsAs != "" {
-			marca := ""
+			mark := ""
 			if a.ShimFixed {
-				marca = "  (shim resuelto)"
+				mark = "  (shim resolved)"
 			}
-			fmt.Fprintf(&b, "  %-10s ejecuta como: %s%s\n", "", a.RunsAs, marca)
+			fmt.Fprintf(&b, "  %-10s runs as: %s%s\n", "", a.RunsAs, mark)
 		}
 	}
 
 	if len(r.Notes) > 0 {
-		fmt.Fprintf(&b, "\n=== Lectura ===\n")
+		fmt.Fprintf(&b, "\n=== Notes ===\n")
 		for _, n := range r.Notes {
 			fmt.Fprintf(&b, "  - %s\n", n)
 		}
