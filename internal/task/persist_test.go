@@ -96,6 +96,66 @@ func TestRestoreSurfacesPreviousInstanceTasksAsOrphaned(t *testing.T) {
 	}
 }
 
+// Restoring an orphan once would freeze it at that instant. The process that
+// owns it keeps writing, so this one has to keep re-reading — otherwise a task
+// that finished elsewhere sits at "orphaned" forever and the user never learns
+// how it went.
+func TestOrphanPicksUpProgressFromTheOwningProcess(t *testing.T) {
+	store, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	// The other process: a task mid-run.
+	owner := NewManager(10)
+	owner.SetStore(store)
+	theirs := &Task{
+		ID: "task-9-cafe", AgentName: "mock", store: store,
+		status: StatusRunning, running: true, startedAt: time.Now(),
+	}
+	theirs.mu.Lock()
+	theirs.appendLine("line one", "line one", false)
+	theirs.mu.Unlock()
+	theirs.persist()
+
+	// This process picks it up as an orphan.
+	mine := NewManager(10)
+	mine.SetStore(store)
+	mine.Restore(agent.NewRegistry(agent.NewMockAdapter()))
+	got, ok := mine.Get("task-9-cafe")
+	if !ok {
+		t.Fatal("the other process's task was not restored")
+	}
+	if s := got.Snapshot(); s.Status != StatusOrphaned {
+		t.Fatalf("status = %q, want %q", s.Status, StatusOrphaned)
+	}
+
+	// The other process keeps working, then finishes.
+	theirs.mu.Lock()
+	theirs.appendLine("line two", "line two", false)
+	theirs.status = StatusDone
+	theirs.running = false
+	theirs.resultText = "finished elsewhere"
+	theirs.endedAt = time.Now()
+	theirs.mu.Unlock()
+	theirs.persist()
+
+	// Re-reads are throttled to once a second, so wait past that window.
+	time.Sleep(1100 * time.Millisecond)
+
+	snap := got.Snapshot()
+	if snap.Status != StatusDone {
+		t.Errorf("status = %q, want %q once the owner settled it", snap.Status, StatusDone)
+	}
+	if snap.Result != "finished elsewhere" {
+		t.Errorf("result = %q, want the outcome the other process recorded", snap.Result)
+	}
+	if snap.TotalLines != 2 {
+		t.Errorf("total_output_lines = %d, want 2 — the later line never arrived", snap.TotalLines)
+	}
+}
+
 // A finished task must come back finished, not relabelled as orphaned.
 func TestRestoreKeepsSettledOutcomes(t *testing.T) {
 	store, err := state.Open(t.TempDir())

@@ -178,7 +178,7 @@ IMPORTANT — you cannot stop the worker once it starts. Progress notifications 
 
 BACKGROUND MODE (a tracked task you watch):
 1. agent_start_task — start the task, get a task_id (returns immediately).
-2. agent_watch — call it ONCE. By default (until="done") it blocks in this single call until the task finishes, streaming live progress to the user the whole time. Do NOT poll it in a loop; just make the one call and wait for it to return the result. Use this when you want the task tracked/backgrounded but still wait for it.
+2. agent_watch — by default (until="done") it blocks until the task finishes, streaming live progress the whole time. If the task is longer than the watch window it returns early with running=true and a next_since_line: the task was NOT interrupted and nothing failed. Call agent_watch again with that since_line and keep going until running is false. This is the way to follow a long task — a single call cannot cover it, because the client abandons a tool call that takes too long.
 3. Only if you need to actively supervise and possibly interrupt: call agent_watch with until="change" (returns on each new chunk so you can judge it), and agent_cancel_task if it drifts (terminates the worker and the process tree it created; a process the worker deliberately detached via ShellExecute can outlive it). To redirect: cancel and start a corrected task, or agent_send_followup once finished.
 
 SHOWING THE USER WHERE THINGS STAND:
@@ -221,7 +221,7 @@ type watchInput struct {
 	TaskID         string `json:"task_id" jsonschema:"The backgrounded task id to watch."`
 	Until          string `json:"until,omitempty" jsonschema:"When to return: \"done\" (default) blocks in a SINGLE call until the task finishes, streaming live progress the whole time; \"change\" returns as soon as there's new output so you can peek and possibly interrupt."`
 	SinceLine      int    `json:"since_line,omitempty" jsonschema:"Line index to watch from. Pass the next_since_line returned by the previous call to get only new output."`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"For until=\"change\": how long to wait for new output before returning (default 25, max 55)."`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"How long this call may block before returning. For until=\"change\" it is how long to wait for new output (default 25, max 55); for until=\"done\" it overrides the server's watch window. Leave unset unless you know the client's tool-call limit."`
 	Raw            bool   `json:"raw,omitempty" jsonschema:"Return the raw JSONL transcript instead of the compact, filtered view."`
 }
 
@@ -607,7 +607,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "agent_watch",
 		Description: "Watch a backgrounded task (from agent_start_task), streaming its live progress to the user. " +
-			"By default (until=\"done\") a SINGLE call blocks until the task finishes and streams progress the whole time — so you do NOT need to call this repeatedly. Use it right after agent_start_task and just wait. " +
+			"By default (until=\"done\") it blocks until the task finishes, streaming the whole time. If the task outlives the watch window it returns early with running=true and a next_since_line — that is NOT a failure and the task keeps going: call agent_watch again with that since_line, and keep repeating until running is false. " +
 			"Use until=\"change\" instead when you want to actively supervise: it returns as soon as there's new output so you can judge it and call agent_cancel_task if it's going wrong (then loop, passing back next_since_line). " +
 			"To steer, cancel and start a corrected task, or agent_send_followup once it has finished.",
 		Annotations: readOnlyTool(),
@@ -660,13 +660,35 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return textResult(body), watchResult{TaskID: t.ID, Status: string(status), Running: running, NewSinceLine: newSince, Text: text}, nil
 		}
 
-		// until="done" (default): one call, block until the task finishes.
+		// until="done" (default): block until the task finishes OR the watch
+		// window closes, whichever comes first.
+		//
+		// Blocking indefinitely looked right and was not: clients cap how long
+		// they will wait on a tool call — Claude Desktop at 60s — and when that
+		// cap hits, the call is abandoned and everything this handler was about
+		// to return is discarded. The user sees the watch "cut off" with no
+		// result at all, which is strictly worse than never having watched.
+		// Returning first, carrying the output so far and the line to resume
+		// from, turns that dead end into a call the model can simply repeat.
+		window := cfg.WatchWindow
+		if in.TimeoutSeconds > 0 {
+			window = time.Duration(in.TimeoutSeconds) * time.Second
+		}
+		deadline := time.Now().Add(window)
+
 		since := in.SinceLine
 		start := time.Now()
 		var status task.Status
 		running := true
 		for {
-			text, newSince, _, st, run := t.WatchFrom(ctx, since, 10*time.Second, compact)
+			slice := 10 * time.Second
+			if left := time.Until(deadline); left < slice {
+				slice = left
+			}
+			if slice <= 0 {
+				break
+			}
+			text, newSince, _, st, run := t.WatchFrom(ctx, since, slice, compact)
 			status, running, since = st, run, newSince
 			if text != "" {
 				emitChunk(text)
@@ -677,6 +699,16 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 				break
 			}
 		}
+
+		if running && ctx.Err() == nil {
+			body := fmt.Sprintf(
+				"Task %s is STILL RUNNING after %s. This is not a failure and the task was not interrupted.\n\n"+
+					"Call agent_watch again with task_id=%s and since_line=%d to keep following it, and repeat until running is false.",
+				t.ID, time.Since(start).Round(time.Second), t.ID, since)
+			return textResult(body),
+				watchResult{TaskID: t.ID, Status: string(status), Running: true, NewSinceLine: since}, nil
+		}
+
 		snap := t.Snapshot()
 		final := snap.Result
 		if final == "" {
@@ -864,6 +896,11 @@ Configuration (environment variables):
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
   CLI_AGENT_MCP_AUDIT_LOG          Path to a JSONL audit log of what the worker did
+  CLI_AGENT_MCP_WATCH_WINDOW_SECONDS  How long one agent_watch call may block before
+                                   returning a resumable partial. Keep it under the
+                                   client's tool-call limit (Claude Desktop: 60s), or
+                                   the call is abandoned and its result lost.
+                                                                        (default: 50)
   CLI_AGENT_MCP_STATE_DIR          Where task records and the instance lock live, so
                                    tasks survive a restart and a second instance is
                                    detected instead of silently starting empty.
