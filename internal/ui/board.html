@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Tareas del agente</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1c1d1f;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --card: #fafafa;
+    --card-hover: #f3f4f6;
+    --running: #2563eb;
+    --done: #15803d;
+    --failed: #dc2626;
+    --canceled: #9ca3af;
+    --code-bg: #f6f7f9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1b1b1d;
+      --fg: #e8e8ea;
+      --muted: #9ca3af;
+      --line: #34343a;
+      --card: #232326;
+      --card-hover: #2b2b30;
+      --running: #60a5fa;
+      --done: #4ade80;
+      --failed: #f87171;
+      --canceled: #7c7c85;
+      --code-bg: #171719;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 14px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.45 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  .count { color: var(--muted); font-size: 13px; }
+  .live { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--running); animation: pulse 1.6s ease-in-out infinite; }
+  .pulse.idle { background: var(--canceled); animation: none; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+  .task { border: 1px solid var(--line); border-radius: 9px; background: var(--card); margin-bottom: 8px; overflow: hidden; }
+  .head { display: flex; align-items: center; gap: 9px; padding: 9px 11px; cursor: pointer; user-select: none; }
+  .head:hover { background: var(--card-hover); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+  .dot.running { background: var(--running); animation: pulse 1.6s ease-in-out infinite; }
+  .dot.done { background: var(--done); }
+  .dot.failed { background: var(--failed); }
+  .dot.canceled { background: var(--canceled); }
+  .prompt { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .meta { color: var(--muted); font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
+  .badge { font-size: 11px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); flex: 0 0 auto; }
+  .chev { color: var(--muted); font-size: 11px; flex: 0 0 auto; width: 10px; }
+
+  .body { border-top: 1px solid var(--line); padding: 10px 11px; }
+  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .id { font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  button {
+    font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px;
+    border: 1px solid var(--line); background: transparent; color: var(--fg); cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--card-hover); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.danger { color: var(--failed); border-color: var(--failed); }
+  pre {
+    margin: 0; padding: 9px 10px; background: var(--code-bg); border-radius: 7px;
+    max-height: 300px; overflow: auto;
+    font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+    font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+  .err { color: var(--failed); font-size: 12px; margin-bottom: 8px; white-space: pre-wrap; }
+  .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+  .banner {
+    border: 1px solid var(--failed); border-radius: 8px; padding: 8px 10px;
+    margin-bottom: 10px; font-size: 12px; line-height: 1.5;
+  }
+  .dot.orphaned { background: var(--canceled); box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--canceled); }
+  .cwd { font-size: 11px; color: var(--muted); word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tareas del agente</h1>
+  <span class="count" id="count"></span>
+  <span class="live"><span class="pulse idle" id="pulse"></span><span id="livetext">conectando…</span></span>
+</header>
+<div id="banner"></div>
+<div id="list"><div class="empty">Cargando…</div></div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- JSON-RPC over postMessage (MCP Apps dialect, 2026-01-26) ----------
+  var pending = new Map();
+  var nextId = 1;
+
+  function post(msg) { window.parent.postMessage(msg, "*"); }
+
+  function request(method, params) {
+    var id = nextId++;
+    return new Promise(function (resolve, reject) {
+      pending.set(id, { resolve: resolve, reject: reject });
+      post({ jsonrpc: "2.0", id: id, method: method, params: params || {} });
+      setTimeout(function () {
+        if (pending.has(id)) {
+          pending.delete(id);
+          reject(new Error("sin respuesta del host: " + method));
+        }
+      }, 30000);
+    });
+  }
+
+  function notify(method, params) {
+    post({ jsonrpc: "2.0", method: method, params: params || {} });
+  }
+
+  window.addEventListener("message", function (ev) {
+    var m = ev.data;
+    if (!m || m.jsonrpc !== "2.0") return;
+
+    if (m.id !== undefined && m.id !== null && (m.result !== undefined || m.error !== undefined)) {
+      var p = pending.get(m.id);
+      if (!p) return;
+      pending.delete(m.id);
+      if (m.error) p.reject(new Error(m.error.message || "error RPC"));
+      else p.resolve(m.result);
+      return;
+    }
+
+    // The host pushes the result of the tool that opened this view, so the
+    // first paint needs no round-trip.
+    if (m.method === "ui/notifications/tool-result") {
+      var sc = m.params && m.params.structuredContent;
+      if (sc && sc.tasks) {
+        showWarning(sc.warning);
+        render(sc.tasks);
+      }
+    }
+  });
+
+  function callTool(name, args) {
+    return request("tools/call", { name: name, arguments: args || {} });
+  }
+
+  // ---- rendering --------------------------------------------------------
+  var listEl = document.getElementById("list");
+  var countEl = document.getElementById("count");
+  var pulseEl = document.getElementById("pulse");
+  var liveEl = document.getElementById("livetext");
+
+  var bannerEl = document.getElementById("banner");
+  var expanded = new Set();   // task ids whose transcript is open
+  var outputs = new Map();    // task id -> last fetched transcript tail
+  var lastTasks = [];
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  // Another server instance owns tasks this one cannot see, so the list below
+  // may be incomplete. Saying so is the whole point of the warning.
+  function showWarning(text) {
+    bannerEl.innerHTML = text ? '<div class="banner">⚠ ' + esc(text) + "</div>" : "";
+  }
+
+  function elapsed(t) {
+    var start = Date.parse(t.started_at);
+    if (isNaN(start)) return "";
+    var end = t.ended_at ? Date.parse(t.ended_at) : Date.now();
+    if (isNaN(end)) end = Date.now();
+    var s = Math.max(0, Math.round((end - start) / 1000));
+    if (s < 60) return s + "s";
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + "m " + (s % 60) + "s";
+    return Math.floor(m / 60) + "h " + (m % 60) + "m";
+  }
+
+  function statusLabel(t) {
+    if (t.status !== "failed") return t.status;
+    var bits = [];
+    if (t.exit_code !== undefined && t.exit_code !== null) bits.push("exit " + t.exit_code);
+    if (t.error) bits.push(t.error);
+    return bits.length ? "failed (" + bits.join("; ") + ")" : "failed";
+  }
+
+  // MCP gives a server no way to wake the model, so a task that finishes while
+  // nobody is holding a call open goes unannounced. The view can close that
+  // loop: ui/message puts a turn into the conversation, which is what makes the
+  // assistant come back and report on its own.
+  //
+  // Only transitions seen while this panel is open are announced. Tasks already
+  // finished at first paint are recorded silently, or opening the board would
+  // replay every past task as news.
+  var known = new Map();
+  var seeded = false;
+
+  function announceFinished(tasks) {
+    var finished = [];
+    tasks.forEach(function (t) {
+      var was = known.get(t.task_id);
+      known.set(t.task_id, t.status);
+      if (seeded && was === "running" && t.status !== "running") finished.push(t);
+    });
+    seeded = true;
+
+    finished.forEach(function (t) {
+      var prompt = (t.prompts && t.prompts.length) ? t.prompts[t.prompts.length - 1] : "";
+      request("ui/message", {
+        role: "user",
+        content: {
+          type: "text",
+          text: "La tarea " + t.task_id + " (" + t.agent + ") terminó con estado \"" + t.status + "\"." +
+            (prompt ? " Era: " + prompt + "." : "") +
+            " Lee su salida con agent_get_output y cuéntame cómo fue."
+        }
+      }).catch(function () {
+        // Hosts may withhold ui/message. Losing the announcement is acceptable;
+        // the panel still shows the finished task either way.
+      });
+    });
+  }
+
+  function render(tasks) {
+    lastTasks = tasks || [];
+    announceFinished(lastTasks);
+    var running = lastTasks.filter(function (t) { return t.status === "running"; }).length;
+
+    countEl.textContent = lastTasks.length
+      ? lastTasks.length + " tarea" + (lastTasks.length === 1 ? "" : "s") +
+        (running ? " · " + running + " en curso" : "")
+      : "";
+
+    if (!lastTasks.length) {
+      listEl.innerHTML = '<div class="empty">Todavía no hay tareas.</div>';
+      return;
+    }
+
+    listEl.innerHTML = lastTasks.map(function (t) {
+      var open = expanded.has(t.task_id);
+      var prompt = (t.prompts && t.prompts.length) ? t.prompts[t.prompts.length - 1] : "(sin prompt)";
+      var out = outputs.get(t.task_id);
+
+      var body = "";
+      if (open) {
+        body =
+          '<div class="body">' +
+            (t.error ? '<div class="err">' + esc(t.error) + "</div>" : "") +
+            '<div class="row">' +
+              '<span class="id">' + esc(t.task_id) + "</span>" +
+              '<span class="meta">' + esc(statusLabel(t)) + " · " + t.total_output_lines + " líneas · " +
+                t.turns + " turno" + (t.turns === 1 ? "" : "s") + "</span>" +
+              (t.status === "running"
+                ? '<button class="danger" data-cancel="' + esc(t.task_id) + '">Cancelar</button>'
+                : "") +
+            "</div>" +
+            '<div class="row"><span class="cwd">' + esc(t.cwd) + "</span></div>" +
+            "<pre>" + esc(out === undefined ? "cargando…" : (out || "(sin salida todavía)")) + "</pre>" +
+          "</div>";
+      }
+
+      return (
+        '<div class="task">' +
+          '<div class="head" data-toggle="' + esc(t.task_id) + '">' +
+            '<span class="chev">' + (open ? "▾" : "▸") + "</span>" +
+            '<span class="dot ' + esc(t.status) + '"></span>' +
+            '<span class="prompt">' + esc(prompt) + "</span>" +
+            '<span class="badge">' + esc(t.agent) + "</span>" +
+            '<span class="meta">' + esc(elapsed(t)) + "</span>" +
+          "</div>" + body +
+        "</div>"
+      );
+    }).join("");
+
+    listEl.querySelectorAll("[data-toggle]").forEach(function (el) {
+      el.addEventListener("click", function () {
+        var id = el.getAttribute("data-toggle");
+        if (expanded.has(id)) {
+          expanded.delete(id);
+          outputs.delete(id);
+          render(lastTasks);
+        } else {
+          expanded.add(id);
+          render(lastTasks);
+          fetchOutput(id);
+        }
+      });
+    });
+
+    listEl.querySelectorAll("[data-cancel]").forEach(function (el) {
+      el.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        el.disabled = true;
+        el.textContent = "Cancelando…";
+        callTool("agent_cancel_task", { task_id: el.getAttribute("data-cancel") })
+          .then(refresh)
+          .catch(fail);
+      });
+    });
+  }
+
+  // Tail the transcript: ask only for the last lines, using the line count the
+  // snapshot already reports.
+  function fetchOutput(id) {
+    var t = lastTasks.find(function (x) { return x.task_id === id; });
+    var total = t ? t.total_output_lines : 0;
+    var TAIL = 80;
+    var since = Math.max(0, total - TAIL);
+    return callTool("agent_get_output", { task_id: id, since_line: since, max_lines: TAIL })
+      .then(function (res) {
+        var sc = res && res.structuredContent;
+        outputs.set(id, sc ? sc.text : "");
+        render(lastTasks);
+      })
+      .catch(function (e) {
+        outputs.set(id, "no se pudo leer la salida: " + e.message);
+        render(lastTasks);
+      });
+  }
+
+  function fail(e) {
+    pulseEl.className = "pulse idle";
+    liveEl.textContent = e.message;
+  }
+
+  var polling = false;
+
+  function refresh() {
+    if (polling || document.hidden) return Promise.resolve();
+    polling = true;
+    return callTool("agent_list_tasks", {})
+      .then(function (res) {
+        var sc = res && res.structuredContent;
+        showWarning(sc && sc.warning);
+        render((sc && sc.tasks) || []);
+        var anyRunning = lastTasks.some(function (t) { return t.status === "running"; });
+        pulseEl.className = anyRunning ? "pulse" : "pulse idle";
+        liveEl.textContent = anyRunning ? "en vivo" : "al día";
+        return Promise.all(Array.from(expanded).map(fetchOutput));
+      })
+      .catch(fail)
+      .then(function () { polling = false; });
+  }
+
+  // Poll fast while something is running, slowly once everything has settled.
+  function loop() {
+    var anyRunning = lastTasks.some(function (t) { return t.status === "running"; });
+    setTimeout(function () {
+      refresh().then(loop);
+    }, anyRunning ? 2000 : 8000);
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) refresh();
+  });
+
+  request("ui/initialize", {
+    protocolVersion: "2026-01-26",
+    capabilities: {},
+    clientInfo: { name: "cli-agent-mcp-task-board", version: "1" }
+  })
+    .then(function () {
+      notify("ui/notifications/initialized", {});
+      return refresh();
+    })
+    .then(loop)
+    .catch(fail);
+})();
+</script>
+</body>
+</html>

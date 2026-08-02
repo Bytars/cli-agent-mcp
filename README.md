@@ -83,12 +83,102 @@ newline-delimited output. That gives a clean programmatic contract:
 | **`agent_run_followup`** | Continue a session and wait, with the same live streaming. |
 | `agent_start_task` | Delegate without waiting; returns a `task_id` (background). For parallel or supervised use. |
 | **`agent_watch`** | Long-poll a backgrounded task: blocks until new output or completion, returns the new lines. The supervise-and-interrupt primitive. |
+| **`agent_task_board`** | Open the live task board — an interactive panel that keeps refreshing on its own. See [Seeing where tasks stand](#seeing-where-tasks-stand). |
 | `agent_task_status` | Poll status (`running`/`done`/`failed`/`canceled`) and read the result of a backgrounded task. |
 | `agent_get_output` | Fetch the streamed transcript (supports incremental `since_line`/`max_lines`). |
 | `agent_send_followup` | Non-blocking follow-up on a backgrounded task. |
 | `agent_cancel_task` | Terminate a running task. |
 | `agent_list_tasks` | List all tasks, newest first. |
 | `agent_list_agents` | Show which agents are available on this machine. |
+
+## Seeing where tasks stand
+
+Progress notifications only exist while a tool call is in flight. `agent_run_task`
+and `agent_watch` stream them, but once `agent_start_task` returns there is
+nothing left to watch — which is why a backgrounded task can feel like it
+vanished.
+
+`agent_task_board` is the answer to that. It is an
+[MCP App](https://modelcontextprotocol.io/extensions/apps/overview): the server
+ships an HTML view at `ui://cli-agent-mcp/task-board.html`, the host renders it
+in a sandboxed iframe inside the conversation, and the view calls this server's
+own tools on its own schedule. So it keeps updating after the call that opened
+it has already returned — one row per task with its status, elapsed time and
+live transcript, and a cancel button on anything still running. It polls every
+2s while something runs, backs off to 8s once everything has settled, and pauses
+while the panel is off-screen.
+
+**Host support.** This needs a host implementing the MCP Apps extension (spec
+`2026-01-26`). The server advertises it during `initialize` under
+`capabilities.extensions["io.modelcontextprotocol/ui"]`. Hosts that don't
+implement it ignore the view and render the same listing as plain text, so the
+tool is safe to call anywhere.
+
+Interactive views are documented for Claude, Cowork, Claude Desktop and mobile.
+Note, though, that Anthropic's guidance covers **remote connectors** and does not
+state whether a local stdio server like this one gets its views rendered — and
+there is an [open report](https://github.com/modelcontextprotocol/ext-apps/issues/671)
+of hosts negotiating the capability but not rendering the iframe. If the panel
+never appears, that is why: you get the text listing, and `agent_watch` stays the
+reliable way to follow a task live.
+
+## Following a long task without getting cut off
+
+Clients cap how long they will wait on a tool call — Claude Desktop at 60
+seconds. `agent_watch` used to block until the task finished, which meant that
+on anything longer the client abandoned the call and **discarded the result the
+server was about to return**. From the user's side the watch simply stopped,
+with nothing to show for it.
+
+`agent_watch` now blocks for at most `CLI_AGENT_MCP_WATCH_WINDOW_SECONDS`
+(default 50) and then returns what it has, with `running: true` and a
+`next_since_line`. That is not a failure and the task is not interrupted: the
+caller repeats the call with that `since_line` until `running` is false. The
+tool description and the server instructions both say so, because a bounded
+watch that the model reads as "finished" would be no better than the timeout.
+
+Set the window below your client's limit if it differs, or pass
+`timeout_seconds` on an individual call.
+
+## Surviving a restart — and a second instance
+
+MCP clients start server processes; they do not always stop the old one first.
+When that happened, the new process came up with an empty in-memory registry:
+`agent_list_tasks` returned nothing and every previous `task_id` was unknown,
+while the workers those tasks owned kept running under the original process and
+kept writing their results to disk. Nothing was broken except the server's
+ability to see its own work.
+
+Two things close that gap.
+
+**The task registry is on disk.** Each task is written to
+`<state-dir>/tasks/<task-id>.json` as it progresses, with its transcript
+appended to `<task-id>.log` line by line — as the lines arrive, so a run still
+in flight is readable too. On startup the server loads them back, so listing,
+reading output and reading results all work across restarts. Records are pruned
+to `CLI_AGENT_MCP_MAX_TASKS`, newest kept.
+
+A task the *previous* process was still running comes back with status
+**`orphaned`** rather than `running`. This process cannot watch it, cancel it,
+or learn how it ended — the worker may have finished long ago, or may still be
+going under the old instance. Calling it `running` would make `agent_watch`
+block forever on something that can never be seen to finish. Follow-ups on an
+orphaned task are refused for the same reason: resuming would put a second
+worker on a session the old instance may still be driving.
+
+**A PID lock detects the second instance.** The server records itself in
+`<state-dir>/server.lock`. If it finds a lock naming a process that is still
+alive, every task listing carries a warning naming that PID. It does not refuse
+to start — the client that just launched this process is talking to it and
+nothing else, so failing would leave you with no server at all, which is worse
+than having two.
+
+> If you stop the older process, be aware that any worker still running under it
+> dies with it: workers are held in a Job Object with `KILL_ON_JOB_CLOSE`, so
+> closing the owner terminates them mid-write. Let them finish first.
+
+State lives in `%AppData%\cli-agent-mcp` on Windows and `~/.config/cli-agent-mcp`
+elsewhere, unless `CLI_AGENT_MCP_STATE_DIR` says otherwise.
 
 ## Install
 
@@ -549,6 +639,14 @@ internal/task/
   kill_windows.go           process-tree kill on cancel (Windows)
   kill_other.go             process-group kill on cancel (Unix)
 internal/audit/audit.go     append-only JSONL audit trail
+internal/state/
+  state.go                  durable task records + the instance PID lock
+  alive_windows.go          is that PID still running? (Windows)
+  alive_other.go            is that PID still running? (Unix)
+internal/task/persist.go    saving tasks and restoring a previous process's
+internal/ui/
+  ui.go                     MCP Apps wiring (capability, ui:// resource, tool _meta)
+  board.html                the task board view, self-contained (deny-by-default CSP)
 cmd/smoketest/              end-to-end test via the MCP client
 ```
 

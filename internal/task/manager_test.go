@@ -1,8 +1,12 @@
 package task
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/andresh0816/cli-agent-mcp/internal/agent"
 )
 
 func TestTruncateStrKeepsRunesIntact(t *testing.T) {
@@ -88,12 +92,36 @@ func TestRawOutputExcludesStderr(t *testing.T) {
 	}
 }
 
+// agent_watch bounds how long it blocks so it can return before the client
+// gives up on the call. That bound is only real if WatchFrom honours its
+// deadline on a task producing nothing: if it blocked past it, the watch would
+// still be cut off mid-call and its result thrown away.
+func TestWatchFromHonoursItsDeadlineWhileStillRunning(t *testing.T) {
+	tk := &Task{ID: "t1", status: StatusRunning, running: true}
+
+	start := time.Now()
+	text, _, _, status, running := tk.WatchFrom(context.Background(), 0, 200*time.Millisecond, true)
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Errorf("blocked %s on a 200ms deadline", elapsed.Round(time.Millisecond))
+	}
+	if !running || status != StatusRunning {
+		t.Errorf("running=%v status=%q, want the task reported as still going", running, status)
+	}
+	if text != "" {
+		t.Errorf("got output %q from a task that produced none", text)
+	}
+}
+
 func TestPrepareFollowupClaimsTaskUnderLock(t *testing.T) {
 	// Two concurrent follow-ups used to both pass the `running` check and spawn
 	// against the same session. The claim must happen before the lock is
 	// released, so the second attempt is rejected.
 	m := NewManager(10)
-	tk := &Task{ID: "t1", status: StatusDone, sessionID: "sess-1"}
+	// The adapter matters only because prepareFollowup now refuses to resume a
+	// task whose agent is gone; every real task has one.
+	tk := &Task{ID: "t1", status: StatusDone, sessionID: "sess-1", adapter: agent.NewMockAdapter()}
 	m.tasks = map[string]*Task{"t1": tk}
 	m.order = []string{"t1"}
 

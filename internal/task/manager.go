@@ -25,6 +25,7 @@ import (
 
 	"github.com/andresh0816/cli-agent-mcp/internal/agent"
 	"github.com/andresh0816/cli-agent-mcp/internal/audit"
+	"github.com/andresh0816/cli-agent-mcp/internal/state"
 )
 
 // Status is the lifecycle state of a task's most recent turn.
@@ -35,6 +36,13 @@ const (
 	StatusDone     Status = "done"
 	StatusFailed   Status = "failed"
 	StatusCanceled Status = "canceled"
+
+	// StatusOrphaned marks a task restored from disk that a previous server
+	// process was still running. This process cannot watch it, cancel it, or
+	// learn how it ended — the worker may have finished long ago or may still be
+	// going under the old instance. Reporting it as "running" would be a lie
+	// that makes agent_watch block forever.
+	StatusOrphaned Status = "orphaned"
 )
 
 // TurnInfo records one prompt sent within a task.
@@ -73,6 +81,10 @@ type Task struct {
 
 	adapter agent.Adapter
 	audit   *audit.Logger
+	store   *state.Store
+
+	// lastRefresh throttles re-reading an orphan's files; see refreshOrphan.
+	lastRefresh time.Time
 }
 
 // Snapshot is an immutable view of a Task for serialization.
@@ -121,6 +133,7 @@ func (t *Task) snapshot() Snapshot {
 
 // Snapshot returns a thread-safe view of the task.
 func (t *Task) Snapshot() Snapshot {
+	t.refreshOrphan()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.snapshot()
@@ -132,6 +145,7 @@ func (t *Task) Snapshot() Snapshot {
 // backgrounded task in near-real-time and decides whether to let it continue or
 // cancel it, without busy-polling.
 func (t *Task) WatchFrom(ctx context.Context, since int, timeout time.Duration, compact bool) (text string, newSince, total int, status Status, running bool) {
+	t.refreshOrphan()
 	deadline := time.Now().Add(timeout)
 	for {
 		t.mu.Lock()
@@ -164,6 +178,7 @@ func (t *Task) WatchFrom(ctx context.Context, since int, timeout time.Duration, 
 // When compact, noisy lines are dropped and each is rendered human-readably;
 // `since`/`total` always index the raw stream so the contract is stable.
 func (t *Task) Output(since, max int, compact bool) (from, to, total int, text string) {
+	t.refreshOrphan()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	total = len(t.lines)
@@ -218,6 +233,7 @@ type Manager struct {
 	maxTasks int
 	counter  atomic.Uint64
 	audit    *audit.Logger
+	store    *state.Store
 	timeout  time.Duration
 }
 
@@ -293,6 +309,7 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*T
 		Model:     spec.Model,
 		adapter:   a,
 		audit:     m.audit,
+		store:     m.store,
 		status:    StatusRunning,
 		running:   true,
 		startedAt: time.Now(),
@@ -304,6 +321,8 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*T
 	m.order = append(m.order, t.ID)
 	m.evictLocked()
 	m.mu.Unlock()
+
+	t.persist()
 
 	go m.runTurn(context.Background(), t, spec, nil)
 	return t, nil
@@ -321,6 +340,7 @@ func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd str
 		Model:     spec.Model,
 		adapter:   a,
 		audit:     m.audit,
+		store:     m.store,
 		status:    StatusRunning,
 		running:   true,
 		startedAt: time.Now(),
@@ -332,6 +352,8 @@ func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd str
 	m.order = append(m.order, t.ID)
 	m.evictLocked()
 	m.mu.Unlock()
+
+	t.persist()
 
 	m.runTurn(ctx, t, spec, sink)
 	return t, nil
@@ -361,6 +383,11 @@ func (m *Manager) evictLocked() {
 			if !running {
 				delete(m.tasks, id)
 				m.order = append(m.order[:i], m.order[i+1:]...)
+				if m.store != nil {
+					// Dropping it from memory but leaving it on disk would let the
+					// next startup restore what was just evicted.
+					m.store.Forget(id)
+				}
 				dropped = true
 				break
 			}
@@ -383,6 +410,15 @@ func (m *Manager) prepareFollowup(id, prompt string, allowedTools, extraArgs []s
 	if t.running {
 		t.mu.Unlock()
 		return nil, agent.RunSpec{}, errors.New("task is still running; wait for it to finish before sending a follow-up")
+	}
+	if t.status == StatusOrphaned {
+		t.mu.Unlock()
+		return nil, agent.RunSpec{}, errors.New("this task was started by a previous server instance and may still be running under it; " +
+			"resuming would put two workers on the same session. Read its output, then start a new task instead")
+	}
+	if t.adapter == nil {
+		t.mu.Unlock()
+		return nil, agent.RunSpec{}, fmt.Errorf("agent %q is no longer configured on this server, so this task cannot be resumed", t.AgentName)
 	}
 	session := t.sessionID
 	model := t.Model
@@ -581,6 +617,8 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	}
 	t.mu.Unlock()
 
+	t.persist()
+
 	t.audit.Log("turn_end", map[string]any{
 		"task_id":     t.ID,
 		"status":      string(endStatus),
@@ -660,9 +698,16 @@ func (t *Task) appendLine(raw, display string, isErr bool) {
 		t.fromStderr = append(t.fromStderr, true)
 		return
 	}
-	t.lines = append(t.lines, truncateStr(raw, maxLineBytes))
+	line := truncateStr(raw, maxLineBytes)
+	t.lines = append(t.lines, line)
 	t.display = append(t.display, truncateStr(display, maxLineBytes))
 	t.fromStderr = append(t.fromStderr, isErr)
+
+	// Written as it arrives rather than at the end of the turn, so another
+	// instance — or this one after a restart — can read a run still in flight.
+	if t.store != nil {
+		_ = t.store.AppendLine(t.ID, line)
+	}
 }
 
 // renderEvent produces the compact, human-facing rendering of a parsed event,
