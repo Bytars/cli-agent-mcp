@@ -72,6 +72,60 @@ func (m *Manager) Restore(reg *agent.Registry) int {
 	return restored
 }
 
+// refreshOrphan re-reads a task that belongs to another server process.
+//
+// Restoring it once at startup would freeze it at that instant: the owning
+// process keeps appending to the transcript and keeps rewriting the record, so
+// without this an orphan would sit unchanged forever, even after its worker had
+// finished and written a result. Re-reading lets it advance, and lets it settle
+// into its real outcome.
+//
+// Throttled to once a second, because the board polls the task list every two.
+func (t *Task) refreshOrphan() {
+	t.mu.Lock()
+	if t.store == nil || t.status != StatusOrphaned || time.Since(t.lastRefresh) < time.Second {
+		t.mu.Unlock()
+		return
+	}
+	t.lastRefresh = time.Now()
+	store, adapter, have := t.store, t.adapter, len(t.lines)
+	t.mu.Unlock()
+
+	// Read off the lock: this is file I/O on paths another process is writing.
+	raw, err := store.LoadTask(t.ID)
+	if err != nil || raw == nil {
+		return
+	}
+	var snap Snapshot
+	if json.Unmarshal(raw, &snap) != nil {
+		return
+	}
+	lines, _ := store.ReadLines(t.ID)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Append only what is new. Rebuilding the whole slice would shift indices
+	// that callers are already holding as since_line.
+	for i := have; i < len(lines); i++ {
+		stderr := strings.HasPrefix(lines[i], "[stderr] ")
+		t.lines = append(t.lines, lines[i])
+		t.fromStderr = append(t.fromStderr, stderr)
+		t.display = append(t.display, renderRestored(lines[i], stderr, adapter))
+	}
+
+	// A settled record means the owning process saw the worker finish, so the
+	// outcome is knowable now and the task stops being an orphan.
+	if snap.Status != "" && snap.Status != StatusRunning && snap.Status != StatusOrphaned {
+		t.status = snap.Status
+		t.resultText = snap.Result
+		t.isError = snap.IsError
+		t.exitCode = snap.ExitCode
+		t.runErr = snap.Error
+		t.endedAt = parseTime(snap.EndedAt)
+	}
+}
+
 func (m *Manager) taskFromSnapshot(snap Snapshot, reg *agent.Registry) *Task {
 	status := snap.Status
 	if status == StatusRunning {

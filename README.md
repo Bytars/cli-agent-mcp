@@ -122,6 +122,24 @@ of hosts negotiating the capability but not rendering the iframe. If the panel
 never appears, that is why: you get the text listing, and `agent_watch` stays the
 reliable way to follow a task live.
 
+## Following a long task without getting cut off
+
+Clients cap how long they will wait on a tool call — Claude Desktop at 60
+seconds. `agent_watch` used to block until the task finished, which meant that
+on anything longer the client abandoned the call and **discarded the result the
+server was about to return**. From the user's side the watch simply stopped,
+with nothing to show for it.
+
+`agent_watch` now blocks for at most `CLI_AGENT_MCP_WATCH_WINDOW_SECONDS`
+(default 50) and then returns what it has, with `running: true` and a
+`next_since_line`. That is not a failure and the task is not interrupted: the
+caller repeats the call with that `since_line` until `running` is false. The
+tool description and the server instructions both say so, because a bounded
+watch that the model reads as "finished" would be no better than the timeout.
+
+Set the window below your client's limit if it differs, or pass
+`timeout_seconds` on an individual call.
+
 ## Surviving a restart — and a second instance
 
 MCP clients start server processes; they do not always stop the old one first.

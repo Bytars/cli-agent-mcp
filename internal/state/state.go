@@ -155,6 +155,26 @@ func (s *Store) LoadTasks() ([]json.RawMessage, error) {
 	return out, nil
 }
 
+// LoadTask returns one stored record, or nil when there is none. It is how a
+// task owned by another process gets re-read: that process keeps rewriting the
+// record, so this is the only way to learn that it finished.
+func (s *Store) LoadTask(id string) (json.RawMessage, error) {
+	if err := safeID(id); err != nil {
+		return nil, err
+	}
+	buf, err := os.ReadFile(s.taskPath(id, ".json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !json.Valid(buf) {
+		return nil, nil
+	}
+	return json.RawMessage(buf), nil
+}
+
 // AppendLine adds one transcript line to the task's log. Lines are written as
 // they arrive so another instance can read a run that is still in progress.
 func (s *Store) AppendLine(id, line string) error {

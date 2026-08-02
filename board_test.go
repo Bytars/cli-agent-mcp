@@ -122,6 +122,42 @@ func TestBoardToolPointsAtTheView(t *testing.T) {
 	}
 }
 
+// Bounding the watch is only half the fix. If the model is not told that an
+// early return means "call me again", it reads running=true as the end of the
+// story and the task goes unwatched — the same failure the bound was meant to
+// remove.
+func TestWatchGuidanceTellsTheModelToResume(t *testing.T) {
+	cs := connect(t)
+	tools, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var watch *mcp.Tool
+	for _, tool := range tools.Tools {
+		if tool.Name == "agent_watch" {
+			watch = tool
+		}
+	}
+	if watch == nil {
+		t.Fatal("agent_watch is not registered")
+	}
+	for _, want := range []string{"running=true", "call agent_watch again", "until running is false"} {
+		if !strings.Contains(watch.Description, want) {
+			t.Errorf("agent_watch description never says %q:\n%s", want, watch.Description)
+		}
+	}
+	for _, want := range []string{"running=true", "Call agent_watch again", "until running is false"} {
+		if !strings.Contains(instructions, want) {
+			t.Errorf("server instructions never say %q", want)
+		}
+	}
+	// The old guidance actively told the model not to come back. Leaving it in
+	// place would override everything above.
+	if strings.Contains(instructions, "Do NOT poll it in a loop") {
+		t.Error("instructions still tell the model not to re-call agent_watch")
+	}
+}
+
 // Hosts without view support show this text, so it has to carry the status on
 // its own.
 func TestBoardTextStandsAlone(t *testing.T) {

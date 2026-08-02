@@ -82,6 +82,9 @@ type Task struct {
 	adapter agent.Adapter
 	audit   *audit.Logger
 	store   *state.Store
+
+	// lastRefresh throttles re-reading an orphan's files; see refreshOrphan.
+	lastRefresh time.Time
 }
 
 // Snapshot is an immutable view of a Task for serialization.
@@ -130,6 +133,7 @@ func (t *Task) snapshot() Snapshot {
 
 // Snapshot returns a thread-safe view of the task.
 func (t *Task) Snapshot() Snapshot {
+	t.refreshOrphan()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.snapshot()
@@ -141,6 +145,7 @@ func (t *Task) Snapshot() Snapshot {
 // backgrounded task in near-real-time and decides whether to let it continue or
 // cancel it, without busy-polling.
 func (t *Task) WatchFrom(ctx context.Context, since int, timeout time.Duration, compact bool) (text string, newSince, total int, status Status, running bool) {
+	t.refreshOrphan()
 	deadline := time.Now().Add(timeout)
 	for {
 		t.mu.Lock()
@@ -173,6 +178,7 @@ func (t *Task) WatchFrom(ctx context.Context, since int, timeout time.Duration, 
 // When compact, noisy lines are dropped and each is rendered human-readably;
 // `since`/`total` always index the raw stream so the contract is stable.
 func (t *Task) Output(since, max int, compact bool) (from, to, total int, text string) {
+	t.refreshOrphan()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	total = len(t.lines)

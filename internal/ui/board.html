@@ -196,8 +196,46 @@
     return bits.length ? "failed (" + bits.join("; ") + ")" : "failed";
   }
 
+  // MCP gives a server no way to wake the model, so a task that finishes while
+  // nobody is holding a call open goes unannounced. The view can close that
+  // loop: ui/message puts a turn into the conversation, which is what makes the
+  // assistant come back and report on its own.
+  //
+  // Only transitions seen while this panel is open are announced. Tasks already
+  // finished at first paint are recorded silently, or opening the board would
+  // replay every past task as news.
+  var known = new Map();
+  var seeded = false;
+
+  function announceFinished(tasks) {
+    var finished = [];
+    tasks.forEach(function (t) {
+      var was = known.get(t.task_id);
+      known.set(t.task_id, t.status);
+      if (seeded && was === "running" && t.status !== "running") finished.push(t);
+    });
+    seeded = true;
+
+    finished.forEach(function (t) {
+      var prompt = (t.prompts && t.prompts.length) ? t.prompts[t.prompts.length - 1] : "";
+      request("ui/message", {
+        role: "user",
+        content: {
+          type: "text",
+          text: "La tarea " + t.task_id + " (" + t.agent + ") terminó con estado \"" + t.status + "\"." +
+            (prompt ? " Era: " + prompt + "." : "") +
+            " Lee su salida con agent_get_output y cuéntame cómo fue."
+        }
+      }).catch(function () {
+        // Hosts may withhold ui/message. Losing the announcement is acceptable;
+        // the panel still shows the finished task either way.
+      });
+    });
+  }
+
   function render(tasks) {
     lastTasks = tasks || [];
+    announceFinished(lastTasks);
     var running = lastTasks.filter(function (t) { return t.status === "running"; }).length;
 
     countEl.textContent = lastTasks.length
