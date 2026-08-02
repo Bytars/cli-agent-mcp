@@ -95,6 +95,17 @@ type Config struct {
 	// was asked to do. Empty disables it.
 	AuditLog string
 
+	// WatchWindow bounds how long a single agent_watch call blocks before
+	// returning a resumable partial result. It exists because clients cap tool
+	// calls: blocking past that cap loses the response entirely, so the server
+	// returns first and tells the caller to come back.
+	WatchWindow time.Duration
+
+	// StateDir is where the task registry and the instance lock live, so a
+	// restarted or second server instance can still see earlier tasks. Empty
+	// means the per-user default.
+	StateDir string
+
 	// TaskTimeout, if > 0, cancels any turn that runs longer than this. It is a
 	// safety net against a worker that hangs — e.g. blocked on a permission
 	// prompt with no human to approve it. Zero means no timeout.
@@ -164,6 +175,21 @@ func Load() Config {
 		}
 	}
 
+	// Long enough to be worth blocking, short enough to return before a client
+	// gives up on the call. Claude Desktop cuts a tool call at 60s unless it is
+	// resetting that clock on progress notifications, and we cannot count on it.
+	watchWindow := 50 * time.Second
+	if v := os.Getenv("CLI_AGENT_MCP_WATCH_WINDOW_SECONDS"); v != "" {
+		switch n, err := strconv.Atoi(v); {
+		case err != nil:
+			warnInvalid("CLI_AGENT_MCP_WATCH_WINDOW_SECONDS", v, "is not an integer", watchWindow)
+		case n <= 0:
+			warnInvalid("CLI_AGENT_MCP_WATCH_WINDOW_SECONDS", v, "must be greater than 0", watchWindow)
+		default:
+			watchWindow = time.Duration(n) * time.Second
+		}
+	}
+
 	var taskTimeout time.Duration
 	if v := os.Getenv("CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS"); v != "" {
 		switch n, err := strconv.Atoi(v); {
@@ -201,6 +227,8 @@ func Load() Config {
 		AllowedCwds:        allowed,
 		MaxTasks:           maxTasks,
 		AuditLog:           getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
+		StateDir:           getenv("CLI_AGENT_MCP_STATE_DIR", ""),
+		WatchWindow:        watchWindow,
 		TaskTimeout:        taskTimeout,
 		Compact:            getbool("CLI_AGENT_MCP_COMPACT", true),
 	}

@@ -26,8 +26,17 @@ import (
 	"github.com/andresh0816/cli-agent-mcp/internal/agent"
 	"github.com/andresh0816/cli-agent-mcp/internal/audit"
 	"github.com/andresh0816/cli-agent-mcp/internal/config"
+	"github.com/andresh0816/cli-agent-mcp/internal/state"
 	"github.com/andresh0816/cli-agent-mcp/internal/task"
+	"github.com/andresh0816/cli-agent-mcp/internal/ui"
 )
+
+// instanceWarning is set once during startup, before the server begins serving,
+// when another live server process is found holding the state lock. It rides
+// along on every task listing because the situation it describes is invisible
+// otherwise: the other instance owns tasks this one cannot see, watch or
+// cancel, and a caller reading an empty list would conclude nothing is running.
+var instanceWarning string
 
 // version is overridden at release time via -ldflags "-X main.version=<tag>".
 var version = "dev"
@@ -94,6 +103,34 @@ func main() {
 		log.Printf("task timeout: %s", cfg.TaskTimeout)
 	}
 
+	// The task registry has to outlive the process. Clients do start a second
+	// server instance — sometimes alongside the first rather than in place of
+	// it — and an instance that came up with an empty map used to report that
+	// emptiness as fact while the other one's workers kept running.
+	if store, err := state.Open(cfg.StateDir); err != nil {
+		log.Printf("warning: task state is not being saved: %v", err)
+	} else {
+		defer store.Close()
+		mgr.SetStore(store)
+		store.Prune(cfg.MaxTasks)
+
+		if prev, err := store.Acquire(); err != nil {
+			log.Printf("warning: could not take the instance lock: %v", err)
+		} else if prev != nil {
+			instanceWarning = fmt.Sprintf(
+				"another cli-agent-mcp server (pid %d, started %s) is still running and owns tasks this instance cannot watch or cancel. "+
+					"Tasks it started appear here as %q once they are restored from disk. "+
+					"If that process is no longer wanted, stop it — but note that doing so kills any worker still running under it.",
+				prev.PID, prev.Started.Format(time.RFC3339), task.StatusOrphaned)
+			log.Printf("warning: %s", instanceWarning)
+		}
+
+		if n := mgr.Restore(reg); n > 0 {
+			log.Printf("restored %d task(s) from %s", n, store.Dir())
+		}
+		log.Printf("task state: %s", store.Dir())
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "--list-agents" {
 		for _, a := range reg.All() {
 			ok, detail := a.Available()
@@ -106,11 +143,19 @@ func main() {
 		return
 	}
 
+	// Advertise the MCP Apps extension so hosts that support interactive views
+	// know this server can render one, and fetch the board's ui:// resource.
+	// Setting Capabilities at all replaces the SDK's default, so logging has to
+	// be restated here to keep it.
+	caps := &mcp.ServerCapabilities{Logging: &mcp.LoggingCapabilities{}}
+	caps.AddExtension(ui.ExtensionName, ui.Capability())
+
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "cli-agent-mcp",
 		Version: version,
 	}, &mcp.ServerOptions{
 		Instructions: instructions,
+		Capabilities: caps,
 	})
 
 	registerTools(srv, reg, mgr, cfg)
@@ -133,8 +178,11 @@ IMPORTANT — you cannot stop the worker once it starts. Progress notifications 
 
 BACKGROUND MODE (a tracked task you watch):
 1. agent_start_task — start the task, get a task_id (returns immediately).
-2. agent_watch — call it ONCE. By default (until="done") it blocks in this single call until the task finishes, streaming live progress to the user the whole time. Do NOT poll it in a loop; just make the one call and wait for it to return the result. Use this when you want the task tracked/backgrounded but still wait for it.
+2. agent_watch — by default (until="done") it blocks until the task finishes, streaming live progress the whole time. If the task is longer than the watch window it returns early with running=true and a next_since_line: the task was NOT interrupted and nothing failed. Call agent_watch again with that since_line and keep going until running is false. This is the way to follow a long task — a single call cannot cover it, because the client abandons a tool call that takes too long.
 3. Only if you need to actively supervise and possibly interrupt: call agent_watch with until="change" (returns on each new chunk so you can judge it), and agent_cancel_task if it drifts (terminates the worker and the process tree it created; a process the worker deliberately detached via ShellExecute can outlive it). To redirect: cancel and start a corrected task, or agent_send_followup once finished.
+
+SHOWING THE USER WHERE THINGS STAND:
+- agent_task_board — opens a live panel listing every task with its status, elapsed time and output, which keeps refreshing on its own and can cancel a running task. Progress notifications only exist while a call is in flight, so a backgrounded task is invisible once agent_start_task returns; the board is what fixes that. Call it right after agent_start_task, and whenever the user asks how their tasks are going.
 
 Also: agent_task_status / agent_get_output (poll/read on demand), agent_list_tasks, agent_list_agents.
 
@@ -173,7 +221,7 @@ type watchInput struct {
 	TaskID         string `json:"task_id" jsonschema:"The backgrounded task id to watch."`
 	Until          string `json:"until,omitempty" jsonschema:"When to return: \"done\" (default) blocks in a SINGLE call until the task finishes, streaming live progress the whole time; \"change\" returns as soon as there's new output so you can peek and possibly interrupt."`
 	SinceLine      int    `json:"since_line,omitempty" jsonschema:"Line index to watch from. Pass the next_since_line returned by the previous call to get only new output."`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"For until=\"change\": how long to wait for new output before returning (default 25, max 55)."`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"How long this call may block before returning. For until=\"change\" it is how long to wait for new output (default 25, max 55); for until=\"done\" it overrides the server's watch window. Leave unset unless you know the client's tool-call limit."`
 	Raw            bool   `json:"raw,omitempty" jsonschema:"Return the raw JSONL transcript instead of the compact, filtered view."`
 }
 
@@ -197,7 +245,24 @@ type watchResult struct {
 }
 
 type listResult struct {
-	Tasks []task.Snapshot `json:"tasks"`
+	Tasks   []task.Snapshot `json:"tasks"`
+	Warning string          `json:"warning,omitempty"`
+}
+
+// newListResult pairs a task listing with the standing instance warning, if
+// any, so no caller can read the list without also seeing that it may be
+// incomplete.
+func newListResult(tasks []task.Snapshot) listResult {
+	return listResult{Tasks: tasks, Warning: instanceWarning}
+}
+
+// withWarning prefixes text output with the instance warning. Structured output
+// carries it too, but the text is what a human actually reads.
+func withWarning(body string) string {
+	if instanceWarning == "" {
+		return body
+	}
+	return "⚠ " + instanceWarning + "\n\n" + body
 }
 
 type agentInfo struct {
@@ -492,7 +557,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
-		msg := fmt.Sprintf("Started task %s on agent %q in %s. Poll agent_task_status until status is \"done\" or \"failed\".", snap.ID, snap.Agent, snap.Cwd)
+		msg := fmt.Sprintf("Started task %s on agent %q in %s. Call agent_task_board to show the user a live panel of it, or agent_watch to block until it finishes.", snap.ID, snap.Agent, snap.Cwd)
 		return textResult(msg), snap, nil
 	})
 
@@ -542,7 +607,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "agent_watch",
 		Description: "Watch a backgrounded task (from agent_start_task), streaming its live progress to the user. " +
-			"By default (until=\"done\") a SINGLE call blocks until the task finishes and streams progress the whole time — so you do NOT need to call this repeatedly. Use it right after agent_start_task and just wait. " +
+			"By default (until=\"done\") it blocks until the task finishes, streaming the whole time. If the task outlives the watch window it returns early with running=true and a next_since_line — that is NOT a failure and the task keeps going: call agent_watch again with that since_line, and keep repeating until running is false. " +
 			"Use until=\"change\" instead when you want to actively supervise: it returns as soon as there's new output so you can judge it and call agent_cancel_task if it's going wrong (then loop, passing back next_since_line). " +
 			"To steer, cancel and start a corrected task, or agent_send_followup once it has finished.",
 		Annotations: readOnlyTool(),
@@ -595,13 +660,35 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return textResult(body), watchResult{TaskID: t.ID, Status: string(status), Running: running, NewSinceLine: newSince, Text: text}, nil
 		}
 
-		// until="done" (default): one call, block until the task finishes.
+		// until="done" (default): block until the task finishes OR the watch
+		// window closes, whichever comes first.
+		//
+		// Blocking indefinitely looked right and was not: clients cap how long
+		// they will wait on a tool call — Claude Desktop at 60s — and when that
+		// cap hits, the call is abandoned and everything this handler was about
+		// to return is discarded. The user sees the watch "cut off" with no
+		// result at all, which is strictly worse than never having watched.
+		// Returning first, carrying the output so far and the line to resume
+		// from, turns that dead end into a call the model can simply repeat.
+		window := cfg.WatchWindow
+		if in.TimeoutSeconds > 0 {
+			window = time.Duration(in.TimeoutSeconds) * time.Second
+		}
+		deadline := time.Now().Add(window)
+
 		since := in.SinceLine
 		start := time.Now()
 		var status task.Status
 		running := true
 		for {
-			text, newSince, _, st, run := t.WatchFrom(ctx, since, 10*time.Second, compact)
+			slice := 10 * time.Second
+			if left := time.Until(deadline); left < slice {
+				slice = left
+			}
+			if slice <= 0 {
+				break
+			}
+			text, newSince, _, st, run := t.WatchFrom(ctx, since, slice, compact)
 			status, running, since = st, run, newSince
 			if text != "" {
 				emitChunk(text)
@@ -612,6 +699,16 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 				break
 			}
 		}
+
+		if running && ctx.Err() == nil {
+			body := fmt.Sprintf(
+				"Task %s is STILL RUNNING after %s. This is not a failure and the task was not interrupted.\n\n"+
+					"Call agent_watch again with task_id=%s and since_line=%d to keep following it, and repeat until running is false.",
+				t.ID, time.Since(start).Round(time.Second), t.ID, since)
+			return textResult(body),
+				watchResult{TaskID: t.ID, Status: string(status), Running: true, NewSinceLine: since}, nil
+		}
+
 		snap := t.Snapshot()
 		final := snap.Result
 		if final == "" {
@@ -665,7 +762,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, listResult, error) {
 		tasks := mgr.List()
-		return textResult(fmt.Sprintf("%d task(s).", len(tasks))), listResult{Tasks: tasks}, nil
+		return textResult(withWarning(fmt.Sprintf("%d task(s).", len(tasks)))), newListResult(tasks), nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -696,6 +793,72 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		rep := agent.Diagnose(ctx, reg)
 		return textResult(rep.Text()), rep, nil
 	})
+
+	registerBoard(srv, mgr)
+}
+
+// registerBoard wires up the interactive task board: the ui:// resource holding
+// the view, plus the tool that opens it.
+//
+// This is what makes a backgrounded task visible. Progress notifications only
+// exist while a tool call is in flight, so once agent_start_task returns there
+// is nothing left to watch. The board keeps running in the host's iframe and
+// calls agent_list_tasks / agent_get_output on its own schedule, so the user
+// sees each task advance without the model having to hold a call open.
+func registerBoard(srv *mcp.Server, mgr *task.Manager) {
+	srv.AddResource(&mcp.Resource{
+		URI:         ui.ResourceURI,
+		Name:        "task-board",
+		Description: "Interactive panel listing every delegated task with its live status and output.",
+		MIMEType:    ui.MIMEType,
+		Meta:        ui.ResourceMeta(),
+	}, func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		return &mcp.ReadResourceResult{
+			Contents: []*mcp.ResourceContents{{
+				URI:      ui.ResourceURI,
+				MIMEType: ui.MIMEType,
+				Text:     ui.BoardHTML,
+			}},
+		}, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "agent_task_board",
+		Description: "Open the live task board: an interactive panel listing every delegated task with its status, elapsed time and streamed output, which refreshes itself and can cancel a running task. " +
+			"Use it when the user asks how their tasks are going, and right after agent_start_task so they can follow along instead of waiting blind. " +
+			"On hosts without interactive views this returns the same listing as plain text, which is still worth reading out.",
+		Annotations: readOnlyTool(),
+		Meta:        ui.ToolMeta(),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, listResult, error) {
+		tasks := mgr.List()
+		return textResult(withWarning(boardText(tasks))), newListResult(tasks), nil
+	})
+}
+
+// boardText renders the task list as text. Hosts that don't implement
+// interactive views show this instead of the board, so it has to stand on its
+// own rather than point at a panel that will never appear.
+func boardText(tasks []task.Snapshot) string {
+	if len(tasks) == 0 {
+		return "No tasks yet."
+	}
+	running := 0
+	for _, t := range tasks {
+		if t.Status == task.StatusRunning {
+			running++
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d task(s), %d running.\n", len(tasks), running)
+	for _, t := range tasks {
+		prompt := "(no prompt)"
+		if n := len(t.Prompts); n > 0 {
+			prompt = firstLine(t.Prompts[n-1])
+		}
+		fmt.Fprintf(&b, "\n%s  %s  [%s]  %d line(s)%s\n  %s",
+			t.ID, t.Status, t.Agent, t.TotalLines, outcomeDetail(t), truncate(prompt, 120))
+	}
+	return b.String()
 }
 
 func printHelp() {
@@ -733,6 +896,15 @@ Configuration (environment variables):
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
   CLI_AGENT_MCP_AUDIT_LOG          Path to a JSONL audit log of what the worker did
+  CLI_AGENT_MCP_WATCH_WINDOW_SECONDS  How long one agent_watch call may block before
+                                   returning a resumable partial. Keep it under the
+                                   client's tool-call limit (Claude Desktop: 60s), or
+                                   the call is abandoned and its result lost.
+                                                                        (default: 50)
+  CLI_AGENT_MCP_STATE_DIR          Where task records and the instance lock live, so
+                                   tasks survive a restart and a second instance is
+                                   detected instead of silently starting empty.
+                                   (default: %AppData%\cli-agent-mcp, ~/.config/... )
   CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS  Kill a turn that runs longer than this — a
                                    safety net for a worker hung on a permission
                                    prompt.                              (default: 0 = off)
