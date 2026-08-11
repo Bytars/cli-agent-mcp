@@ -55,6 +55,13 @@ type DiagnosticReport struct {
 	Notes         []string      `json:"notes,omitempty"`
 	SpawnWorks    bool          `json:"spawn_works"`
 	SilentFailure bool          `json:"silent_failure_detected"`
+
+	// InteractivePermission says whether a worker can put a permission request
+	// to the person driving this client, and when it cannot, why. It belongs
+	// here because the symptom of it being off is a task that quietly does less
+	// than it was asked to, with nothing in the transcript pointing at the cause.
+	InteractivePermission bool   `json:"interactive_permission"`
+	PermissionDetail      string `json:"interactive_permission_detail,omitempty"`
 }
 
 // Diagnose runs the probes. It never mutates anything and never runs a

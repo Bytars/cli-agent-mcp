@@ -45,14 +45,29 @@ func main() {
 
 	var progressMu sync.Mutex
 	var progressMsgs []string
-	client := mcp.NewClient(&mcp.Implementation{Name: "smoketest", Version: "0.1.0"}, &mcp.ClientOptions{
+	var elicitations []string
+
+	opts := &mcp.ClientOptions{
 		ProgressNotificationHandler: func(_ context.Context, r *mcp.ProgressNotificationClientRequest) {
 			progressMu.Lock()
 			progressMsgs = append(progressMsgs, r.Params.Message)
 			progressMu.Unlock()
 			fmt.Printf("  · progress[%v]: %s\n", r.Params.Progress, r.Params.Message)
 		},
-	})
+	}
+	// Only the permission mode declares this. Declaring elicitation at all is
+	// what switches the server into asking rather than pre-approving, so a
+	// client that always did it would change every other check here.
+	if os.Getenv("SMOKE_ONLY") == "permission" {
+		opts.ElicitationHandler = func(_ context.Context, r *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			progressMu.Lock()
+			elicitations = append(elicitations, r.Params.Message)
+			progressMu.Unlock()
+			fmt.Printf("  · PERMISSION ASKED: %s\n", strings.ReplaceAll(r.Params.Message, "\n", " "))
+			return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approve": true}}, nil
+		}
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "smoketest", Version: "0.1.0"}, opts)
 	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
 	if err != nil {
 		log.Fatalf("connect: %v", err)
@@ -169,6 +184,105 @@ func main() {
 			log.Fatalf("FAIL: cancel took too long (%v) — the process was not really interrupted", elapsed)
 		}
 		fmt.Println("CANCEL-ONLY DONE (interrupt worked)")
+		return
+	}
+
+	// SMOKE_ONLY=isolate exercises the worktree lifecycle end to end: a task
+	// asks for a checkout of its own, its changes are summarized from there, and
+	// the checkout is torn down again. cwd must be a git repository with at
+	// least one commit.
+	if os.Getenv("SMOKE_ONLY") == "isolate" {
+		fmt.Println("\n== isolated task (worktree lifecycle) ==")
+		st := callTool(ctx, session, "agent_run_task", map[string]any{
+			"prompt":  prompt,
+			"agent":   agentName,
+			"cwd":     cwd,
+			"isolate": true,
+		})
+		id := jsonField(st, "task_id")
+		worktree := jsonField(st, "worktree")
+		branch := jsonField(st, "branch")
+		fmt.Printf("  task %s ran in %s (branch %s)\n", id, worktree, branch)
+		if worktree == "" || branch == "" {
+			log.Fatal("FAIL: the task reported no worktree, so it was not isolated")
+		}
+		if worktree == cwd {
+			log.Fatal("FAIL: the worktree is the original directory")
+		}
+		if _, err := os.Stat(worktree); err != nil {
+			log.Fatalf("FAIL: the worktree does not exist on disk: %v", err)
+		}
+
+		// The diff has to come from where the work actually happened.
+		dr := callTool(ctx, session, "agent_task_diff", map[string]any{"task_id": id})
+		if root := jsonField(dr, "root"); root == "" {
+			log.Fatalf("FAIL: agent_task_diff reported no repository: %s", resultText(dr))
+		}
+		fmt.Printf("  agent_task_diff: %s\n", firstLine(resultText(dr)))
+
+		// Removal must refuse while the task's work is still uncommitted — that
+		// work exists nowhere else. Whether it refuses depends on whether the
+		// agent actually changed anything, so both outcomes are legitimate and
+		// only the wrong one is a failure.
+		rm := callToolAllowingError(ctx, session, "agent_remove_worktree", map[string]any{"task_id": id})
+		if rm.IsError {
+			if !strings.Contains(resultText(rm), "force=true") {
+				log.Fatalf("FAIL: removal was refused for the wrong reason: %s", resultText(rm))
+			}
+			fmt.Println("  removal refused while the task's changes were uncommitted, as it should be")
+			rm = callTool(ctx, session, "agent_remove_worktree", map[string]any{"task_id": id, "force": true})
+		}
+		if rm.IsError {
+			log.Fatalf("FAIL: removing the worktree: %s", resultText(rm))
+		}
+		if _, err := os.Stat(worktree); !os.IsNotExist(err) {
+			log.Fatalf("FAIL: the worktree survived removal: %v", err)
+		}
+		fmt.Println("ISOLATE-ONLY DONE (worktree created, diffed and removed)")
+		return
+	}
+
+	// SMOKE_ONLY=permission proves the whole interactive-approval chain: the
+	// worker hits a tool it is not pre-approved for, the request travels back
+	// through the approval endpoint as an elicitation, the answer reaches the
+	// worker, and the run completes instead of hanging.
+	//
+	// It needs a REAL agent (SMOKE_AGENT=claude): the mock never asks for
+	// anything, so there is nothing to approve. Run the server without
+	// pre-approving the tool the prompt needs, or nothing will be asked.
+	if os.Getenv("SMOKE_ONLY") == "permission" {
+		fmt.Println("\n== interactive permission (worker asks, user answers) ==")
+
+		// The server knows whether it can ask this client at all, and says so.
+		// Reporting "nothing was asked" as a failure when the negotiated
+		// protocol forbids server-initiated elicitation would be blaming the
+		// wiring for a rule.
+		diag := callTool(ctx, session, "agent_diagnose", map[string]any{})
+		if jsonField(diag, "interactive_permission") != "true" {
+			fmt.Printf("  NOT APPLICABLE: %s\n", jsonField(diag, "interactive_permission_detail"))
+			fmt.Println("PERMISSION-ONLY SKIPPED (this client cannot be asked)")
+			return
+		}
+
+		res := callTool(ctx, session, "agent_run_task", map[string]any{
+			"prompt": prompt,
+			"agent":  agentName,
+			"cwd":    cwd,
+		})
+		status := jsonField(res, "status")
+		progressMu.Lock()
+		asked := len(elicitations)
+		progressMu.Unlock()
+
+		fmt.Printf("  status=%s after %d permission request(s)\n", status, asked)
+		if asked == 0 {
+			log.Fatal("FAIL: nothing was ever asked — the worker was either pre-approved for everything, " +
+				"or the permission prompt tool was not wired up")
+		}
+		if status != "done" {
+			log.Fatalf("FAIL: the approved run ended as %q:\n%s", status, resultText(res))
+		}
+		fmt.Println("PERMISSION-ONLY DONE (asked, answered, completed)")
 		return
 	}
 
@@ -351,6 +465,16 @@ func callTool(ctx context.Context, s *mcp.ClientSession, name string, args map[s
 	return res
 }
 
+// callToolAllowingError is callTool for the cases where a refusal is one of the
+// outcomes under test, rather than a failure of the test itself.
+func callToolAllowingError(ctx context.Context, s *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
+	res, err := s.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		log.Fatalf("call %s: %v", name, err)
+	}
+	return res
+}
+
 func textContent(res *mcp.CallToolResult) string {
 	for _, c := range res.Content {
 		if tc, ok := c.(*mcp.TextContent); ok {
@@ -442,4 +566,19 @@ func splitLines(s string) []string {
 	}
 	lines = append(lines, s[start:])
 	return lines
+}
+
+// resultText returns a tool result's text content, which is what a human reads
+// and what the error paths carry.
+func resultText(res *mcp.CallToolResult) string {
+	if res == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			b.WriteString(tc.Text)
+		}
+	}
+	return b.String()
 }

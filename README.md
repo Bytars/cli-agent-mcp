@@ -87,9 +87,113 @@ newline-delimited output. That gives a clean programmatic contract:
 | `agent_task_status` | Poll status (`running`/`done`/`failed`/`canceled`) and read the result of a backgrounded task. |
 | `agent_get_output` | Fetch the streamed transcript (supports incremental `since_line`/`max_lines`). |
 | `agent_send_followup` | Non-blocking follow-up on a backgrounded task. |
+| **`agent_task_diff`** | Show what a task actually changed: files, line counts, commits, optionally the patch. The agent's summary is a claim; this is the evidence. |
+| `agent_remove_worktree` | Delete the isolated checkout a task ran in. Refuses while it still holds uncommitted work. |
 | `agent_cancel_task` | Terminate a running task. |
 | `agent_list_tasks` | List all tasks, newest first. |
 | `agent_list_agents` | Show which agents are available on this machine. |
+| `agent_diagnose` | Why an agent fails with no explanation: package identity, whether spawning works, how each launcher resolves, whether permission questions can reach you. |
+
+## What a task cost
+
+Delegating hides everything a person at a terminal would have watched accumulate,
+and cost is the part that compounds without anyone noticing. Every result now
+carries what the run cost, the tokens it moved, how many turns it took and which
+model actually ran — on the board, in the audit log, and inline with the answer:
+
+```
+Task task-3-9b8b5e97 finished with status "done".
+
+Added the retry with backoff and a test for it.
+
+— $0.1104 · 4 in / 252 out tokens · 56.3k cached · 2 agent turn(s) · 9s · claude-opus-5
+```
+
+A run that reported nothing shows nothing. An absent figure and a zero one mean
+different things, and printing `$0.0000` for the first would be a lie.
+
+## Reviewing what the worker changed
+
+`agent_task_diff` compares against the commit the repository was on when the task
+started, captured up front because it cannot be recovered afterwards: once the
+worker commits its own work, a diff against `HEAD` shows nothing and reads as
+"the agent changed no files". Untracked files are listed too — a file created and
+never staged has still changed the repository, and never appears in a diff.
+
+## Running tasks in parallel without collisions
+
+Agents edit files. Two of them working in the same checkout overwrite each other
+and produce a diff neither intended — the failure that arrives the moment
+delegating more than one task at a time starts working well enough to be worth
+doing.
+
+Pass `isolate: true` and the task gets a git worktree on a branch of its own,
+sharing the repository's history so the result still merges normally:
+
+```
+agent_run_task { prompt: "…", cwd: "C:\\code\\api", isolate: true }
+```
+
+It is opt-in per call rather than a mode. A worktree is a fresh checkout, so
+anything the repository does not track — `node_modules`, a `.env`, a build cache
+— is simply not there, and a task that needs those has to run in place.
+
+Concurrency is capped at `CLI_AGENT_MCP_MAX_CONCURRENT` (default 3) live workers.
+That is a different limit from `MAX_TASKS`, which only bounds retained records:
+the current Claude Code binary is a quarter of a gigabyte per worker, so an
+orchestrator fanning out ten tasks can exhaust the machine with every other limit
+still satisfied.
+
+## Letting the worker ask instead of stalling
+
+A headless agent executes what it is allowed to and asks about the rest. With no
+terminal there is nobody to answer, so the run either hangs or the operator
+pre-approves everything up front — trading the ability to say no for the ability
+to finish.
+
+When the client supports it, this server takes the third option: Claude Code is
+launched with `--permission-prompt-tool` pointing at a single-use endpoint on
+loopback, and each request becomes a question put to the person who delegated the
+task, showing the actual command rather than "may the agent use Bash". A refusal
+reaches the agent as a reason it can work around. The grant is revoked with its
+config file the moment the turn ends.
+
+**It does not engage for every client.** It needs one that declared the
+elicitation capability, *and* a negotiated protocol older than `2026-07-28` —
+from that version the spec ([SEP-2322](https://blog.modelcontextprotocol.io/posts/2026-07-28/))
+forbids a server from opening an elicitation on its own and requires the question
+to be embedded in the result of a call the client itself made. A worker's
+permission request does not arrive during such a call, so there is nothing to
+attach it to.
+
+When it cannot engage, behaviour is exactly what it was before — the operator's
+pre-approved list decides — and `agent_diagnose` says so in as many words:
+
+```
+ask to run  : no — MCP 2026-07-28 no longer lets a server open an elicitation on its own (SEP-2322) …
+              A tool that is neither pre-approved nor denied will stall instead of asking;
+              pre-approve what tasks need with CLI_AGENT_MCP_ALLOWED_TOOLS or allowed_tools.
+```
+
+## One server, several clients
+
+Over stdio the client owns the process, so every client that wants these tools
+starts its own copy — and a second copy cannot see, watch or cancel the first
+one's workers. That is what the orphaned-instance machinery below exists to
+survive.
+
+`--http` removes the cause instead:
+
+```bash
+cli-agent-mcp --http 127.0.0.1:7777
+```
+
+One long-lived server, one task registry, and every client pointed at
+`http://127.0.0.1:7777/mcp`. A socket has no parent to inherit trust from and
+this process can run arbitrary commands on the machine, so it binds to loopback
+and requires a bearer token (`CLI_AGENT_MCP_HTTP_TOKEN`, or one is generated and
+printed to stderr at startup). A non-loopback bind is allowed and says so loudly
+in the log.
 
 ## Seeing where tasks stand
 
@@ -275,6 +379,11 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_DEFAULT_CWD` | server's cwd | Working directory when a call omits `cwd`. **Set this.** |
 | `CLI_AGENT_MCP_ALLOWED_CWDS` | — | If set, every task `cwd` must live under one of these roots (`;`-separated). |
 | `CLI_AGENT_MCP_MAX_TASKS` | `100` | Max retained tasks in memory. |
+| `CLI_AGENT_MCP_MAX_CONCURRENT` | `3` | Max workers running at once. Separate from `MAX_TASKS`, which only bounds retained records. |
+| `CLI_AGENT_MCP_ASK_PERMISSION` | `true` | Let a worker ask you before running something it isn't pre-approved for. Only engages for clients that can be asked — see above. |
+| `CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS` | `600` | How long a worker waits for that answer before the request is denied. |
+| `CLI_AGENT_MCP_WORKTREE_DIR` | `<state dir>/worktrees` | Where isolated task checkouts are created. |
+| `CLI_AGENT_MCP_HTTP_TOKEN` | generated | Bearer token required by `--http`. Printed to stderr when generated. |
 | `CLI_AGENT_MCP_AUDIT_LOG` | — | Path to a JSONL audit log of what the worker did. See [Audit log](#audit-log). |
 | `CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS` | `0` (off) | Kill a turn that runs longer than this — a safety net for a worker hung on a permission prompt. |
 | `CLI_AGENT_MCP_COMPACT` | `true` | `agent_get_output`/`agent_watch` return a filtered, readable transcript instead of raw JSONL (pass `raw: true` on a call to override). |

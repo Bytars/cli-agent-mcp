@@ -56,18 +56,64 @@ func (d *permissionDesk) Decide(ctx context.Context, req approval.Request) appro
 // decides and anything outside it stalls — bad, but the failure the operator
 // configured for, not a new one introduced here.
 func (d *permissionDesk) Approver(session *mcp.ServerSession) task.Approver {
-	if d == nil || d.broker == nil || session == nil || !canElicit(session) {
+	if d == nil || d.broker == nil || session == nil {
+		return nil
+	}
+	if reason := cannotAsk(session); reason != "" {
 		return nil
 	}
 	return &sessionApprover{desk: d, session: session}
 }
 
-// canElicit reports whether the connected client told us during initialize that
-// it can put a question to its user. Asking one that cannot would block every
-// permission request until it timed out.
-func canElicit(session *mcp.ServerSession) bool {
+// cannotAsk returns why this client cannot be asked a permission question, or
+// "" when it can. It is phrased as the obstacle rather than the capability
+// because both callers want to explain the absence.
+//
+// Two things have to hold. The client must have declared during initialize that
+// it can elicit — asking one that cannot would block every request until it
+// timed out. And the negotiated protocol must still permit a server to open an
+// elicitation on its own: from 2026-07-28 the spec (SEP-2322) forbids
+// server-initiated requests and requires the question to be embedded in the
+// result of a call the client itself made. A permission request does not arrive
+// during such a call — it comes from a worker process, often long after the
+// delegating call returned — so there is nothing to embed it in.
+func cannotAsk(session *mcp.ServerSession) string {
 	params := session.InitializeParams()
-	return params != nil && params.Capabilities != nil && params.Capabilities.Elicitation != nil
+	if params == nil {
+		return "the client's capabilities are not known"
+	}
+	if params.Capabilities == nil || params.Capabilities.Elicitation == nil {
+		return "this client did not declare the elicitation capability, so it has no way to put the question to you"
+	}
+	if params.ProtocolVersion >= mrtrProtocolVersion {
+		return "MCP " + params.ProtocolVersion + " no longer lets a server open an elicitation on its own (SEP-2322), " +
+			"and a worker's permission request does not arrive during a call this client made, so there is nothing to attach it to"
+	}
+	return ""
+}
+
+// mrtrProtocolVersion is the release that replaced server-initiated elicitation
+// with multi round-trip requests.
+const mrtrProtocolVersion = "2026-07-28"
+
+// status reports whether a worker can ask this client for permission, and why
+// not when it cannot. agent_diagnose surfaces it, because the symptom of this
+// being off is a task that quietly does less than it was asked to, with nothing
+// in the transcript pointing at the cause.
+func (d *permissionDesk) status(session *mcp.ServerSession, configured bool) (bool, string) {
+	if !configured {
+		return false, "turned off on this server (CLI_AGENT_MCP_ASK_PERMISSION=false)"
+	}
+	if d == nil || d.broker == nil {
+		return false, "the approval endpoint could not be started; see the server log"
+	}
+	if session == nil {
+		return false, "no client session"
+	}
+	if reason := cannotAsk(session); reason != "" {
+		return false, reason
+	}
+	return true, ""
 }
 
 // sessionApprover is one client session's ability to answer for the tasks it

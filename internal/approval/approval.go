@@ -47,9 +47,10 @@ type Decision struct {
 
 // Request is one tool call the worker wants to make.
 type Request struct {
-	TaskID   string
-	ToolName string
-	Input    map[string]any
+	TaskID    string
+	ToolName  string
+	Input     map[string]any
+	ToolUseID string // the agent's own id for this call, for correlating logs
 }
 
 // Decider answers a permission request. It is called off the broker's lock and
@@ -172,23 +173,43 @@ func (b *Broker) serverFor(r *http.Request) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        toolName,
 		Description: "Ask the human running this task whether the agent may perform a tool call.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in promptInput) (*mcp.CallToolResult, any, error) {
+		InputSchema: promptSchema,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+		name, _ := in["tool_name"].(string)
+		input, _ := in["input"].(map[string]any)
+		useID, _ := in["tool_use_id"].(string)
+
 		if !ok {
 			return decisionResult(Decision{
 				Message: "this approval link is no longer valid (the task it belonged to has ended)",
-			}, in.Input), nil, nil
+			}, input), nil, nil
 		}
-		d := b.decide(ctx, Request{TaskID: taskID, ToolName: in.ToolName, Input: in.Input})
-		return decisionResult(d, in.Input), nil, nil
+		d := b.decide(ctx, Request{TaskID: taskID, ToolName: name, Input: input, ToolUseID: useID})
+		return decisionResult(d, input), nil, nil
 	})
 	return srv
 }
 
-// promptInput is the shape Claude Code sends to a permission prompt tool.
-type promptInput struct {
-	ToolName string         `json:"tool_name" jsonschema:"The tool the agent wants to use."`
-	Input    map[string]any `json:"input,omitempty" jsonschema:"The arguments it wants to call that tool with."`
-}
+// promptSchema is written out rather than inferred from a struct, and it accepts
+// properties it does not name.
+//
+// The SDK generates `additionalProperties: false` from a Go type, and the caller
+// here is Claude Code rather than a model improvising arguments — it sends
+// tool_name, input and tool_use_id today and may send more tomorrow. A strict
+// schema turned that into "Error calling tool (Bash): unexpected additional
+// properties [tool_use_id]", which the agent reported as the *Bash* tool being
+// broken. Nothing pointed at the permission tool, and the run failed while
+// looking like a completely unrelated fault.
+var promptSchema = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "tool_name":   {"type": "string", "description": "The tool the agent wants to use."},
+    "input":       {"type": "object", "description": "The arguments it wants to call that tool with."},
+    "tool_use_id": {"type": "string", "description": "The agent's id for this tool call."}
+  },
+  "required": ["tool_name"],
+  "additionalProperties": true
+}`)
 
 // decisionResult encodes an answer the way a permission prompt tool must: a
 // single text block holding the JSON verdict.

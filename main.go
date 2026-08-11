@@ -562,8 +562,8 @@ func planText(snap task.Snapshot) string {
 		return fmt.Sprintf("Planning task %s FAILED (status %q).%s Nothing was executed.\n\n%s",
 			snap.ID, snap.Status, outcomeDetail(snap), body)
 	}
-	return fmt.Sprintf("Task %s planned (status %q) — NOTHING WAS EXECUTED.%s\n\n%s\n\nReview this with the user. To carry it out, call agent_run_followup with task_id=%s.",
-		snap.ID, snap.Status, outcomeDetail(snap), body, snap.ID)
+	return fmt.Sprintf("Task %s planned (status %q) — NOTHING WAS EXECUTED.%s\n\n%s\n\nReview this with the user. To carry it out, call agent_run_followup with task_id=%s.%s",
+		snap.ID, snap.Status, outcomeDetail(snap), body, snap.ID, usageLine(snap))
 }
 
 func firstLine(s string) string {
@@ -1038,6 +1038,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, agent.DiagnosticReport, error) {
 		rep := agent.Diagnose(ctx, reg)
+		rep.InteractivePermission, rep.PermissionDetail = desk.status(req.Session, cfg.AskPermission)
 		return textResult(rep.Text()), rep, nil
 	})
 

@@ -85,6 +85,59 @@ func TestApproveAllowsAndEchoesTheInput(t *testing.T) {
 	}
 }
 
+// Claude Code sends tool_use_id alongside tool_name and input, and a schema
+// generated from a Go struct rejects it as an unexpected property. The failure
+// that produces is genuinely misleading: the agent reports "Error calling tool
+// (Bash): unexpected additional properties [tool_use_id]" and concludes the Bash
+// tool is broken, while nothing at all points at the permission tool. This is
+// the exact payload, so the schema can never quietly tighten again.
+func TestApproveAcceptsTheFieldsClaudeCodeActuallySends(t *testing.T) {
+	var seen Request
+	b, err := Start(t.TempDir(), func(_ context.Context, r Request) Decision {
+		seen = r
+		return Decision{Allow: true}
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Close()
+
+	g, _ := b.NewGrant("task-1")
+	defer g.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client := mcp.NewClient(&mcp.Implementation{Name: "fake-worker", Version: "1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: grantURL(t, g)}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer session.Close()
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: g.ToolName,
+		Arguments: map[string]any{
+			"tool_name":   "Bash",
+			"input":       map[string]any{"command": "mkdir -p out", "description": "make a directory"},
+			"tool_use_id": "toolu_01abc",
+			// A field we do not know about yet must not break the call either.
+			"future_field": "whatever",
+		},
+	})
+	if err != nil {
+		t.Fatalf("the payload Claude Code sends was rejected: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("the call came back as an error: %s", res.Content)
+	}
+	if seen.ToolUseID != "toolu_01abc" {
+		t.Errorf("ToolUseID = %q, want the agent's own call id", seen.ToolUseID)
+	}
+	if seen.Input["command"] != "mkdir -p out" {
+		t.Errorf("Input = %v, want the command the agent asked to run", seen.Input)
+	}
+}
+
 func TestApproveDeniesWithAReason(t *testing.T) {
 	b, err := Start(t.TempDir(), func(context.Context, Request) Decision {
 		return Decision{Message: "the user said no"}
