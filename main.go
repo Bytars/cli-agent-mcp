@@ -60,9 +60,12 @@ func main() {
 		case "--help", "-h", "help":
 			printHelp()
 			return
-		case "--list-agents":
+		case "--list-agents", "--http":
 			// Handled further down, once the registry exists.
 		default:
+			if strings.HasPrefix(os.Args[1], "--http=") {
+				break
+			}
 			// Anything else that looks like a flag is a typo, not a request to
 			// serve: without this the process would drop into server mode and
 			// hang on stdin with no diagnostic. Usage goes to stderr — stdout is
@@ -183,6 +186,13 @@ func main() {
 	registerTools(srv, reg, mgr, cfg, desk)
 
 	log.Printf("starting (default agent=%s, max_tasks=%d, max_concurrent=%d)", cfg.DefaultAgent, cfg.MaxTasks, cfg.MaxConcurrent)
+
+	if addr, ok := httpAddrFromArgs(os.Args[1:]); ok {
+		if err := serveHTTP(context.Background(), srv, addr, hostToken()); err != nil {
+			log.Fatalf("server exited: %v", err)
+		}
+		return
+	}
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatalf("server exited: %v", err)
 	}
@@ -1024,7 +1034,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_diagnose",
-		Description: "Diagnostica la cadena de ejecución: identidad de paquete del proceso (MSIX en Windows), si el spawn de procesos hijos funciona, y cómo resuelve cada agente su binario. Usar cuando un agente falla sin explicación o con exit code sin salida.",
+		Description: "Diagnose the execution chain: this process's package identity (MSIX on Windows), whether spawning a child process works at all, and how each agent resolves its launcher. Use it when an agent fails with no explanation, or exits with a code and no output.",
 		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, agent.DiagnosticReport, error) {
 		rep := agent.Diagnose(ctx, reg)
@@ -1137,6 +1147,12 @@ background worker, with live progress streaming.
 
 Usage:
   cli-agent-mcp                 Run the MCP server over stdio (how an MCP client launches it).
+  cli-agent-mcp --http [addr]   Run over streamable HTTP instead (default 127.0.0.1:7777),
+                                so several clients share ONE server — and therefore one task
+                                registry — instead of each starting a copy that cannot see
+                                the others' work. Endpoint: http://<addr>/mcp
+                                Requires a bearer token: set CLI_AGENT_MCP_HTTP_TOKEN, or one
+                                is generated and printed to stderr at startup.
   cli-agent-mcp --list-agents   Print detected agents and availability, then exit.
   cli-agent-mcp --version       Print version.
   cli-agent-mcp --help          This help.
@@ -1156,6 +1172,20 @@ Configuration (environment variables):
   CLI_AGENT_MCP_DEFAULT_CWD        Default working directory
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
+  CLI_AGENT_MCP_MAX_CONCURRENT     Max workers running at once. Separate from MAX_TASKS,
+                                   which only bounds retained records — a headless agent is
+                                   a heavyweight process.                (default: 3)
+  CLI_AGENT_MCP_ASK_PERMISSION     Let the worker ask the person who delegated the task
+                                   before running something it isn't pre-approved for,
+                                   instead of stalling. Only engages for a client that can
+                                   elicit.                               (default: true)
+  CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS
+                                   How long a worker waits for that answer before the
+                                   request is denied.                    (default: 600)
+  CLI_AGENT_MCP_WORKTREE_DIR       Where isolated task checkouts are created
+                                   (default: <state dir>\worktrees)
+  CLI_AGENT_MCP_HTTP_TOKEN         Bearer token required by --http. Generated per run when
+                                   unset, and printed to stderr.
   CLI_AGENT_MCP_AUDIT_LOG          Path to a JSONL audit log of what the worker did
   CLI_AGENT_MCP_WATCH_WINDOW_SECONDS  How long one agent_watch call may block before
                                    returning a resumable partial. Keep it under the

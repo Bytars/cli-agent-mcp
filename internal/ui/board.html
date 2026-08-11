@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Tareas del agente</title>
+<title>Agent tasks</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -41,7 +41,7 @@
     color: var(--fg);
     font: 14px/1.45 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
   }
-  header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
   h1 { font-size: 15px; font-weight: 600; margin: 0; }
   .count { color: var(--muted); font-size: 13px; }
   .live { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
@@ -57,6 +57,7 @@
   .dot.done { background: var(--done); }
   .dot.failed { background: var(--failed); }
   .dot.canceled { background: var(--canceled); }
+  .dot.orphaned { background: var(--canceled); box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--canceled); }
   .prompt { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .meta { color: var(--muted); font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
   .badge { font-size: 11px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); flex: 0 0 auto; }
@@ -72,6 +73,11 @@
   button:hover:not(:disabled) { background: var(--card-hover); }
   button:disabled { opacity: .45; cursor: default; }
   button.danger { color: var(--failed); border-color: var(--failed); }
+  input[type=text] {
+    font: inherit; font-size: 12px; padding: 4px 8px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+    flex: 1 1 220px; min-width: 0;
+  }
   pre {
     margin: 0; padding: 9px 10px; background: var(--code-bg); border-radius: 7px;
     max-height: 300px; overflow: auto;
@@ -84,18 +90,18 @@
     border: 1px solid var(--failed); border-radius: 8px; padding: 8px 10px;
     margin-bottom: 10px; font-size: 12px; line-height: 1.5;
   }
-  .dot.orphaned { background: var(--canceled); box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--canceled); }
   .cwd { font-size: 11px; color: var(--muted); word-break: break-all; }
+  .isolated { border-color: var(--running); color: var(--running); }
 </style>
 </head>
 <body>
 <header>
-  <h1>Tareas del agente</h1>
+  <h1>Agent tasks</h1>
   <span class="count" id="count"></span>
-  <span class="live"><span class="pulse idle" id="pulse"></span><span id="livetext">conectando…</span></span>
+  <span class="live"><span class="pulse idle" id="pulse"></span><span id="livetext">connecting…</span></span>
 </header>
 <div id="banner"></div>
-<div id="list"><div class="empty">Cargando…</div></div>
+<div id="list"><div class="empty">Loading…</div></div>
 
 <script>
 (function () {
@@ -115,7 +121,7 @@
       setTimeout(function () {
         if (pending.has(id)) {
           pending.delete(id);
-          reject(new Error("sin respuesta del host: " + method));
+          reject(new Error("no response from the host: " + method));
         }
       }, 30000);
     });
@@ -133,7 +139,7 @@
       var p = pending.get(m.id);
       if (!p) return;
       pending.delete(m.id);
-      if (m.error) p.reject(new Error(m.error.message || "error RPC"));
+      if (m.error) p.reject(new Error(m.error.message || "RPC error"));
       else p.resolve(m.result);
       return;
     }
@@ -162,6 +168,7 @@
   var bannerEl = document.getElementById("banner");
   var expanded = new Set();   // task ids whose transcript is open
   var outputs = new Map();    // task id -> last fetched transcript tail
+  var diffs = new Map();      // task id -> last fetched change summary
   var lastTasks = [];
 
   function esc(s) {
@@ -186,6 +193,34 @@
     var m = Math.floor(s / 60);
     if (m < 60) return m + "m " + (s % 60) + "s";
     return Math.floor(m / 60) + "h " + (m % 60) + "m";
+  }
+
+  function money(n) {
+    if (!n) return "";
+    return "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2));
+  }
+
+  function compactNum(n) {
+    if (!n) return "0";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+    return String(n);
+  }
+
+  // What a task cost is the part of delegation that compounds without anyone
+  // noticing, so it goes next to the task rather than behind a click.
+  function usageText(t) {
+    var u = t.usage;
+    if (!u) return "";
+    var bits = [];
+    if (u.cost_usd) bits.push(money(u.cost_usd));
+    if (u.input_tokens || u.output_tokens) {
+      bits.push(compactNum(u.input_tokens) + " in / " + compactNum(u.output_tokens) + " out");
+    }
+    if (u.cache_read_tokens) bits.push(compactNum(u.cache_read_tokens) + " cached");
+    if (u.num_turns) bits.push(u.num_turns + (u.num_turns === 1 ? " turn" : " turns"));
+    if (t.model_used) bits.push(t.model_used);
+    return bits.join(" · ");
   }
 
   function statusLabel(t) {
@@ -218,18 +253,20 @@
 
     finished.forEach(function (t) {
       var prompt = (t.prompts && t.prompts.length) ? t.prompts[t.prompts.length - 1] : "";
-      request("ui/message", {
-        role: "user",
-        content: {
-          type: "text",
-          text: "La tarea " + t.task_id + " (" + t.agent + ") terminó con estado \"" + t.status + "\"." +
-            (prompt ? " Era: " + prompt + "." : "") +
-            " Lee su salida con agent_get_output y cuéntame cómo fue."
-        }
-      }).catch(function () {
-        // Hosts may withhold ui/message. Losing the announcement is acceptable;
-        // the panel still shows the finished task either way.
-      });
+      var text = "Task " + t.task_id + " (" + t.agent + ") finished with status \"" + t.status + "\"." +
+        (prompt ? " It was: " + prompt + "." : "") +
+        " Read its output with agent_get_output";
+      // An isolated task's changes are not in the working copy anyone is
+      // looking at, so the diff is the only way to see what it did.
+      text += t.worktree
+        ? ", check what it changed with agent_task_diff (it ran isolated on branch " + t.branch + "), and tell me how it went."
+        : " and tell me how it went.";
+
+      request("ui/message", { role: "user", content: { type: "text", text: text } })
+        .catch(function () {
+          // Hosts may withhold ui/message. Losing the announcement is
+          // acceptable; the panel still shows the finished task either way.
+        });
     });
   }
 
@@ -237,21 +274,27 @@
     lastTasks = tasks || [];
     announceFinished(lastTasks);
     var running = lastTasks.filter(function (t) { return t.status === "running"; }).length;
+    var total = lastTasks.reduce(function (sum, t) {
+      return sum + ((t.usage && t.usage.cost_usd) || 0);
+    }, 0);
 
     countEl.textContent = lastTasks.length
-      ? lastTasks.length + " tarea" + (lastTasks.length === 1 ? "" : "s") +
-        (running ? " · " + running + " en curso" : "")
+      ? lastTasks.length + (lastTasks.length === 1 ? " task" : " tasks") +
+        (running ? " · " + running + " running" : "") +
+        (total ? " · " + money(total) + " total" : "")
       : "";
 
     if (!lastTasks.length) {
-      listEl.innerHTML = '<div class="empty">Todavía no hay tareas.</div>';
+      listEl.innerHTML = '<div class="empty">No tasks yet.</div>';
       return;
     }
 
     listEl.innerHTML = lastTasks.map(function (t) {
       var open = expanded.has(t.task_id);
-      var prompt = (t.prompts && t.prompts.length) ? t.prompts[t.prompts.length - 1] : "(sin prompt)";
+      var prompt = (t.prompts && t.prompts.length) ? t.prompts[t.prompts.length - 1] : "(no prompt)";
       var out = outputs.get(t.task_id);
+      var diff = diffs.get(t.task_id);
+      var usage = usageText(t);
 
       var body = "";
       if (open) {
@@ -260,14 +303,27 @@
             (t.error ? '<div class="err">' + esc(t.error) + "</div>" : "") +
             '<div class="row">' +
               '<span class="id">' + esc(t.task_id) + "</span>" +
-              '<span class="meta">' + esc(statusLabel(t)) + " · " + t.total_output_lines + " líneas · " +
-                t.turns + " turno" + (t.turns === 1 ? "" : "s") + "</span>" +
+              '<span class="meta">' + esc(statusLabel(t)) + " · " + t.total_output_lines + " lines · " +
+                t.turns + (t.turns === 1 ? " turn" : " turns") + "</span>" +
+              '<button data-diff="' + esc(t.task_id) + '">Changes</button>' +
               (t.status === "running"
-                ? '<button class="danger" data-cancel="' + esc(t.task_id) + '">Cancelar</button>'
+                ? '<button class="danger" data-cancel="' + esc(t.task_id) + '">Cancel</button>'
                 : "") +
             "</div>" +
+            (usage ? '<div class="row"><span class="meta">' + esc(usage) + "</span></div>" : "") +
             '<div class="row"><span class="cwd">' + esc(t.cwd) + "</span></div>" +
-            "<pre>" + esc(out === undefined ? "cargando…" : (out || "(sin salida todavía)")) + "</pre>" +
+            (t.worktree
+              ? '<div class="row"><span class="cwd">isolated on branch ' + esc(t.branch) +
+                ", cut from " + esc(t.repo) + "</span></div>"
+              : "") +
+            (diff !== undefined ? "<pre>" + esc(diff) + "</pre>" : "") +
+            "<pre>" + esc(out === undefined ? "loading…" : (out || "(no output yet)")) + "</pre>" +
+            (t.status !== "running" && t.session_id
+              ? '<div class="row">' +
+                  '<input type="text" placeholder="Send a follow-up to this session…" data-prompt="' + esc(t.task_id) + '">' +
+                  '<button data-followup="' + esc(t.task_id) + '">Send</button>' +
+                "</div>"
+              : "") +
           "</div>";
       }
 
@@ -277,6 +333,8 @@
             '<span class="chev">' + (open ? "▾" : "▸") + "</span>" +
             '<span class="dot ' + esc(t.status) + '"></span>' +
             '<span class="prompt">' + esc(prompt) + "</span>" +
+            (t.worktree ? '<span class="badge isolated">isolated</span>' : "") +
+            (t.usage && t.usage.cost_usd ? '<span class="meta">' + esc(money(t.usage.cost_usd)) + "</span>" : "") +
             '<span class="badge">' + esc(t.agent) + "</span>" +
             '<span class="meta">' + esc(elapsed(t)) + "</span>" +
           "</div>" + body +
@@ -290,6 +348,7 @@
         if (expanded.has(id)) {
           expanded.delete(id);
           outputs.delete(id);
+          diffs.delete(id);
           render(lastTasks);
         } else {
           expanded.add(id);
@@ -303,12 +362,62 @@
       el.addEventListener("click", function (ev) {
         ev.stopPropagation();
         el.disabled = true;
-        el.textContent = "Cancelando…";
+        el.textContent = "Cancelling…";
         callTool("agent_cancel_task", { task_id: el.getAttribute("data-cancel") })
           .then(refresh)
           .catch(fail);
       });
     });
+
+    listEl.querySelectorAll("[data-diff]").forEach(function (el) {
+      el.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        var id = el.getAttribute("data-diff");
+        el.disabled = true;
+        diffs.set(id, "loading…");
+        render(lastTasks);
+        callTool("agent_task_diff", { task_id: id })
+          .then(function (res) {
+            diffs.set(id, textOf(res) || "(no changes)");
+            render(lastTasks);
+          })
+          .catch(function (e) {
+            diffs.set(id, "could not read the changes: " + e.message);
+            render(lastTasks);
+          });
+      });
+    });
+
+    listEl.querySelectorAll("[data-followup]").forEach(function (el) {
+      el.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        var id = el.getAttribute("data-followup");
+        var input = listEl.querySelector('[data-prompt="' + id + '"]');
+        var text = input && input.value.trim();
+        if (!text) return;
+        el.disabled = true;
+        el.textContent = "Sending…";
+        callTool("agent_send_followup", { task_id: id, prompt: text })
+          .then(function () {
+            if (input) input.value = "";
+            return refresh();
+          })
+          .catch(fail);
+      });
+    });
+
+    listEl.querySelectorAll("input[data-prompt]").forEach(function (el) {
+      el.addEventListener("click", function (ev) { ev.stopPropagation(); });
+    });
+  }
+
+  // Tools answer with both structured content and text; the text is what reads
+  // well in a panel, so prefer it and fall back to the structured field.
+  function textOf(res) {
+    if (!res) return "";
+    if (res.content && res.content.length && res.content[0].text) return res.content[0].text;
+    var sc = res.structuredContent;
+    return (sc && sc.text) || "";
   }
 
   // Tail the transcript: ask only for the last lines, using the line count the
@@ -325,7 +434,7 @@
         render(lastTasks);
       })
       .catch(function (e) {
-        outputs.set(id, "no se pudo leer la salida: " + e.message);
+        outputs.set(id, "could not read the output: " + e.message);
         render(lastTasks);
       });
   }
@@ -347,7 +456,7 @@
         render((sc && sc.tasks) || []);
         var anyRunning = lastTasks.some(function (t) { return t.status === "running"; });
         pulseEl.className = anyRunning ? "pulse" : "pulse idle";
-        liveEl.textContent = anyRunning ? "en vivo" : "al día";
+        liveEl.textContent = anyRunning ? "live" : "up to date";
         return Promise.all(Array.from(expanded).map(fetchOutput));
       })
       .catch(fail)
