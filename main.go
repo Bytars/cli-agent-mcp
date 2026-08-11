@@ -20,12 +20,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/andresh0816/cli-agent-mcp/internal/agent"
 	"github.com/andresh0816/cli-agent-mcp/internal/audit"
 	"github.com/andresh0816/cli-agent-mcp/internal/config"
+	"github.com/andresh0816/cli-agent-mcp/internal/gitx"
 	"github.com/andresh0816/cli-agent-mcp/internal/state"
 	"github.com/andresh0816/cli-agent-mcp/internal/task"
 	"github.com/andresh0816/cli-agent-mcp/internal/ui"
@@ -211,8 +213,13 @@ type followupInput struct {
 type outputInput struct {
 	TaskID    string `json:"task_id" jsonschema:"The task id to read output from."`
 	SinceLine int    `json:"since_line,omitempty" jsonschema:"0-based line index to start from (for incremental reads)."`
-	MaxLines  int    `json:"max_lines,omitempty" jsonschema:"Maximum number of lines to return. 0 means all."`
+	MaxLines  int    `json:"max_lines,omitempty" jsonschema:"Maximum number of lines to return. Leave unset to get the end of the transcript (the last few hundred lines), which is where the agent's conclusion is; set it explicitly to page through from since_line."`
 	Raw       bool   `json:"raw,omitempty" jsonschema:"Return the raw JSONL transcript instead of the compact, filtered view."`
+}
+
+type diffInput struct {
+	TaskID string `json:"task_id" jsonschema:"The task whose changes to summarize."`
+	Patch  bool   `json:"patch,omitempty" jsonschema:"Include the actual diff, not just the file list. Bounded in size — ask for it when you intend to review the code, not by default."`
 }
 
 type watchInput struct {
@@ -402,6 +409,53 @@ func outcomeDetail(snap task.Snapshot) string {
 	return " " + strings.Join(parts, "; ") + "."
 }
 
+// usageLine renders what the turn cost, or "" when the agent reported nothing.
+// Delegating hides what a person at a terminal would have watched accumulate,
+// and cost is the part that compounds quietly, so it is shown by default rather
+// than left for someone to go looking for.
+func usageLine(snap task.Snapshot) string {
+	u := snap.Usage
+	if u == nil {
+		return ""
+	}
+	var parts []string
+	if u.CostUSD > 0 {
+		parts = append(parts, fmt.Sprintf("$%.4f", u.CostUSD))
+	}
+	if in, out := u.InputTokens, u.OutputTokens; in > 0 || out > 0 {
+		parts = append(parts, fmt.Sprintf("%s in / %s out tokens", compactNum(in), compactNum(out)))
+	}
+	if cached := u.CacheReadTokens; cached > 0 {
+		parts = append(parts, compactNum(cached)+" cached")
+	}
+	if u.NumTurns > 0 {
+		parts = append(parts, fmt.Sprintf("%d agent turn(s)", u.NumTurns))
+	}
+	if u.DurationMS > 0 {
+		parts = append(parts, (time.Duration(u.DurationMS) * time.Millisecond).Round(time.Second).String())
+	}
+	if snap.ModelUsed != "" {
+		parts = append(parts, snap.ModelUsed)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "\n\n— " + strings.Join(parts, " · ")
+}
+
+// compactNum abbreviates token counts, which routinely run into the millions
+// and are unreadable written out in full.
+func compactNum(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
+}
+
 // finishText builds the inline text returned when a streaming run completes.
 func finishText(snap task.Snapshot) string {
 	body := snap.Result
@@ -412,7 +466,7 @@ func finishText(snap task.Snapshot) string {
 	if snap.IsError || snap.Status == task.StatusFailed {
 		header = fmt.Sprintf("Task %s FAILED (status %q).", snap.ID, snap.Status)
 	}
-	return header + outcomeDetail(snap) + "\n\n" + body
+	return header + outcomeDetail(snap) + "\n\n" + body + usageLine(snap)
 }
 
 // stillRunningText is what a blocking "run" tool returns when the turn outlives
@@ -455,6 +509,34 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+const (
+	// defaultOutputLines bounds an agent_get_output call that asked for no
+	// range. A transcript can hold 50 000 lines and the caller is a model with
+	// a finite context; returning all of them spends on scrollback the room it
+	// needs to act on what it read.
+	defaultOutputLines = 400
+
+	// maxOutputBytes is the same bound expressed in bytes, for the case where
+	// few lines are each enormous (a diff, a stack trace, a file dump).
+	maxOutputBytes = 60_000
+
+	// maxPatchBytes bounds a requested patch for the same reason.
+	maxPatchBytes = 60_000
+)
+
+// truncateHead keeps the last n bytes of s on a rune boundary. The tail is what
+// matters in an agent transcript: it holds the conclusion.
+func truncateHead(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
 }
 
 func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config) {
@@ -598,7 +680,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if snap.Result != "" {
 			msg += "\nResult: " + snap.Result
 		}
-		return textResult(msg), snap, nil
+		return textResult(msg + usageLine(snap)), snap, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -610,7 +692,26 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if !ok {
 			return errResult("unknown task " + in.TaskID), outputResult{}, nil
 		}
-		from, to, total, text := t.Output(in.SinceLine, in.MaxLines, cfg.Compact && !in.Raw)
+
+		// An unbounded read used to mean "every line", and a task's transcript
+		// runs to fifty thousand of them. Handing that to the orchestrating model
+		// costs it the context it needs to act on what it just read. When no
+		// range is asked for, return the end of the transcript — which is where
+		// an agent's conclusion lives — and say what was skipped.
+		since, note := in.SinceLine, ""
+		if in.MaxLines <= 0 {
+			if total := t.LineCount(); total-since > defaultOutputLines {
+				skipped := total - defaultOutputLines - since
+				since = total - defaultOutputLines
+				note = fmt.Sprintf("… %d earlier line(s) omitted; read them with since_line/max_lines\n", skipped)
+			}
+		}
+
+		from, to, total, text := t.Output(since, in.MaxLines, cfg.Compact && !in.Raw)
+		if len(text) > maxOutputBytes {
+			text = truncateHead(text, maxOutputBytes)
+			note = "… output truncated to the last " + fmt.Sprint(maxOutputBytes) + " bytes\n"
+		}
 		snap := t.Snapshot()
 		res := outputResult{
 			TaskID:     snap.ID,
@@ -620,8 +721,8 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			TotalLines: total,
 			Text:       text,
 		}
-		body := text
-		if body == "" {
+		body := note + text
+		if strings.TrimSpace(body) == "" {
 			body = "(no output yet)"
 		}
 		return textResult(body), res, nil
@@ -739,7 +840,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			// is told only that there was no text — the cause stays invisible.
 			final = fmt.Sprintf("(no textual result; status=%s)%s", status, outcomeDetail(snap))
 		}
-		return textResult(fmt.Sprintf("Task %s finished with status %q.\n\n%s", snap.ID, status, final)),
+		return textResult(fmt.Sprintf("Task %s finished with status %q.\n\n%s%s", snap.ID, status, final, usageLine(snap))),
 			watchResult{TaskID: snap.ID, Status: string(status), Running: running, NewSinceLine: since, Text: final}, nil
 	})
 
@@ -809,6 +910,28 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
+		Name: "agent_task_diff",
+		Description: "Show what a task actually changed on disk: the files it touched with line counts, any commits it made, and optionally the patch itself. " +
+			"It compares against the commit the repository was on when the task started, so it still reports the work correctly after the worker has committed it. " +
+			"Use this before telling the user a delegated task is done — the agent's own summary is a claim, this is the evidence.",
+		Annotations: readOnlyTool(),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in diffInput) (*mcp.CallToolResult, gitx.Report, error) {
+		t, ok := mgr.Get(in.TaskID)
+		if !ok {
+			return errResult("unknown task " + in.TaskID), gitx.Report{}, nil
+		}
+		if _, ok := gitx.Available(); !ok {
+			return errResult("git was not found on this machine, so changes cannot be summarized"), gitx.Report{}, nil
+		}
+		snap := t.Snapshot()
+		rep, err := gitx.Summarize(ctx, snap.Cwd, snap.BaseCommit, in.Patch, maxPatchBytes)
+		if err != nil {
+			return errResult(err.Error()), gitx.Report{}, nil
+		}
+		return textResult(rep.Text()), rep, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_diagnose",
 		Description: "Diagnostica la cadena de ejecución: identidad de paquete del proceso (MSIX en Windows), si el spawn de procesos hijos funciona, y cómo resuelve cada agente su binario. Usar cuando un agente falla sin explicación o con exit code sin salida.",
 		Annotations: readOnlyTool(),
@@ -873,13 +996,22 @@ func boardText(tasks []task.Snapshot) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d task(s), %d running.\n", len(tasks), running)
+	var total float64
 	for _, t := range tasks {
 		prompt := "(no prompt)"
 		if n := len(t.Prompts); n > 0 {
 			prompt = firstLine(t.Prompts[n-1])
 		}
-		fmt.Fprintf(&b, "\n%s  %s  [%s]  %d line(s)%s\n  %s",
-			t.ID, t.Status, t.Agent, t.TotalLines, outcomeDetail(t), truncate(prompt, 120))
+		cost := ""
+		if t.Usage != nil && t.Usage.CostUSD > 0 {
+			cost = fmt.Sprintf("  $%.4f", t.Usage.CostUSD)
+			total += t.Usage.CostUSD
+		}
+		fmt.Fprintf(&b, "\n%s  %s  [%s]  %d line(s)%s%s\n  %s",
+			t.ID, t.Status, t.Agent, t.TotalLines, cost, outcomeDetail(t), truncate(prompt, 120))
+	}
+	if total > 0 {
+		fmt.Fprintf(&b, "\n\nTotal reported cost: $%.4f", total)
 	}
 	return b.String()
 }

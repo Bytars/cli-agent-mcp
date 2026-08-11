@@ -123,6 +123,12 @@ func (t *Task) refreshOrphan() {
 		t.exitCode = snap.ExitCode
 		t.runErr = snap.Error
 		t.endedAt = parseTime(snap.EndedAt)
+		t.modelUsed = snap.ModelUsed
+		// Assigned, not accumulated: the record is the owning process's running
+		// total, so adding it to ours would double-count on every refresh.
+		if snap.Usage != nil {
+			t.usage = *snap.Usage
+		}
 	}
 }
 
@@ -147,6 +153,11 @@ func (m *Manager) taskFromSnapshot(snap Snapshot, reg *agent.Registry) *Task {
 		runErr:     snap.Error,
 		startedAt:  parseTime(snap.StartedAt),
 		endedAt:    parseTime(snap.EndedAt),
+		modelUsed:  snap.ModelUsed,
+		baseCommit: snap.BaseCommit,
+	}
+	if snap.Usage != nil {
+		t.usage = *snap.Usage
 	}
 	if reg != nil {
 		t.adapter = reg.Get(snap.Agent)

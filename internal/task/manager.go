@@ -25,6 +25,7 @@ import (
 
 	"github.com/andresh0816/cli-agent-mcp/internal/agent"
 	"github.com/andresh0816/cli-agent-mcp/internal/audit"
+	"github.com/andresh0816/cli-agent-mcp/internal/gitx"
 	"github.com/andresh0816/cli-agent-mcp/internal/state"
 )
 
@@ -78,6 +79,14 @@ type Task struct {
 	cancel            context.CancelFunc
 	canceledRequested bool
 	timedOut          bool
+	usage             agent.Usage // accumulated over every turn of this task
+	modelUsed         string      // the model the agent said it was running
+
+	// baseCommit is where the repository stood when this task started. It is
+	// captured up front because it cannot be recovered afterwards: once the
+	// worker commits its own work, a diff against HEAD shows nothing and reads
+	// as "the agent changed no files", which is the opposite of the truth.
+	baseCommit string
 
 	adapter agent.Adapter
 	audit   *audit.Logger
@@ -104,6 +113,38 @@ type Snapshot struct {
 	TotalLines int      `json:"total_output_lines"`
 	Turns      int      `json:"turns"`
 	Prompts    []string `json:"prompts,omitempty"`
+
+	// ModelUsed is what the agent reported it actually ran, which is the only
+	// way to know when the caller requested no override.
+	ModelUsed string `json:"model_used,omitempty"`
+
+	// Usage accumulates every turn's accounting. Nil when the agent reported
+	// none — an absent figure and a zero one mean different things here.
+	Usage *agent.Usage `json:"usage,omitempty"`
+
+	// BaseCommit is where the repository stood when the task started, so its
+	// changes can still be reviewed after the worker has committed them.
+	BaseCommit string `json:"base_commit,omitempty"`
+}
+
+// baseCommit records the starting point of a task's repository, or "" when the
+// directory is not a repository at all — which is not an error, only a
+// directory whose changes cannot be summarized later.
+func baseCommit(cwd string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	head, err := gitx.Head(ctx, cwd)
+	if err != nil {
+		return ""
+	}
+	return head
+}
+
+// BaseCommit reports where the repository stood when this task started.
+func (t *Task) BaseCommit() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.baseCommit
 }
 
 func (t *Task) snapshot() Snapshot {
@@ -121,6 +162,12 @@ func (t *Task) snapshot() Snapshot {
 		StartedAt:  t.startedAt.Format(time.RFC3339),
 		TotalLines: len(t.lines),
 		Turns:      len(t.turns),
+		ModelUsed:  t.modelUsed,
+		BaseCommit: t.baseCommit,
+	}
+	if !t.usage.Empty() {
+		u := t.usage
+		s.Usage = &u
 	}
 	if !t.endedAt.IsZero() {
 		s.EndedAt = t.endedAt.Format(time.RFC3339)
@@ -172,6 +219,15 @@ func (t *Task) WatchFrom(ctx context.Context, since int, timeout time.Duration, 
 		case <-time.After(150 * time.Millisecond):
 		}
 	}
+}
+
+// LineCount reports how many transcript lines the task holds, so a caller can
+// work out a range before asking for it.
+func (t *Task) LineCount() int {
+	t.refreshOrphan()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.lines)
 }
 
 // Output returns lines[since:since+max]. since is 0-based; max<=0 means "all".
@@ -323,16 +379,17 @@ func pathWithin(path, root string) bool {
 // StartTask creates a task and launches its first turn asynchronously.
 func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*Task, error) {
 	t := &Task{
-		ID:        newID(m.counter.Add(1)),
-		AgentName: a.Name(),
-		Cwd:       cwd,
-		Model:     spec.Model,
-		adapter:   a,
-		audit:     m.audit,
-		store:     m.store,
-		status:    StatusRunning,
-		running:   true,
-		startedAt: time.Now(),
+		ID:         newID(m.counter.Add(1)),
+		AgentName:  a.Name(),
+		Cwd:        cwd,
+		Model:      spec.Model,
+		adapter:    a,
+		audit:      m.audit,
+		store:      m.store,
+		status:     StatusRunning,
+		running:    true,
+		startedAt:  time.Now(),
+		baseCommit: baseCommit(cwd),
 	}
 	spec.Cwd = cwd
 
@@ -359,16 +416,17 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*T
 // outlive the call that asked for it; the caller comes back through agent_watch.
 func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd string, spec agent.RunSpec, sink EventSink, window time.Duration) (t *Task, finished bool, err error) {
 	t = &Task{
-		ID:        newID(m.counter.Add(1)),
-		AgentName: a.Name(),
-		Cwd:       cwd,
-		Model:     spec.Model,
-		adapter:   a,
-		audit:     m.audit,
-		store:     m.store,
-		status:    StatusRunning,
-		running:   true,
-		startedAt: time.Now(),
+		ID:         newID(m.counter.Add(1)),
+		AgentName:  a.Name(),
+		Cwd:        cwd,
+		Model:      spec.Model,
+		adapter:    a,
+		audit:      m.audit,
+		store:      m.store,
+		status:     StatusRunning,
+		running:    true,
+		startedAt:  time.Now(),
+		baseCommit: baseCommit(cwd),
 	}
 	spec.Cwd = cwd
 
@@ -702,6 +760,8 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	endStatus := t.status
 	endErr := t.isError
 	endResult := t.resultText
+	endUsage := t.usage
+	endModel := t.modelUsed
 	var endExit int
 	if t.exitCode != nil {
 		endExit = *t.exitCode
@@ -710,14 +770,27 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 
 	t.persist()
 
-	t.audit.Log("turn_end", map[string]any{
+	rec := map[string]any{
 		"task_id":     t.ID,
 		"status":      string(endStatus),
 		"is_error":    endErr,
 		"exit_code":   endExit,
 		"duration_ms": time.Since(turnStarted).Milliseconds(),
 		"result":      truncateStr(endResult, 500),
-	})
+	}
+	// The audit trail is where an operator reconstructs what a fleet of workers
+	// actually did, and "how much did this cost" is one of the questions it
+	// should be able to answer.
+	if !endUsage.Empty() {
+		rec["cost_usd"] = endUsage.CostUSD
+		rec["input_tokens"] = endUsage.InputTokens
+		rec["output_tokens"] = endUsage.OutputTokens
+		rec["agent_turns"] = endUsage.NumTurns
+	}
+	if endModel != "" {
+		rec["model_used"] = endModel
+	}
+	t.audit.Log("turn_end", rec)
 }
 
 const (
@@ -849,6 +922,12 @@ func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup)
 				}
 				if ev.Text != "" {
 					t.lastText = ev.Text
+				}
+				if ev.Model != "" {
+					t.modelUsed = ev.Model
+				}
+				if ev.Usage != nil {
+					t.usage.Add(*ev.Usage)
 				}
 				if ev.Final {
 					t.isError = ev.FinalError

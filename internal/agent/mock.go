@@ -85,7 +85,21 @@ func RunMock(args []string) int {
 		b, _ := json.Marshal(v)
 		fmt.Fprintln(os.Stdout, string(b))
 	}
-	emit(map[string]any{"type": "system", "subtype": "init", "session_id": "mock-session-1"})
+	emit(map[string]any{"type": "system", "subtype": "init", "session_id": "mock-session-1", "model": "mock-model-1"})
+
+	// The accounting a real agent reports on its terminal event, so the mock
+	// exercises the cost/token path end to end rather than leaving it to the
+	// first real run to discover it was never wired up.
+	mockUsage := func(m map[string]any) map[string]any {
+		m["total_cost_usd"] = 0.0042
+		m["duration_ms"] = 1234
+		m["num_turns"] = 1
+		m["usage"] = map[string]any{
+			"input_tokens": 321, "output_tokens": 123,
+			"cache_read_input_tokens": 1000, "cache_creation_input_tokens": 40,
+		}
+		return m
+	}
 
 	// Simulate a long-running turn (used to test cancellation / watching). It
 	// emits a few lines spaced across the sleep so watchers see live output; if
@@ -119,10 +133,10 @@ func RunMock(args []string) int {
 				"content": []map[string]any{{"type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": []map[string]any{}}},
 			},
 		})
-		emit(map[string]any{
+		emit(mockUsage(map[string]any{
 			"type": "result", "subtype": "success", "session_id": "mock-session-1",
 			"is_error": false, "result": "The ssh command failed silently.",
-		})
+		}))
 		return 0
 	}
 
@@ -134,13 +148,13 @@ func RunMock(args []string) int {
 				"content": []map[string]any{{"type": "text", "text": "Planning: " + prompt}},
 			},
 		})
-		emit(map[string]any{
+		emit(mockUsage(map[string]any{
 			"type":       "result",
 			"subtype":    "success",
 			"session_id": "mock-session-1",
 			"is_error":   false,
 			"result":     "PLAN for: " + prompt + "\n1. inspect\n2. change\n3. verify",
-		})
+		}))
 		return 0
 	}
 	// Assistant decides to run a tool.
@@ -167,12 +181,12 @@ func RunMock(args []string) int {
 			"content": []map[string]any{{"type": "text", "text": "Working on: " + prompt}},
 		},
 	})
-	emit(map[string]any{
+	emit(mockUsage(map[string]any{
 		"type":       "result",
 		"subtype":    "success",
 		"session_id": "mock-session-1",
 		"is_error":   false,
 		"result":     "Completed task: " + prompt,
-	})
+	}))
 	return 0
 }

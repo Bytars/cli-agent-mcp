@@ -33,6 +33,43 @@ type RunSpec struct {
 	PlanOnly     bool     // propose a plan without executing anything
 }
 
+// Usage is the accounting an agent reports for the work it did: what it cost,
+// how long it spent, and how many tokens it moved.
+//
+// It is worth extracting rather than discarding. Delegating to a headless
+// worker hides exactly the things a person watching a terminal would have seen,
+// and cost is the one that compounds silently — a task that quietly burned two
+// dollars looks identical to one that burned two cents until the bill arrives.
+type Usage struct {
+	CostUSD          float64 `json:"cost_usd,omitempty"`
+	DurationMS       int64   `json:"duration_ms,omitempty"`
+	APIDurationMS    int64   `json:"api_duration_ms,omitempty"`
+	NumTurns         int     `json:"num_turns,omitempty"`
+	InputTokens      int     `json:"input_tokens,omitempty"`
+	OutputTokens     int     `json:"output_tokens,omitempty"`
+	CacheReadTokens  int     `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int     `json:"cache_write_tokens,omitempty"`
+}
+
+// Empty reports whether the agent told us nothing worth showing.
+func (u Usage) Empty() bool { return u == Usage{} }
+
+// Add accumulates another turn's accounting into u. Counters sum; NumTurns is a
+// running total the agent already reports for the session, so the later value
+// replaces rather than adds to the earlier one.
+func (u *Usage) Add(v Usage) {
+	u.CostUSD += v.CostUSD
+	u.DurationMS += v.DurationMS
+	u.APIDurationMS += v.APIDurationMS
+	u.InputTokens += v.InputTokens
+	u.OutputTokens += v.OutputTokens
+	u.CacheReadTokens += v.CacheReadTokens
+	u.CacheWriteTokens += v.CacheWriteTokens
+	if v.NumTurns > u.NumTurns {
+		u.NumTurns = v.NumTurns
+	}
+}
+
 // Event is the adapter's interpretation of a single line of agent stdout.
 // Raw is always populated; the other fields are best-effort extractions.
 type Event struct {
@@ -47,6 +84,13 @@ type Event struct {
 
 	IsToolResult    bool // this line is a tool's result coming back
 	ToolResultError bool // for a tool result: whether the tool reported failure
+
+	// Model is the model the agent reported it is actually using, which is the
+	// only way to learn it when no override was requested.
+	Model string
+
+	// Usage is non-nil on a terminal event that carried accounting.
+	Usage *Usage
 }
 
 // Adapter knows how to launch and interpret one specific CLI agent.

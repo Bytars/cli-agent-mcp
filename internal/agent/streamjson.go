@@ -14,6 +14,24 @@ type claudeStreamEvent struct {
 	Result    string          `json:"result"`
 	IsError   bool            `json:"is_error"`
 	Message   json.RawMessage `json:"message"`
+
+	// Reported on the terminal "result" event. Claude Code has emitted these
+	// all along; they were simply being thrown away.
+	TotalCostUSD  float64      `json:"total_cost_usd"`
+	DurationMS    int64        `json:"duration_ms"`
+	DurationAPIMS int64        `json:"duration_api_ms"`
+	NumTurns      int          `json:"num_turns"`
+	Usage         *claudeUsage `json:"usage"`
+
+	// Reported on the "system"/"init" event that opens every run.
+	Model string `json:"model"`
+}
+
+type claudeUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
 type claudeMessage struct {
@@ -57,11 +75,30 @@ func parseClaudeStreamLine(line string) Event {
 		ev.SessionID = se.SessionID
 	}
 
+	if se.Model != "" {
+		ev.Model = se.Model
+	}
+
 	switch se.Type {
 	case "result":
 		ev.Final = true
 		ev.FinalError = se.IsError
 		ev.FinalText = se.Result
+		u := Usage{
+			CostUSD:       se.TotalCostUSD,
+			DurationMS:    se.DurationMS,
+			APIDurationMS: se.DurationAPIMS,
+			NumTurns:      se.NumTurns,
+		}
+		if se.Usage != nil {
+			u.InputTokens = se.Usage.InputTokens
+			u.OutputTokens = se.Usage.OutputTokens
+			u.CacheReadTokens = se.Usage.CacheReadInputTokens
+			u.CacheWriteTokens = se.Usage.CacheCreationInputTokens
+		}
+		if !u.Empty() {
+			ev.Usage = &u
+		}
 	case "assistant":
 		if len(se.Message) > 0 {
 			var m claudeMessage
