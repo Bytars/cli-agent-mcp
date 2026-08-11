@@ -92,6 +92,10 @@ type Task struct {
 	// worktree cut for this task alone.
 	workspace Workspace
 
+	// approver, when set, lets each turn hand the worker a way to ask a human
+	// for permission instead of stalling on a prompt nobody can answer.
+	approver Approver
+
 	adapter agent.Adapter
 	audit   *audit.Logger
 	store   *state.Store
@@ -291,6 +295,32 @@ func (t *Task) joinRange(from, to int, compact bool) string {
 	return strings.Join(kept, "\n")
 }
 
+// Approver supplies the wiring that lets a worker ask a human for permission
+// mid-run instead of stalling on a prompt nobody can answer.
+//
+// It is an interface here so this package stays unaware of how the question
+// reaches the person: that belongs to whatever is orchestrating.
+type Approver interface {
+	// Grant issues per-run approval for a task. ok is false when the run should
+	// proceed without it — because the orchestrating client cannot ask, or
+	// because the operator turned it off. release must be called when the turn
+	// ends, and revokes the grant.
+	Grant(taskID string) (configPath, toolName string, release func(), ok bool)
+}
+
+// Options are the per-call knobs shared by every way of starting a turn.
+type Options struct {
+	// Sink receives each event as it arrives, for callers streaming progress.
+	Sink EventSink
+
+	// Window bounds how long a blocking call waits before handing back a task
+	// id. Zero means wait until the turn ends or the caller goes away.
+	Window time.Duration
+
+	// Approver, when set, lets the worker ask for permission during the run.
+	Approver Approver
+}
+
 // EventSink receives each parsed stdout event of a running turn, in order. It
 // is used by the streaming ("run") tools to forward live progress to the MCP
 // client. It is always called off the task lock, so it may call back into the
@@ -413,8 +443,9 @@ func (m *Manager) newTask(a agent.Adapter, ws Workspace, spec agent.RunSpec) *Ta
 }
 
 // StartTask creates a task and launches its first turn asynchronously.
-func (m *Manager) StartTask(a agent.Adapter, ws Workspace, spec agent.RunSpec) (*Task, error) {
+func (m *Manager) StartTask(a agent.Adapter, ws Workspace, spec agent.RunSpec, opts Options) (*Task, error) {
 	t := m.newTask(a, ws, spec)
+	t.approver = opts.Approver
 	spec.Cwd = ws.Path
 
 	if err := m.admit(t); err != nil {
@@ -438,8 +469,9 @@ func (m *Manager) StartTask(a agent.Adapter, ws Workspace, spec agent.RunSpec) (
 // was then killed mid-edit and recorded as "failed" with an exit code, which is
 // indistinguishable from the agent genuinely failing. A delegated task has to
 // outlive the call that asked for it; the caller comes back through agent_watch.
-func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, ws Workspace, spec agent.RunSpec, sink EventSink, window time.Duration) (t *Task, finished bool, err error) {
+func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, ws Workspace, spec agent.RunSpec, opts Options) (t *Task, finished bool, err error) {
 	t = m.newTask(a, ws, spec)
+	t.approver = opts.Approver
 	spec.Cwd = ws.Path
 
 	if err := m.admit(t); err != nil {
@@ -448,28 +480,34 @@ func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, ws Work
 
 	t.persist()
 
-	return t, m.runDetached(ctx, t, spec, sink, window), nil
+	return t, m.runDetached(ctx, t, spec, opts), nil
 }
 
 // FollowupStreaming resumes a finished task's session with a new prompt,
 // waiting on it under the same rules as RunTaskStreaming.
-func (m *Manager) FollowupStreaming(ctx context.Context, id, prompt string, allowedTools, extraArgs []string, sink EventSink, window time.Duration) (*Task, bool, error) {
+func (m *Manager) FollowupStreaming(ctx context.Context, id, prompt string, allowedTools, extraArgs []string, opts Options) (*Task, bool, error) {
 	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
 	if err != nil {
 		return nil, false, err
 	}
-	return t, m.runDetached(ctx, t, spec, sink, window), nil
+	if opts.Approver != nil {
+		t.mu.Lock()
+		t.approver = opts.Approver
+		t.mu.Unlock()
+	}
+	return t, m.runDetached(ctx, t, spec, opts), nil
 }
 
 // runDetached starts a turn on a context of its own and waits for it, reporting
 // whether it finished within the window. The turn keeps running either way.
-func (m *Manager) runDetached(ctx context.Context, t *Task, spec agent.RunSpec, sink EventSink, window time.Duration) (finished bool) {
+func (m *Manager) runDetached(ctx context.Context, t *Task, spec agent.RunSpec, opts Options) (finished bool) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m.runTurn(context.Background(), t, spec, sink)
+		m.runTurn(context.Background(), t, spec, opts.Sink)
 	}()
 
+	window := opts.Window
 	if window <= 0 {
 		select {
 		case <-done:
@@ -607,10 +645,15 @@ func (m *Manager) prepareFollowup(id, prompt string, allowedTools, extraArgs []s
 }
 
 // Followup resumes a task's session with a new prompt, asynchronously.
-func (m *Manager) Followup(id, prompt string, allowedTools, extraArgs []string) (*Task, error) {
+func (m *Manager) Followup(id, prompt string, allowedTools, extraArgs []string, opts Options) (*Task, error) {
 	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
 	if err != nil {
 		return nil, err
+	}
+	if opts.Approver != nil {
+		t.mu.Lock()
+		t.approver = opts.Approver
+		t.mu.Unlock()
 	}
 	go m.runTurn(context.Background(), t, spec, nil)
 	return t, nil
@@ -656,6 +699,20 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 			"error":       msg,
 			"duration_ms": time.Since(turnStarted).Milliseconds(),
 		})
+	}
+
+	// Issue this turn's permission grant, if the orchestrator can answer for it.
+	// It is revoked the moment the turn ends: the URL it names can approve
+	// commands on this machine, so it must outlive nothing.
+	t.mu.Lock()
+	approver := t.approver
+	t.mu.Unlock()
+	if approver != nil {
+		if cfgPath, tool, release, ok := approver.Grant(t.ID); ok {
+			defer release()
+			spec.MCPConfigPath = cfgPath
+			spec.PermissionTool = tool
+		}
 	}
 
 	cmd, err := t.adapter.Command(ctx, spec)

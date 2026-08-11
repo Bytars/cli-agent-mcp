@@ -122,6 +122,19 @@ type Config struct {
 	// alongside the task records, under StateDir.
 	WorktreeDir string
 
+	// AskPermission lets a worker put a permission request to the person who
+	// delegated the task, instead of stalling on a prompt nobody can answer.
+	//
+	// It is on by default and costs nothing when unusable: it only engages for
+	// a client that declared it can elicit, and a client that cannot gets
+	// exactly the behaviour it had before.
+	AskPermission bool
+
+	// PermissionTimeout bounds how long a worker waits for that answer. It has
+	// to be generous — there is a human at the other end who may be looking at
+	// something else — but finite, or an unattended run waits forever.
+	PermissionTimeout time.Duration
+
 	// Compact controls whether agent_get_output / agent_watch return a filtered,
 	// human-readable transcript by default (dropping the noisy init/config dump)
 	// rather than raw JSONL.
@@ -260,6 +273,8 @@ func Load() Config {
 		AuditLog:           getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
 		StateDir:           getenv("CLI_AGENT_MCP_STATE_DIR", ""),
 		WorktreeDir:        getenv("CLI_AGENT_MCP_WORKTREE_DIR", ""),
+		AskPermission:      getbool("CLI_AGENT_MCP_ASK_PERMISSION", true),
+		PermissionTimeout:  time.Duration(getPositiveInt("CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS", 600)) * time.Second,
 		WatchWindow:        watchWindow,
 		TaskTimeout:        taskTimeout,
 		Compact:            getbool("CLI_AGENT_MCP_COMPACT", true),

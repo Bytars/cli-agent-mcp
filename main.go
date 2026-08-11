@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/andresh0816/cli-agent-mcp/internal/agent"
+	"github.com/andresh0816/cli-agent-mcp/internal/approval"
 	"github.com/andresh0816/cli-agent-mcp/internal/audit"
 	"github.com/andresh0816/cli-agent-mcp/internal/config"
 	"github.com/andresh0816/cli-agent-mcp/internal/gitx"
@@ -148,6 +150,21 @@ func main() {
 		log.Printf("task state: %s", store.Dir())
 	}
 
+	// Interactive approval. It only does anything for a client that can put a
+	// question to its user, and it fails soft: if the endpoint cannot be brought
+	// up, tasks run exactly as they did before.
+	desk := newPermissionDesk(cfg.PermissionTimeout)
+	if cfg.AskPermission {
+		broker, err := approval.Start(filepath.Join(cfg.StateDir, "approval"), desk.Decide)
+		if err != nil {
+			log.Printf("warning: interactive permission prompts are off: %v", err)
+		} else {
+			defer broker.Close()
+			desk.broker = broker
+			log.Printf("interactive approval: %s", broker.Addr())
+		}
+	}
+
 	// Advertise the MCP Apps extension so hosts that support interactive views
 	// know this server can render one, and fetch the board's ui:// resource.
 	// Setting Capabilities at all replaces the SDK's default, so logging has to
@@ -163,7 +180,7 @@ func main() {
 		Capabilities: caps,
 	})
 
-	registerTools(srv, reg, mgr, cfg)
+	registerTools(srv, reg, mgr, cfg, desk)
 
 	log.Printf("starting (default agent=%s, max_tasks=%d, max_concurrent=%d)", cfg.DefaultAgent, cfg.MaxTasks, cfg.MaxConcurrent)
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
@@ -581,7 +598,7 @@ func truncateHead(s string, n int) string {
 	return s[start:]
 }
 
-func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config) {
+func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config, desk *permissionDesk) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "agent_run_task",
 		Description: "Delegate a task to a local headless CLI agent (Claude Code or Cursor) and WAIT for it to finish, streaming live progress notifications as the agent works. This is the seamless, in-line mode — no polling — so it feels like you did the work yourself. " +
@@ -608,7 +625,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
-		}, newProgressSink(ctx, req), cfg.WatchWindow)
+		}, task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow, Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
@@ -653,7 +670,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
 			PlanOnly:     true,
-		}, newProgressSink(ctx, req), cfg.WatchWindow)
+		}, task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow, Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
@@ -676,7 +693,8 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
-		t, finished, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs, newProgressSink(ctx, req), cfg.WatchWindow)
+		t, finished, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs,
+			task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow, Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
@@ -711,7 +729,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
-		})
+		}, task.Options{Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
@@ -909,7 +927,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
-		t, err := mgr.Followup(in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs)
+		t, err := mgr.Followup(in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs, task.Options{Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}

@@ -80,6 +80,16 @@ func (a *ClaudeAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 	if a.AppendPrompt != "" {
 		args = append(args, "--append-system-prompt", a.AppendPrompt)
 	}
+	// Interactive approval. Without it a headless run that hits a tool it may
+	// not use yet simply waits for an answer nobody is there to give; with it,
+	// the question travels back to the person who delegated the task. Plan-only
+	// turns are excluded — nothing executes, so there is nothing to approve.
+	if !spec.PlanOnly && spec.MCPConfigPath != "" && spec.PermissionTool != "" {
+		args = append(args,
+			"--mcp-config", spec.MCPConfigPath,
+			"--permission-prompt-tool", spec.PermissionTool,
+		)
+	}
 	if spec.Model != "" {
 		args = append(args, "--model", spec.Model)
 	}

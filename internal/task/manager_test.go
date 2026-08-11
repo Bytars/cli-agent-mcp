@@ -172,7 +172,7 @@ func TestRunTaskStreamingSurvivesRequestCancellation(t *testing.T) {
 	}()
 
 	tk, finished, err := m.RunTaskStreaming(ctx, sleepAdapter{ms: 1500}, At(t.TempDir()),
-		agent.RunSpec{Prompt: "work"}, nil, 30*time.Second)
+		agent.RunSpec{Prompt: "work"}, Options{Window: 30 * time.Second})
 	if err != nil {
 		t.Fatalf("RunTaskStreaming: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestRunTaskStreamingReturnsWhenTheWindowCloses(t *testing.T) {
 
 	start := time.Now()
 	tk, finished, err := m.RunTaskStreaming(context.Background(), sleepAdapter{ms: 3000}, At(t.TempDir()),
-		agent.RunSpec{Prompt: "work"}, nil, 300*time.Millisecond)
+		agent.RunSpec{Prompt: "work"}, Options{Window: 300 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("RunTaskStreaming: %v", err)
 	}
@@ -234,14 +234,14 @@ func TestConcurrencyLimitRefusesExtraWorkers(t *testing.T) {
 
 	var started []*Task
 	for i := 0; i < 2; i++ {
-		tk, err := m.StartTask(sleepAdapter{ms: 2000}, At(t.TempDir()), agent.RunSpec{Prompt: "work"})
+		tk, err := m.StartTask(sleepAdapter{ms: 2000}, At(t.TempDir()), agent.RunSpec{Prompt: "work"}, Options{})
 		if err != nil {
 			t.Fatalf("task %d should have been admitted: %v", i, err)
 		}
 		started = append(started, tk)
 	}
 
-	if _, err := m.StartTask(sleepAdapter{ms: 2000}, At(t.TempDir()), agent.RunSpec{Prompt: "work"}); err == nil {
+	if _, err := m.StartTask(sleepAdapter{ms: 2000}, At(t.TempDir()), agent.RunSpec{Prompt: "work"}, Options{}); err == nil {
 		t.Fatal("a third concurrent task must be refused")
 	} else if !strings.Contains(err.Error(), "MAX_CONCURRENT") {
 		t.Errorf("the refusal must name the setting that caused it, got: %v", err)

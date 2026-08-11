@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -24,7 +25,7 @@ func connect(t *testing.T) *mcp.ClientSession {
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "cli-agent-mcp", Version: "test"},
 		&mcp.ServerOptions{Instructions: instructions, Capabilities: caps})
-	registerTools(srv, agent.NewRegistry(agent.NewMockAdapter()), task.NewManager(10), config.Config{DefaultAgent: "mock"})
+	registerTools(srv, agent.NewRegistry(agent.NewMockAdapter()), task.NewManager(10), config.Config{DefaultAgent: "mock"}, newPermissionDesk(time.Minute))
 
 	ct, st := mcp.NewInMemoryTransports()
 	ctx := context.Background()
