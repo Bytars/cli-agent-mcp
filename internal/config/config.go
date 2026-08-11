@@ -118,6 +118,10 @@ type Config struct {
 	// prompt with no human to approve it. Zero means no timeout.
 	TaskTimeout time.Duration
 
+	// WorktreeDir is where isolated task checkouts are created. Empty puts them
+	// alongside the task records, under StateDir.
+	WorktreeDir string
+
 	// Compact controls whether agent_get_output / agent_watch return a filtered,
 	// human-readable transcript by default (dropping the noisy init/config dump)
 	// rather than raw JSONL.
@@ -255,6 +259,7 @@ func Load() Config {
 		MaxConcurrent:      getPositiveInt("CLI_AGENT_MCP_MAX_CONCURRENT", 3),
 		AuditLog:           getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
 		StateDir:           getenv("CLI_AGENT_MCP_STATE_DIR", ""),
+		WorktreeDir:        getenv("CLI_AGENT_MCP_WORKTREE_DIR", ""),
 		WatchWindow:        watchWindow,
 		TaskTimeout:        taskTimeout,
 		Compact:            getbool("CLI_AGENT_MCP_COMPACT", true),

@@ -88,6 +88,10 @@ type Task struct {
 	// as "the agent changed no files", which is the opposite of the truth.
 	baseCommit string
 
+	// workspace is where the worker runs — the caller's directory, or a git
+	// worktree cut for this task alone.
+	workspace Workspace
+
 	adapter agent.Adapter
 	audit   *audit.Logger
 	store   *state.Store
@@ -125,6 +129,13 @@ type Snapshot struct {
 	// BaseCommit is where the repository stood when the task started, so its
 	// changes can still be reviewed after the worker has committed them.
 	BaseCommit string `json:"base_commit,omitempty"`
+
+	// Worktree, Repo and Branch are set only when the task ran isolated in a
+	// checkout of its own. They are what tells a reader that the work is not in
+	// the directory they asked about, and where it is instead.
+	Worktree string `json:"worktree,omitempty"`
+	Repo     string `json:"repo,omitempty"`
+	Branch   string `json:"branch,omitempty"`
 }
 
 // baseCommit records the starting point of a task's repository, or "" when the
@@ -164,6 +175,11 @@ func (t *Task) snapshot() Snapshot {
 		Turns:      len(t.turns),
 		ModelUsed:  t.modelUsed,
 		BaseCommit: t.baseCommit,
+	}
+	if t.workspace.Isolated() {
+		s.Worktree = t.workspace.Path
+		s.Repo = t.workspace.Repo
+		s.Branch = t.workspace.Branch
 	}
 	if !t.usage.Empty() {
 		u := t.usage
@@ -376,12 +392,14 @@ func pathWithin(path, root string) bool {
 	return rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..")
 }
 
-// StartTask creates a task and launches its first turn asynchronously.
-func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*Task, error) {
-	t := &Task{
+// newTask builds an unregistered task for a workspace. The base commit is read
+// here, before the worker has touched anything, because it is the only moment
+// it can be read at all.
+func (m *Manager) newTask(a agent.Adapter, ws Workspace, spec agent.RunSpec) *Task {
+	return &Task{
 		ID:         newID(m.counter.Add(1)),
 		AgentName:  a.Name(),
-		Cwd:        cwd,
+		Cwd:        ws.Path,
 		Model:      spec.Model,
 		adapter:    a,
 		audit:      m.audit,
@@ -389,9 +407,15 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*T
 		status:     StatusRunning,
 		running:    true,
 		startedAt:  time.Now(),
-		baseCommit: baseCommit(cwd),
+		baseCommit: baseCommit(ws.Path),
+		workspace:  ws,
 	}
-	spec.Cwd = cwd
+}
+
+// StartTask creates a task and launches its first turn asynchronously.
+func (m *Manager) StartTask(a agent.Adapter, ws Workspace, spec agent.RunSpec) (*Task, error) {
+	t := m.newTask(a, ws, spec)
+	spec.Cwd = ws.Path
 
 	if err := m.admit(t); err != nil {
 		return nil, err
@@ -414,21 +438,9 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*T
 // was then killed mid-edit and recorded as "failed" with an exit code, which is
 // indistinguishable from the agent genuinely failing. A delegated task has to
 // outlive the call that asked for it; the caller comes back through agent_watch.
-func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd string, spec agent.RunSpec, sink EventSink, window time.Duration) (t *Task, finished bool, err error) {
-	t = &Task{
-		ID:         newID(m.counter.Add(1)),
-		AgentName:  a.Name(),
-		Cwd:        cwd,
-		Model:      spec.Model,
-		adapter:    a,
-		audit:      m.audit,
-		store:      m.store,
-		status:     StatusRunning,
-		running:    true,
-		startedAt:  time.Now(),
-		baseCommit: baseCommit(cwd),
-	}
-	spec.Cwd = cwd
+func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, ws Workspace, spec agent.RunSpec, sink EventSink, window time.Duration) (t *Task, finished bool, err error) {
+	t = m.newTask(a, ws, spec)
+	spec.Cwd = ws.Path
 
 	if err := m.admit(t); err != nil {
 		return nil, false, err

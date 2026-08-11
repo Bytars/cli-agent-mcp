@@ -155,6 +155,7 @@ func (m *Manager) taskFromSnapshot(snap Snapshot, reg *agent.Registry) *Task {
 		endedAt:    parseTime(snap.EndedAt),
 		modelUsed:  snap.ModelUsed,
 		baseCommit: snap.BaseCommit,
+		workspace:  Workspace{Path: snap.Cwd, Repo: snap.Repo, Branch: snap.Branch},
 	}
 	if snap.Usage != nil {
 		t.usage = *snap.Usage

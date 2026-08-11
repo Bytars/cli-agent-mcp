@@ -79,6 +79,11 @@ func main() {
 	log.SetFlags(0)
 
 	cfg := config.Load()
+	// Resolved once, here, so everything downstream — the store, the worktree
+	// root — agrees on where this server keeps its files.
+	if cfg.StateDir == "" {
+		cfg.StateDir = state.DefaultDir()
+	}
 
 	reg := agent.NewRegistry(
 		agent.NewClaudeAdapter(cfg.ClaudeBin, cfg.PermissionMode, cfg.AllowedTools, cfg.DisallowedTools, cfg.AppendSystemPrompt, cfg.ClaudeExtraArgs),
@@ -197,6 +202,7 @@ type startInput struct {
 	Model        string   `json:"model,omitempty" jsonschema:"Optional model override passed to the agent."`
 	AllowedTools []string `json:"allowed_tools,omitempty" jsonschema:"Tools to pre-approve for this run so the headless worker doesn't stall waiting for approval it can't get (Claude Code --allowedTools). Patterns supported, e.g. [\"Bash(git *)\",\"Edit\",\"PowerShell\"]. This only pre-approves; the server's deny policy still applies."`
 	ExtraArgs    []string `json:"extra_args,omitempty" jsonschema:"Extra CLI flags appended verbatim to this run (disabled by default on the server)."`
+	Isolate      bool     `json:"isolate,omitempty" jsonschema:"Run this task in a git worktree of its own, on a new branch, instead of directly in cwd. Use it when other tasks are running against the same repository, or when the change should be reviewed before it touches the working copy. Requires cwd to be a git repository with at least one commit."`
 }
 
 type idInput struct {
@@ -215,6 +221,11 @@ type outputInput struct {
 	SinceLine int    `json:"since_line,omitempty" jsonschema:"0-based line index to start from (for incremental reads)."`
 	MaxLines  int    `json:"max_lines,omitempty" jsonschema:"Maximum number of lines to return. Leave unset to get the end of the transcript (the last few hundred lines), which is where the agent's conclusion is; set it explicitly to page through from since_line."`
 	Raw       bool   `json:"raw,omitempty" jsonschema:"Return the raw JSONL transcript instead of the compact, filtered view."`
+}
+
+type cleanupInput struct {
+	TaskID string `json:"task_id" jsonschema:"The task whose isolated worktree should be removed."`
+	Force  bool   `json:"force,omitempty" jsonschema:"Remove the worktree even though it still holds uncommitted changes. Those changes exist nowhere else and cannot be recovered — ask the user first."`
 }
 
 type diffInput struct {
@@ -350,6 +361,37 @@ func resolveTarget(reg *agent.Registry, cfg config.Config, agentName, cwd string
 		return nil, "", err.Error(), err
 	}
 	return a, resolved, "", nil
+}
+
+// resolveWorkspace decides where a task's worker will actually run: the
+// directory the caller asked for, or a git worktree cut for this task alone.
+//
+// Isolation is opt-in per call rather than a mode, because it is the right
+// answer often but not always: a worktree is a fresh checkout, so anything the
+// repository does not track — node_modules, a .env, a build cache — is not
+// there, and a task that needs those should run in place.
+func resolveWorkspace(ctx context.Context, cfg config.Config, cwd string, isolate bool) (task.Workspace, string, error) {
+	if !isolate {
+		return task.At(cwd), "", nil
+	}
+	ws, err := task.NewWorktree(ctx, cwd, task.WorktreeRoot(cfg.WorktreeDir, cfg.StateDir))
+	if err != nil {
+		return task.Workspace{}, err.Error(), err
+	}
+	return ws, "", nil
+}
+
+// workspaceNote tells the caller their task is not running where they asked,
+// which is otherwise invisible until someone looks for changes in the original
+// directory and finds none.
+func workspaceNote(snap task.Snapshot) string {
+	if snap.Worktree == "" {
+		return ""
+	}
+	return fmt.Sprintf("\n\nThis task ran isolated in %s, on branch %s (cut from %s). "+
+		"Its changes are NOT in the original working copy — review them with agent_task_diff, "+
+		"merge the branch when you want them, and call agent_remove_worktree to clean up.",
+		snap.Worktree, snap.Branch, snap.Repo)
 }
 
 // newProgressSink builds an EventSink that forwards each agent event to the MCP
@@ -557,7 +599,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err != nil {
 			return errResult(emsg), task.Snapshot{}, nil
 		}
-		t, finished, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+		ws, emsg, err := resolveWorkspace(ctx, cfg, cwd, in.Isolate)
+		if err != nil {
+			return errResult(emsg), task.Snapshot{}, nil
+		}
+		t, finished, err := mgr.RunTaskStreaming(ctx, a, ws, agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
@@ -568,9 +614,9 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		}
 		snap := t.Snapshot()
 		if !finished {
-			return textResult(stillRunningText(snap, cfg.WatchWindow)), snap, nil
+			return textResult(stillRunningText(snap, cfg.WatchWindow) + workspaceNote(snap)), snap, nil
 		}
-		return textResult(finishText(snap)), snap, nil
+		return textResult(finishText(snap) + workspaceNote(snap)), snap, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -597,7 +643,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			msg := fmt.Sprintf("agent %q cannot guarantee plan-only execution, so refusing to run: it would carry the task out instead of planning it", a.Name())
 			return errResult(msg), task.Snapshot{}, nil
 		}
-		t, finished, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+		// Deliberately not isolated: a plan-only turn changes nothing, so a
+		// worktree would cost a checkout to protect a directory nothing is going
+		// to touch — and would then show the plan against a tree the follow-up
+		// that executes it will not be using.
+		t, finished, err := mgr.RunTaskStreaming(ctx, a, task.At(cwd), agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
@@ -652,7 +702,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err != nil {
 			return errResult(emsg), task.Snapshot{}, nil
 		}
-		t, err := mgr.StartTask(a, cwd, agent.RunSpec{
+		ws, emsg, err := resolveWorkspace(ctx, cfg, cwd, in.Isolate)
+		if err != nil {
+			return errResult(emsg), task.Snapshot{}, nil
+		}
+		t, err := mgr.StartTask(a, ws, agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
@@ -663,7 +717,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		}
 		snap := t.Snapshot()
 		msg := fmt.Sprintf("Started task %s on agent %q in %s. Call agent_task_board to show the user a live panel of it, or agent_watch to block until it finishes.", snap.ID, snap.Agent, snap.Cwd)
-		return textResult(msg), snap, nil
+		return textResult(msg + workspaceNote(snap)), snap, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -929,6 +983,25 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return errResult(err.Error()), gitx.Report{}, nil
 		}
 		return textResult(rep.Text()), rep, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "agent_remove_worktree",
+		Description: "Delete the isolated worktree a task ran in, along with its branch. " +
+			"Refuses while the worktree still holds uncommitted changes — that work is the whole product of the task and exists nowhere else — unless force is set. " +
+			"Review with agent_task_diff and merge the branch first if you want to keep the work.",
+		Annotations: &mcp.ToolAnnotations{
+			DestructiveHint: ptr(true),
+			IdempotentHint:  true,
+			OpenWorldHint:   ptr(false),
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in cleanupInput) (*mcp.CallToolResult, task.Snapshot, error) {
+		path, err := mgr.RemoveWorktree(ctx, in.TaskID, in.Force)
+		if err != nil {
+			return errResult(err.Error()), task.Snapshot{}, nil
+		}
+		t, _ := mgr.Get(in.TaskID)
+		return textResult("Removed the worktree at " + path + " and its branch."), t.Snapshot(), nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

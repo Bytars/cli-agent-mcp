@@ -183,6 +183,43 @@ func Summarize(ctx context.Context, dir, base string, patch bool, maxPatchBytes 
 	return rep, nil
 }
 
+// AddWorktree checks out a new branch at path, sharing the repository's history
+// but with a working directory of its own.
+//
+// This is what lets several workers run at once without fighting: agents edit
+// files, and two of them in the same checkout will overwrite each other's work
+// and produce a diff neither of them intended. A worktree gives each one an
+// isolated tree while keeping one git history, so the result can still be
+// reviewed and merged normally.
+func AddWorktree(ctx context.Context, repo, path, branch string) error {
+	if _, err := Root(ctx, repo); err != nil {
+		return fmt.Errorf("%s is not inside a git repository, so no worktree can be created there: %w", repo, err)
+	}
+	if _, err := run(ctx, repo, "worktree", "add", "-b", branch, path); err != nil {
+		return err
+	}
+	return nil
+}
+
+// RemoveWorktree deletes a worktree and its branch. Without force it refuses
+// when the tree still holds uncommitted work, which is the whole reason the
+// worktree existed.
+func RemoveWorktree(ctx context.Context, repo, path, branch string, force bool) error {
+	args := []string{"worktree", "remove"}
+	if force {
+		args = append(args, "--force")
+	}
+	if _, err := run(ctx, repo, append(args, path)...); err != nil {
+		return err
+	}
+	if branch != "" {
+		// -D rather than -d: the branch was created for this task and was never
+		// merged anywhere, so git would refuse the safe form every time.
+		_, _ = run(ctx, repo, "branch", "-D", branch)
+	}
+	return nil
+}
+
 // clip bounds a patch on a rune boundary, keeping the beginning: unlike a log,
 // a diff is read from the top and its first hunks are the ones being reviewed.
 func clip(s string, max int) (string, bool) {
