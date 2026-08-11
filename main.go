@@ -84,6 +84,15 @@ func main() {
 		agent.NewCustomAdapter(cfg.CustomName, cfg.CustomBin, cfg.CustomArgs),
 		agent.NewMockAdapter(),
 	)
+	// Answered before anything touches the state directory. Taking the instance
+	// lock here would record this short-lived process as the owner and erase the
+	// live server's entry, so the next real startup would report no conflict
+	// while another instance was still holding tasks it cannot see.
+	if len(os.Args) > 1 && os.Args[1] == "--list-agents" {
+		listAgents(reg)
+		return
+	}
+
 	mgr := task.NewManager(cfg.MaxTasks)
 
 	auditLog, err := audit.New(cfg.AuditLog)
@@ -96,6 +105,7 @@ func main() {
 	defer auditLog.Close()
 	mgr.SetAudit(auditLog)
 	mgr.SetTaskTimeout(cfg.TaskTimeout)
+	mgr.SetMaxConcurrent(cfg.MaxConcurrent)
 	if auditLog.Enabled() {
 		log.Printf("audit log: %s", cfg.AuditLog)
 	}
@@ -131,18 +141,6 @@ func main() {
 		log.Printf("task state: %s", store.Dir())
 	}
 
-	if len(os.Args) > 1 && os.Args[1] == "--list-agents" {
-		for _, a := range reg.All() {
-			ok, detail := a.Available()
-			status := "available"
-			if !ok {
-				status = "unavailable"
-			}
-			fmt.Printf("%-8s %-12s %s\n", a.Name(), status, detail)
-		}
-		return
-	}
-
 	// Advertise the MCP Apps extension so hosts that support interactive views
 	// know this server can render one, and fetch the board's ui:// resource.
 	// Setting Capabilities at all replaces the SDK's default, so logging has to
@@ -160,7 +158,7 @@ func main() {
 
 	registerTools(srv, reg, mgr, cfg)
 
-	log.Printf("starting (default agent=%s, max_tasks=%d)", cfg.DefaultAgent, cfg.MaxTasks)
+	log.Printf("starting (default agent=%s, max_tasks=%d, max_concurrent=%d)", cfg.DefaultAgent, cfg.MaxTasks, cfg.MaxConcurrent)
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatalf("server exited: %v", err)
 	}
@@ -417,6 +415,19 @@ func finishText(snap task.Snapshot) string {
 	return header + outcomeDetail(snap) + "\n\n" + body
 }
 
+// stillRunningText is what a blocking "run" tool returns when the turn outlives
+// the window it was allowed to wait. It has to be unmistakable that nothing
+// went wrong and that the work is still under way, because the obvious reading
+// of a truncated result is that the task died.
+func stillRunningText(snap task.Snapshot, window time.Duration) string {
+	return fmt.Sprintf(
+		"Task %s is STILL RUNNING after %s. Nothing failed and the worker was not interrupted — "+
+			"this call simply returned before the client would have abandoned it.\n\n"+
+			"Follow it with agent_watch (task_id=%s) until running is false, or show the user "+
+			"agent_task_board. The result will be there when it finishes.",
+		snap.ID, window.Round(time.Second), snap.ID)
+}
+
 // planText frames the outcome of a plan-only run, making it unmistakable that
 // nothing ran and stating how to proceed.
 func planText(snap task.Snapshot) string {
@@ -448,8 +459,10 @@ func truncate(s string, n int) string {
 
 func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config) {
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "agent_run_task",
-		Description: "Delegate a task to a local headless CLI agent (Claude Code or Cursor) and WAIT for it to finish, streaming live progress notifications as the agent works. This is the seamless, in-line mode — no polling — so it feels like you did the work yourself. Use agent_start_task instead only when you want fire-and-forget or several tasks running in parallel.",
+		Name: "agent_run_task",
+		Description: "Delegate a task to a local headless CLI agent (Claude Code or Cursor) and WAIT for it to finish, streaming live progress notifications as the agent works. This is the seamless, in-line mode — no polling — so it feels like you did the work yourself. " +
+			"If the task outlasts the server's wait window this returns early saying it is STILL RUNNING and gives you the task_id: the worker keeps going, so follow it with agent_watch until running is false. " +
+			"Use agent_start_task instead only when you want fire-and-forget or several tasks running in parallel.",
 		Annotations: mutatingTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in startInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
@@ -462,16 +475,19 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err != nil {
 			return errResult(emsg), task.Snapshot{}, nil
 		}
-		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+		t, finished, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
-		}, newProgressSink(ctx, req))
+		}, newProgressSink(ctx, req), cfg.WatchWindow)
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
+		if !finished {
+			return textResult(stillRunningText(snap, cfg.WatchWindow)), snap, nil
+		}
 		return textResult(finishText(snap)), snap, nil
 	})
 
@@ -499,23 +515,27 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			msg := fmt.Sprintf("agent %q cannot guarantee plan-only execution, so refusing to run: it would carry the task out instead of planning it", a.Name())
 			return errResult(msg), task.Snapshot{}, nil
 		}
-		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+		t, finished, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
 			PlanOnly:     true,
-		}, newProgressSink(ctx, req))
+		}, newProgressSink(ctx, req), cfg.WatchWindow)
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
+		if !finished {
+			return textResult(stillRunningText(snap, cfg.WatchWindow)), snap, nil
+		}
 		return textResult(planText(snap)), snap, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "agent_run_followup",
-		Description: "Continue a finished task's session with a new instruction and WAIT for it to finish, streaming live progress (same seamless mode as agent_run_task). Resumes the same agent conversation.",
+		Name: "agent_run_followup",
+		Description: "Continue a finished task's session with a new instruction and WAIT for it to finish, streaming live progress (same seamless mode as agent_run_task). Resumes the same agent conversation. " +
+			"Like agent_run_task, it returns early with the task_id if the turn outlasts the wait window; the worker keeps going and agent_watch picks it up.",
 		Annotations: mutatingTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in followupInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
@@ -524,11 +544,14 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
-		t, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs, newProgressSink(ctx, req))
+		t, finished, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs, newProgressSink(ctx, req), cfg.WatchWindow)
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
+		if !finished {
+			return textResult(stillRunningText(snap, cfg.WatchWindow)), snap, nil
+		}
 		return textResult(finishText(snap)), snap, nil
 	})
 
@@ -859,6 +882,21 @@ func boardText(tasks []task.Snapshot) string {
 			t.ID, t.Status, t.Agent, t.TotalLines, outcomeDetail(t), truncate(prompt, 120))
 	}
 	return b.String()
+}
+
+// listAgents prints each registered adapter and whether it is usable here. It
+// also reports how the launcher will actually be invoked, because "available"
+// only means the name resolved — the interesting failure is a launcher that
+// resolves fine and then cannot be run.
+func listAgents(reg *agent.Registry) {
+	for _, a := range reg.All() {
+		ok, detail := a.Available()
+		status := "available"
+		if !ok {
+			status = "unavailable"
+		}
+		fmt.Printf("%-8s %-12s %s\n", a.Name(), status, detail)
+	}
 }
 
 func printHelp() {

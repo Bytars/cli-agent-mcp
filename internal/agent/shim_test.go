@@ -28,6 +28,22 @@ IF EXIST "%dp0%\node.exe" (
 endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@anthropic-ai\claude-code\cli.js" %*
 `
 
+// npmExeShim is the shape npm generates when the package ships a compiled
+// launcher instead of a .js entry point — which is what @anthropic-ai/claude-code
+// installs today. Reproduced byte for byte from a real claude.cmd, because
+// failing to resolve this exact file is what made every prompt containing a
+// quote fail outright.
+const npmExeShim = `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+"%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"   %*
+`
+
 func writeShimTree(t *testing.T) (dir, shim, entry, node string) {
 	t.Helper()
 	dir = t.TempDir()
@@ -58,15 +74,64 @@ func TestResolveScriptShim_npmCmd(t *testing.T) {
 	}
 	_, shim, entry, node := writeShimTree(t)
 
-	gotNode, gotEntry, ok := resolveScriptShim(shim)
+	gotNode, prefix, ok := resolveScriptShim(shim)
 	if !ok {
 		t.Fatalf("expected the shim to resolve")
 	}
 	if gotNode != node {
-		t.Errorf("node = %q, want %q", gotNode, node)
+		t.Errorf("exe = %q, want %q", gotNode, node)
 	}
-	if gotEntry != entry {
-		t.Errorf("entry = %q, want %q", gotEntry, entry)
+	if len(prefix) != 1 || prefix[0] != entry {
+		t.Errorf("prefix = %q, want [%q]", prefix, entry)
+	}
+}
+
+// A shim that execs a bundled binary must resolve to that binary, with no
+// arguments of its own inserted ahead of the caller's.
+func TestResolveScriptShim_npmExeLauncher(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows-only shim format")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("MZ"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shim := filepath.Join(dir, "claude.cmd")
+	if err := os.WriteFile(shim, []byte(npmExeShim), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exe, prefix, ok := resolveScriptShim(shim)
+	if !ok {
+		t.Fatalf("expected the exe shim to resolve")
+	}
+	if exe != target {
+		t.Errorf("exe = %q, want %q", exe, target)
+	}
+	if len(prefix) != 0 {
+		t.Errorf("prefix = %q, want none", prefix)
+	}
+}
+
+// The Node runtime a shim uses to launch its entry point is not the program the
+// shim wraps: resolving to it would run node with the caller's arguments and no
+// script at all.
+func TestResolveScriptShim_neverResolvesToNode(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows-only shim format")
+	}
+	dir, shim, _, node := writeShimTree(t)
+	_ = dir
+	exe, prefix, ok := resolveScriptShim(shim)
+	if !ok {
+		t.Fatal("expected the shim to resolve")
+	}
+	if exe == node && len(prefix) == 0 {
+		t.Error("resolved to the node runtime with no entry point")
 	}
 }
 

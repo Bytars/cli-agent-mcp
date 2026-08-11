@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -151,7 +152,8 @@ func (r *Registry) All() []Adapter {
 // buildCommand creates an *exec.Cmd for bin+args, resolving Windows script
 // wrappers so adapters can treat every launcher uniformly.
 //
-//   - npm-style shim : resolved to `node.exe entry.js ...` and run directly.
+//   - script shim    : resolved to whatever it would have run (`node.exe
+//     entry.js ...`, or a bundled `.exe`) and run directly.
 //   - .exe / no ext  : executed directly (Go quotes args correctly).
 //   - .ps1 / .cmd    : last resort, via an interpreter anchored to System32, and
 //     only when no argument contains a character that a second parser could
@@ -166,11 +168,19 @@ func buildCommand(ctx context.Context, bin string, args []string) (*exec.Cmd, er
 		resolved = p
 	}
 
-	// Preferred path: if this is an npm-style script shim, run what it would
-	// have run. One process, argv passed verbatim, no shell parser involved.
-	if node, entry, ok := resolveScriptShim(resolved); ok {
-		full := append([]string{entry}, args...)
-		return hardenSpawn(exec.CommandContext(ctx, node, full...)), nil
+	// Preferred path: if this is a script shim, run what it would have run. One
+	// process, argv passed verbatim, no shell parser involved.
+	if exe, prefix, ok := resolveScriptShim(resolved); ok {
+		full := append(append([]string(nil), prefix...), args...)
+		return hardenSpawn(exec.CommandContext(ctx, exe, full...)), nil
+	}
+
+	// Second chance before the interpreter: PATH order decides which of several
+	// installs LookPath returns, and it can hand back a shim while a native
+	// executable for the same command sits further down. Running that directly
+	// is strictly better than shelling out to a wrapper we could not read.
+	if native := nativeAlternative(bin, resolved); native != "" {
+		return hardenSpawn(exec.CommandContext(ctx, native, args...)), nil
 	}
 
 	switch strings.ToLower(filepath.Ext(resolved)) {
@@ -189,6 +199,44 @@ func buildCommand(ctx context.Context, bin string, args []string) (*exec.Cmd, er
 	default:
 		return hardenSpawn(exec.CommandContext(ctx, resolved, args...)), nil
 	}
+}
+
+// nativeExts are the extensions of things Windows can execute without an
+// interpreter, in the order we would rather have them.
+var nativeExts = []string{".exe", ".com"}
+
+// nativeAlternative looks for a real executable that answers to the same command
+// as a script shim we could not read. It returns "" unless resolved really is a
+// shim and a native sibling exists, so on every other platform and every other
+// launcher it is a no-op.
+//
+// It searches the shim's own directory first — an install that ships both keeps
+// them together — then the PATH, which is where a second, independent install of
+// the same agent turns up.
+func nativeAlternative(bin, resolved string) string {
+	switch strings.ToLower(filepath.Ext(resolved)) {
+	case ".cmd", ".bat", ".ps1":
+	default:
+		return ""
+	}
+
+	stem := strings.TrimSuffix(filepath.Base(resolved), filepath.Ext(resolved))
+	dirs := []string{filepath.Dir(resolved)}
+	dirs = append(dirs, filepath.SplitList(os.Getenv("PATH"))...)
+
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		for _, ext := range nativeExts {
+			cand := filepath.Join(dir, stem+ext)
+			if fileExists(cand) {
+				log.Printf("cli-agent-mcp: %q resolved to the script shim %s, which could not be read; using %s instead", bin, resolved, cand)
+				return cand
+			}
+		}
+	}
+	return ""
 }
 
 // shellMetaChars are the characters we cannot round-trip safely through a

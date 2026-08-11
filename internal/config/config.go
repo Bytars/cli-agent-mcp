@@ -91,6 +91,13 @@ type Config struct {
 	// MaxTasks caps the number of tasks retained in memory.
 	MaxTasks int
 
+	// MaxConcurrent caps how many workers may run at the same time. It is a
+	// different limit from MaxTasks, which only bounds retained records: a
+	// headless coding agent is a heavyweight process, so an orchestrator that
+	// fans out ten tasks can exhaust the machine while every other limit still
+	// looks satisfied. Zero means no limit.
+	MaxConcurrent int
+
 	// AuditLog is a file path for a JSONL audit trail of everything the worker
 	// was asked to do. Empty disables it.
 	AuditLog string
@@ -140,6 +147,25 @@ func getbool(key string, def bool) bool {
 		warnInvalid(key, raw, "is not a recognized boolean (1/true/yes/on, 0/false/no/off)", def)
 		return def
 	}
+}
+
+// getPositiveInt reads an integer env value that must be greater than zero,
+// falling back to def and reporting anything unusable rather than silently
+// accepting it.
+func getPositiveInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	switch n, err := strconv.Atoi(v); {
+	case err != nil:
+		warnInvalid(key, v, "is not an integer", def)
+	case n <= 0:
+		warnInvalid(key, v, "must be greater than 0", def)
+	default:
+		return n
+	}
+	return def
 }
 
 // splitArgs splits a whitespace/semicolon-separated env value into args. It is
@@ -226,6 +252,7 @@ func Load() Config {
 		DefaultCwd:         getenv("CLI_AGENT_MCP_DEFAULT_CWD", ""),
 		AllowedCwds:        allowed,
 		MaxTasks:           maxTasks,
+		MaxConcurrent:      getPositiveInt("CLI_AGENT_MCP_MAX_CONCURRENT", 3),
 		AuditLog:           getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
 		StateDir:           getenv("CLI_AGENT_MCP_STATE_DIR", ""),
 		WatchWindow:        watchWindow,

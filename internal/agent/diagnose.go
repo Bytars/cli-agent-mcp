@@ -90,8 +90,11 @@ func Diagnose(ctx context.Context, reg *Registry) DiagnosticReport {
 			if b := binOf(a); b != "" {
 				if p, err := exec.LookPath(b); err == nil {
 					d.Launcher = p
-					if node, entry, ok := resolveScriptShim(p); ok {
-						d.RunsAs = node + " " + entry
+					if exe, prefix, ok := resolveScriptShim(p); ok {
+						d.RunsAs = strings.TrimSpace(exe + " " + strings.Join(prefix, " "))
+						d.ShimFixed = true
+					} else if native := nativeAlternative(b, p); native != "" {
+						d.RunsAs = native
 						d.ShimFixed = true
 					} else {
 						d.RunsAs = p
