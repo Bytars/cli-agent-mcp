@@ -1,9 +1,9 @@
 # cli-agent-mcp
 
-[![ci](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/ci.yml)
-[![release](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/release.yml)
-[![latest release](https://img.shields.io/github/v/release/andresh0816/cli-agent-mcp?sort=semver)](https://github.com/andresh0816/cli-agent-mcp/releases/latest)
-[![Go Reference](https://pkg.go.dev/badge/github.com/andresh0816/cli-agent-mcp.svg)](https://pkg.go.dev/github.com/andresh0816/cli-agent-mcp)
+[![ci](https://github.com/Bytars/cli-agent-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Bytars/cli-agent-mcp/actions/workflows/ci.yml)
+[![release](https://github.com/Bytars/cli-agent-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/Bytars/cli-agent-mcp/actions/workflows/release.yml)
+[![latest release](https://img.shields.io/github/v/release/Bytars/cli-agent-mcp?sort=semver)](https://github.com/Bytars/cli-agent-mcp/releases/latest)
+[![Go Reference](https://pkg.go.dev/badge/github.com/Bytars/cli-agent-mcp.svg)](https://pkg.go.dev/github.com/Bytars/cli-agent-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A single-binary **MCP (Model Context Protocol) stdio server** that lets an MCP
@@ -333,7 +333,7 @@ elsewhere, unless `CLI_AGENT_MCP_STATE_DIR` says otherwise.
 ### Download a binary (recommended)
 
 Grab a prebuilt binary from the
-[**Releases**](https://github.com/andresh0816/cli-agent-mcp/releases/latest) page.
+[**Releases**](https://github.com/Bytars/cli-agent-mcp/releases/latest) page.
 The assets are raw binaries — no unzip needed.
 
 | Platform | Asset |
@@ -351,13 +351,13 @@ macOS/Linux remember to `chmod +x` the downloaded file.
 ### With Go
 
 ```bash
-go install github.com/andresh0816/cli-agent-mcp@latest
+go install github.com/Bytars/cli-agent-mcp@latest
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/andresh0816/cli-agent-mcp
+git clone https://github.com/Bytars/cli-agent-mcp
 cd cli-agent-mcp
 go build -o cli-agent-mcp .
 ```

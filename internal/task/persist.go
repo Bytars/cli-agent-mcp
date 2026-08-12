@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/agent"
-	"github.com/andresh0816/cli-agent-mcp/internal/state"
+	"github.com/Bytars/cli-agent-mcp/internal/agent"
+	"github.com/Bytars/cli-agent-mcp/internal/state"
 )
 
 // SetStore attaches durable storage. Without one the manager behaves exactly as

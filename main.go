@@ -25,15 +25,15 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/agent"
-	"github.com/andresh0816/cli-agent-mcp/internal/approval"
-	"github.com/andresh0816/cli-agent-mcp/internal/audit"
-	"github.com/andresh0816/cli-agent-mcp/internal/config"
-	"github.com/andresh0816/cli-agent-mcp/internal/gitx"
-	"github.com/andresh0816/cli-agent-mcp/internal/grants"
-	"github.com/andresh0816/cli-agent-mcp/internal/state"
-	"github.com/andresh0816/cli-agent-mcp/internal/task"
-	"github.com/andresh0816/cli-agent-mcp/internal/ui"
+	"github.com/Bytars/cli-agent-mcp/internal/agent"
+	"github.com/Bytars/cli-agent-mcp/internal/approval"
+	"github.com/Bytars/cli-agent-mcp/internal/audit"
+	"github.com/Bytars/cli-agent-mcp/internal/config"
+	"github.com/Bytars/cli-agent-mcp/internal/gitx"
+	"github.com/Bytars/cli-agent-mcp/internal/grants"
+	"github.com/Bytars/cli-agent-mcp/internal/state"
+	"github.com/Bytars/cli-agent-mcp/internal/task"
+	"github.com/Bytars/cli-agent-mcp/internal/ui"
 )
 
 // instanceWarning is set once during startup, before the server begins serving,

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/gitx"
+	"github.com/Bytars/cli-agent-mcp/internal/gitx"
 )
 
 // Workspace is where a task's worker actually runs.

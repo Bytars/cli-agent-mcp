@@ -11,9 +11,9 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/approval"
-	"github.com/andresh0816/cli-agent-mcp/internal/grants"
-	"github.com/andresh0816/cli-agent-mcp/internal/task"
+	"github.com/Bytars/cli-agent-mcp/internal/approval"
+	"github.com/Bytars/cli-agent-mcp/internal/grants"
+	"github.com/Bytars/cli-agent-mcp/internal/task"
 )
 
 // permissionDesk routes a worker's permission request back to the person who

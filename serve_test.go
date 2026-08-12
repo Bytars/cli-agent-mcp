@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/ui"
+	"github.com/Bytars/cli-agent-mcp/internal/ui"
 )
 
 // boardHandler mirrors what serveHTTP registers, so the gate can be exercised

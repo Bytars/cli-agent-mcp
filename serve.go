@@ -17,7 +17,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/ui"
+	"github.com/Bytars/cli-agent-mcp/internal/ui"
 )
 
 // serveHTTP runs the server over streamable HTTP instead of stdio.

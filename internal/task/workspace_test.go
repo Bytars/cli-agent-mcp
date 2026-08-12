@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/agent"
-	"github.com/andresh0816/cli-agent-mcp/internal/gitx"
+	"github.com/Bytars/cli-agent-mcp/internal/agent"
+	"github.com/Bytars/cli-agent-mcp/internal/gitx"
 )
 
 func repoWithOneCommit(t *testing.T) string {

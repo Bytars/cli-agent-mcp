@@ -5,7 +5,7 @@ Thanks for your interest! Issues, ideas, and pull requests are all welcome.
 ## Getting started
 
 ```bash
-git clone https://github.com/andresh0816/cli-agent-mcp
+git clone https://github.com/Bytars/cli-agent-mcp
 cd cli-agent-mcp
 go build ./...
 ```

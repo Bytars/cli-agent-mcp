@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/agent"
+	"github.com/Bytars/cli-agent-mcp/internal/agent"
 )
 
 func parkedManager(t *testing.T) (*Manager, *Task) {
