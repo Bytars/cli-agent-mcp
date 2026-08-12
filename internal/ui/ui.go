@@ -49,3 +49,18 @@ func ToolMeta() map[string]any {
 func ResourceMeta() map[string]any {
 	return map[string]any{"ui": map[string]any{"prefersBorder": true}}
 }
+
+// ClientRenders reports whether a client declared, during initialize, that it
+// can render views like the board.
+//
+// It is worth asking because the failure is silent by design: a host that does
+// not implement the extension ignores the ui:// resource and shows the tool's
+// text result instead, which reads as the board simply not being very good
+// rather than never having been rendered at all.
+func ClientRenders(extensions map[string]any) bool {
+	if extensions == nil {
+		return false
+	}
+	_, ok := extensions[ExtensionName]
+	return ok
+}

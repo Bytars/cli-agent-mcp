@@ -107,13 +107,25 @@
 (function () {
   "use strict";
 
+  // ---- transports --------------------------------------------------------
+  //
+  // The same document is used two ways. Inside a host that implements the MCP
+  // Apps extension it lives in an iframe and reaches the server through the
+  // host, which proxies its tool calls. Served as a plain page by --http it has
+  // no host at all and talks to the MCP endpoint itself.
+  //
+  // Keeping one file for both is deliberate: a second copy of the board would
+  // drift from this one the first time either changed, and the difference
+  // between them is only how a tool call is delivered.
+  var standalone = (window.parent === window);
+
   // ---- JSON-RPC over postMessage (MCP Apps dialect, 2026-01-26) ----------
   var pending = new Map();
   var nextId = 1;
 
   function post(msg) { window.parent.postMessage(msg, "*"); }
 
-  function request(method, params) {
+  function hostRequest(method, params) {
     var id = nextId++;
     return new Promise(function (resolve, reject) {
       pending.set(id, { resolve: resolve, reject: reject });
@@ -125,10 +137,6 @@
         }
       }, 30000);
     });
-  }
-
-  function notify(method, params) {
-    post({ jsonrpc: "2.0", method: method, params: params || {} });
   }
 
   window.addEventListener("message", function (ev) {
@@ -155,8 +163,94 @@
     }
   });
 
+  // ---- JSON-RPC straight to the MCP endpoint (standalone) ---------------
+  //
+  // The token arrives in the query string, because a browser navigating to a
+  // page cannot set an Authorization header. It is read once and removed from
+  // the address bar so it does not end up in history or in a screenshot; the
+  // page keeps it in memory for its own calls.
+  var token = "";
+  var mcpSession = "";
+
+  if (standalone) {
+    var q = new URLSearchParams(window.location.search);
+    token = q.get("token") || "";
+    if (token && window.history.replaceState) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }
+
+  function directRPC(method, params, isNotification) {
+    var headers = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream"
+    };
+    if (token) headers["Authorization"] = "Bearer " + token;
+    if (mcpSession) headers["Mcp-Session-Id"] = mcpSession;
+
+    var body = { jsonrpc: "2.0", method: method, params: params || {} };
+    if (!isNotification) body.id = nextId++;
+
+    return fetch("mcp", { method: "POST", headers: headers, body: JSON.stringify(body) })
+      .then(function (res) {
+        if (res.status === 401) throw new Error("this board's access token is not valid — reopen the /board URL the server printed");
+        var sid = res.headers.get("Mcp-Session-Id");
+        if (sid) mcpSession = sid;
+        if (isNotification || res.status === 202) return null;
+        if (!res.ok) throw new Error("server returned " + res.status);
+        return res.text().then(parseRPC);
+      });
+  }
+
+  // The endpoint answers with either a bare JSON object or an SSE stream
+  // carrying one, depending on the request. Both have to be understood, and
+  // only the last data frame matters here since every call made from this page
+  // is a single request/response.
+  function parseRPC(text) {
+    var payload = null;
+    if (text.indexOf("data:") === 0 || text.indexOf("\ndata:") >= 0) {
+      text.split("\n").forEach(function (line) {
+        if (line.indexOf("data:") === 0) payload = line.slice(5).trim();
+      });
+    } else {
+      payload = text.trim();
+    }
+    if (!payload) throw new Error("empty response from the server");
+    var msg = JSON.parse(payload);
+    if (msg.error) throw new Error(msg.error.message || "RPC error");
+    return msg.result;
+  }
+
+  // ---- one interface over both ------------------------------------------
   function callTool(name, args) {
-    return request("tools/call", { name: name, arguments: args || {} });
+    var params = { name: name, arguments: args || {} };
+    return standalone ? directRPC("tools/call", params) : hostRequest("tools/call", params);
+  }
+
+  // Putting a turn into the conversation only means something inside a host.
+  // Standalone there is no conversation to put it into, so it is dropped.
+  function announce(text) {
+    if (standalone) return Promise.resolve();
+    return hostRequest("ui/message", { role: "user", content: { type: "text", text: text } });
+  }
+
+  function handshake() {
+    if (!standalone) {
+      return hostRequest("ui/initialize", {
+        protocolVersion: "2026-01-26",
+        capabilities: {},
+        clientInfo: { name: "cli-agent-mcp-task-board", version: "1" }
+      }).then(function () {
+        post({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} });
+      });
+    }
+    return directRPC("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "cli-agent-mcp-task-board", version: "1" }
+    }).then(function () {
+      return directRPC("notifications/initialized", {}, true);
+    });
   }
 
   // ---- rendering --------------------------------------------------------
@@ -262,11 +356,10 @@
         ? ", check what it changed with agent_task_diff (it ran isolated on branch " + t.branch + "), and tell me how it went."
         : " and tell me how it went.";
 
-      request("ui/message", { role: "user", content: { type: "text", text: text } })
-        .catch(function () {
-          // Hosts may withhold ui/message. Losing the announcement is
-          // acceptable; the panel still shows the finished task either way.
-        });
+      announce(text).catch(function () {
+        // Hosts may withhold ui/message. Losing the announcement is
+        // acceptable; the panel still shows the finished task either way.
+      });
     });
   }
 
@@ -445,15 +538,22 @@
   }
 
   var polling = false;
+  var painted = false;
 
   function refresh() {
-    if (polling || document.hidden) return Promise.resolve();
+    // Not polling a panel nobody is looking at is worth doing, but skipping the
+    // FIRST fetch on that basis is not: a board opened in a background tab —
+    // which is what a browser does when a page is opened programmatically, and
+    // what a host does when the panel starts off-screen — would sit on
+    // "connecting…" until it happened to be looked at, and look broken.
+    if (polling || (document.hidden && painted)) return Promise.resolve();
     polling = true;
     return callTool("agent_list_tasks", {})
       .then(function (res) {
         var sc = res && res.structuredContent;
         showWarning(sc && sc.warning);
         render((sc && sc.tasks) || []);
+        painted = true;
         var anyRunning = lastTasks.some(function (t) { return t.status === "running"; });
         pulseEl.className = anyRunning ? "pulse" : "pulse idle";
         liveEl.textContent = anyRunning ? "live" : "up to date";
@@ -475,15 +575,8 @@
     if (!document.hidden) refresh();
   });
 
-  request("ui/initialize", {
-    protocolVersion: "2026-01-26",
-    capabilities: {},
-    clientInfo: { name: "cli-agent-mcp-task-board", version: "1" }
-  })
-    .then(function () {
-      notify("ui/notifications/initialized", {});
-      return refresh();
-    })
+  handshake()
+    .then(refresh)
     .then(loop)
     .catch(fail);
 })();

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/andresh0816/cli-agent-mcp/internal/ui"
 )
 
 // serveHTTP runs the server over streamable HTTP instead of stdio.
@@ -49,6 +52,31 @@ func serveHTTP(ctx context.Context, srv *mcp.Server, addr, token string) error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", requireToken(token, handler))
+
+	// The board as an ordinary web page.
+	//
+	// As an MCP view it only appears in hosts that implement the views
+	// extension, and when a host does not, the tool quietly returns text
+	// instead — so the panel is not merely unavailable, it is invisible in a way
+	// that looks like the board being unimpressive. Served here it works in any
+	// browser, from the same document, against the same endpoint.
+	//
+	// The token rides in the query string because a browser navigating to a page
+	// cannot set an Authorization header; the page strips it from the address
+	// bar on load and keeps it in memory for its own calls.
+	mux.HandleFunc("/board", func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("token")), []byte(token)) != 1 {
+			http.Error(w, "unauthorized: open the /board URL printed at startup", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		// The page holds a live credential; keeping it out of any other site's
+		// frame costs nothing and closes the obvious way to steal one.
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		_, _ = io.WriteString(w, ui.BoardHTML)
+	})
 	// A liveness check that does not require the token, so a supervisor can tell
 	// the difference between "not running" and "running, and you have the wrong
 	// credential" without holding one.
@@ -66,6 +94,7 @@ func serveHTTP(ctx context.Context, srv *mcp.Server, addr, token string) error {
 		log.Printf("WARNING: listening on %s, which is not loopback. Anything that can reach this address and holds the token can run commands on this machine.", ln.Addr())
 	}
 	log.Printf("http transport: http://%s/mcp", ln.Addr())
+	log.Printf("task board:     http://%s/board?token=%s", ln.Addr(), token)
 	if generated {
 		// Printed once, on stderr, because there is no other way for the operator
 		// to learn a token the process invented. Set CLI_AGENT_MCP_HTTP_TOKEN to

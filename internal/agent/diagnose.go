@@ -62,6 +62,13 @@ type DiagnosticReport struct {
 	// than it was asked to, with nothing in the transcript pointing at the cause.
 	InteractivePermission bool   `json:"interactive_permission"`
 	PermissionDetail      string `json:"interactive_permission_detail,omitempty"`
+
+	// BoardRenders says whether the connected client declared that it can render
+	// the task board as a live panel. A host that cannot silently falls back to
+	// the tool's text result, so the board looks merely unimpressive rather than
+	// absent, and nothing anywhere says which of the two happened.
+	BoardRenders bool   `json:"board_renders"`
+	BoardDetail  string `json:"board_detail,omitempty"`
 }
 
 // Diagnose runs the probes. It never mutates anything and never runs a

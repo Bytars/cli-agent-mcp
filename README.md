@@ -188,6 +188,19 @@ survive.
 cli-agent-mcp --http 127.0.0.1:7777
 ```
 
+It also serves the board as an ordinary web page at
+`http://127.0.0.1:7777/board?token=<token>` — the exact URL is printed at
+startup. That matters because the board as an MCP view only appears in hosts
+that implement the views extension, and a host that does not silently returns
+the tool's text instead, so the panel is not merely unavailable but invisible in
+a way that looks like the board being unimpressive. `agent_diagnose` now says
+which of the two you are looking at.
+
+It is the same document either way: inside a host it reaches the server through
+the host, and served here it talks to `/mcp` itself. Keeping one file for both
+is deliberate — a second copy would drift from the first the moment either
+changed, and the only difference between them is how a tool call is delivered.
+
 One long-lived server, one task registry, and every client pointed at
 `http://127.0.0.1:7777/mcp`. A socket has no parent to inherit trust from and
 this process can run arbitrary commands on the machine, so it binds to loopback

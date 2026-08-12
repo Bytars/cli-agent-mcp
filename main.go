@@ -1039,6 +1039,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, agent.DiagnosticReport, error) {
 		rep := agent.Diagnose(ctx, reg)
 		rep.InteractivePermission, rep.PermissionDetail = desk.status(req.Session, cfg.AskPermission)
+		rep.BoardRenders, rep.BoardDetail = boardStatus(req.Session, cfg)
 		return textResult(rep.Text()), rep, nil
 	})
 
@@ -1081,6 +1082,29 @@ func registerBoard(srv *mcp.Server, mgr *task.Manager) {
 		tasks := mgr.List()
 		return textResult(withWarning(boardText(tasks))), newListResult(tasks), nil
 	})
+}
+
+// boardStatus reports whether agent_task_board will actually open a panel for
+// this client, and where to look instead when it will not.
+//
+// The question is worth answering explicitly because the failure is silent by
+// design: a host that does not implement the views extension ignores the ui://
+// resource and renders the tool's text result, so the board looks like a
+// disappointing list rather than a panel that was never shown.
+func boardStatus(session *mcp.ServerSession, cfg config.Config) (bool, string) {
+	if session == nil {
+		return false, "no client session"
+	}
+	params := session.InitializeParams()
+	if params == nil || params.Capabilities == nil {
+		return false, "the client's capabilities are not known"
+	}
+	if ui.ClientRenders(params.Capabilities.Extensions) {
+		return true, ""
+	}
+	return false, "this client did not declare the " + ui.ExtensionName + " extension, so it cannot render views; " +
+		"agent_task_board returns the same listing as plain text. " +
+		"Run the server with --http and open /board in a browser for the live panel, or follow a task with agent_watch."
 }
 
 // boardText renders the task list as text. Hosts that don't implement
