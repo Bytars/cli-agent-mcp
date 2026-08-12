@@ -10,6 +10,7 @@ import (
 
 	"github.com/andresh0816/cli-agent-mcp/internal/agent"
 	"github.com/andresh0816/cli-agent-mcp/internal/config"
+	"github.com/andresh0816/cli-agent-mcp/internal/grants"
 	"github.com/andresh0816/cli-agent-mcp/internal/task"
 	"github.com/andresh0816/cli-agent-mcp/internal/ui"
 )
@@ -25,7 +26,7 @@ func connect(t *testing.T) *mcp.ClientSession {
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "cli-agent-mcp", Version: "test"},
 		&mcp.ServerOptions{Instructions: instructions, Capabilities: caps})
-	registerTools(srv, agent.NewRegistry(agent.NewMockAdapter()), task.NewManager(10), config.Config{DefaultAgent: "mock"}, newPermissionDesk(time.Minute))
+	registerTools(srv, agent.NewRegistry(agent.NewMockAdapter()), task.NewManager(10), config.Config{DefaultAgent: "mock"}, newPermissionDesk(time.Minute), &grants.Store{})
 
 	ct, st := mcp.NewInMemoryTransports()
 	ctx := context.Background()

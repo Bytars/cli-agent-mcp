@@ -253,10 +253,6 @@ func main() {
 	if os.Getenv("SMOKE_ONLY") == "permission" {
 		fmt.Println("\n== interactive permission (worker asks, user answers) ==")
 
-		// The server knows whether it can ask this client at all, and says so.
-		// Reporting "nothing was asked" as a failure when the negotiated
-		// protocol forbids server-initiated elicitation would be blaming the
-		// wiring for a rule.
 		diag := callTool(ctx, session, "agent_diagnose", map[string]any{})
 		if jsonField(diag, "interactive_permission") != "true" {
 			fmt.Printf("  NOT APPLICABLE: %s\n", jsonField(diag, "interactive_permission_detail"))
@@ -264,25 +260,75 @@ func main() {
 			return
 		}
 
-		res := callTool(ctx, session, "agent_run_task", map[string]any{
-			"prompt": prompt,
-			"agent":  agentName,
-			"cwd":    cwd,
+		// Backgrounded on purpose: the worker is going to STOP and wait, so a
+		// blocking call would just sit there. This is exactly the shape the
+		// orchestrator sees — start it, notice it is blocked, answer.
+		st := callTool(ctx, session, "agent_start_task", map[string]any{
+			"prompt": prompt, "agent": agentName, "cwd": cwd,
 		})
-		status := jsonField(res, "status")
-		progressMu.Lock()
-		asked := len(elicitations)
-		progressMu.Unlock()
+		id := jsonField(st, "task_id")
+		fmt.Printf("  started %s; waiting for it to block on a permission…\n", id)
 
-		fmt.Printf("  status=%s after %d permission request(s)\n", status, asked)
-		if asked == 0 {
-			log.Fatal("FAIL: nothing was ever asked — the worker was either pre-approved for everything, " +
+		var asked map[string]any
+		deadline := time.Now().Add(120 * time.Second)
+		for time.Now().Before(deadline) {
+			status := callTool(ctx, session, "agent_task_status", map[string]any{"task_id": id})
+			if p := structField(status, "pending_permission"); p != nil {
+				asked = p
+				break
+			}
+			if jsonField(status, "status") != "running" {
+				log.Fatalf("FAIL: the task finished without ever asking for permission:\n%s", resultText(status))
+			}
+			time.Sleep(time.Second)
+		}
+		if asked == nil {
+			log.Fatal("FAIL: the worker never asked for permission — it was either pre-approved for everything, " +
 				"or the permission prompt tool was not wired up")
 		}
-		if status != "done" {
-			log.Fatalf("FAIL: the approved run ended as %q:\n%s", status, resultText(res))
+		fmt.Printf("  BLOCKED: wants %v — %v\n", asked["tool"], asked["detail"])
+
+		// remember defaults to false: a test that quietly widened the machine's
+		// standing permissions would be a bad citizen. SMOKE_REMEMBER=1 opts
+		// into checking that a granted permission is never asked for twice —
+		// use it with a throwaway CLI_AGENT_MCP_STATE_DIR.
+		remember := os.Getenv("SMOKE_REMEMBER") == "1"
+		ans := callTool(ctx, session, "agent_answer_permission", map[string]any{
+			"task_id": id, "allow": true, "remember": remember,
+		})
+		fmt.Printf("  answered: %s\n", firstLine(resultText(ans)))
+
+		final := ""
+		deadline = time.Now().Add(180 * time.Second)
+		for time.Now().Before(deadline) {
+			status := callTool(ctx, session, "agent_task_status", map[string]any{"task_id": id})
+			if final = jsonField(status, "status"); final != "running" {
+				break
+			}
+			time.Sleep(time.Second)
 		}
-		fmt.Println("PERMISSION-ONLY DONE (asked, answered, completed)")
+		if final != "done" {
+			log.Fatalf("FAIL: after being allowed, the task ended as %q", final)
+		}
+
+		if remember {
+			// The point of remembering is that the second time costs nobody
+			// anything. If this run blocks too, the grant bought nothing.
+			fmt.Println("\n  running the same task again — it must NOT ask this time")
+			second := callTool(ctx, session, "agent_run_task", map[string]any{
+				"prompt": prompt, "agent": agentName, "cwd": cwd,
+			})
+			if p := structField(second, "pending_permission"); p != nil {
+				log.Fatalf("FAIL: it asked again for %v despite the grant", p["tool"])
+			}
+			if st := jsonField(second, "status"); st != "done" {
+				log.Fatalf("FAIL: the second run ended as %q:\n%s", st, resultText(second))
+			}
+			perms := callTool(ctx, session, "agent_list_permissions", map[string]any{})
+			fmt.Printf("  second run finished without asking. %s\n", firstLine(resultText(perms)))
+		}
+
+		fmt.Println("PERMISSION-ONLY DONE (worker blocked, was answered, and finished)")
 		return
 	}
 
@@ -581,4 +627,22 @@ func resultText(res *mcp.CallToolResult) string {
 		}
 	}
 	return b.String()
+}
+
+// structField pulls a nested object out of a tool's StructuredContent, for the
+// fields that are more than a scalar.
+func structField(res *mcp.CallToolResult, key string) map[string]any {
+	if res == nil || res.StructuredContent == nil {
+		return nil
+	}
+	buf, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		return nil
+	}
+	var m map[string]any
+	if json.Unmarshal(buf, &m) != nil {
+		return nil
+	}
+	nested, _ := m[key].(map[string]any)
+	return nested
 }

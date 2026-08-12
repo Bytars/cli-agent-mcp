@@ -30,6 +30,7 @@ import (
 	"github.com/andresh0816/cli-agent-mcp/internal/audit"
 	"github.com/andresh0816/cli-agent-mcp/internal/config"
 	"github.com/andresh0816/cli-agent-mcp/internal/gitx"
+	"github.com/andresh0816/cli-agent-mcp/internal/grants"
 	"github.com/andresh0816/cli-agent-mcp/internal/state"
 	"github.com/andresh0816/cli-agent-mcp/internal/task"
 	"github.com/andresh0816/cli-agent-mcp/internal/ui"
@@ -156,7 +157,16 @@ func main() {
 	// Interactive approval. It only does anything for a client that can put a
 	// question to its user, and it fails soft: if the endpoint cannot be brought
 	// up, tasks run exactly as they did before.
+	grantStore, err := grants.Open(cfg.StateDir)
+	if err != nil {
+		log.Printf("warning: remembered permissions are unavailable: %v", err)
+		grantStore = &grants.Store{}
+	}
+
 	desk := newPermissionDesk(cfg.PermissionTimeout)
+	desk.mgr = mgr
+	desk.grants = grantStore
+	mgr.SetGrants(grantStore)
 	if cfg.AskPermission {
 		broker, err := approval.Start(filepath.Join(cfg.StateDir, "approval"), desk.Decide)
 		if err != nil {
@@ -183,7 +193,7 @@ func main() {
 		Capabilities: caps,
 	})
 
-	registerTools(srv, reg, mgr, cfg, desk)
+	registerTools(srv, reg, mgr, cfg, desk, grantStore)
 
 	log.Printf("starting (default agent=%s, max_tasks=%d, max_concurrent=%d)", cfg.DefaultAgent, cfg.MaxTasks, cfg.MaxConcurrent)
 
@@ -212,6 +222,11 @@ BACKGROUND MODE (a tracked task you watch):
 1. agent_start_task — start the task, get a task_id (returns immediately).
 2. agent_watch — by default (until="done") it blocks until the task finishes, streaming live progress the whole time. If the task is longer than the watch window it returns early with running=true and a next_since_line: the task was NOT interrupted and nothing failed. Call agent_watch again with that since_line and keep going until running is false. This is the way to follow a long task — a single call cannot cover it, because the client abandons a tool call that takes too long.
 3. Only if you need to actively supervise and possibly interrupt: call agent_watch with until="change" (returns on each new chunk so you can judge it), and agent_cancel_task if it drifts (terminates the worker and the process tree it created; a process the worker deliberately detached via ShellExecute can outlive it). To redirect: cancel and start a corrected task, or agent_send_followup once finished.
+
+WHEN THE WORKER NEEDS PERMISSION YOU HAVE NOT GIVEN IT:
+The worker does not fail and does not guess — it STOPS and waits. You will see it in the transcript as "⏸ WAITING FOR PERMISSION", and the task's snapshot carries pending_permission. A task in that state is running but making no progress, and nothing will change until a person answers.
+When that happens: tell the user plainly what the worker wants to run and why it is blocked, ask them, and call agent_answer_permission with their answer. Do NOT decide for them, and do NOT work around it by rewording the task.
+If they say to allow it from now on (rather than just this once), pass remember=true — the permission is then recorded and pre-approved on every future task, so it is never asked again. agent_list_permissions shows what has been granted; agent_revoke_permission takes it back.
 
 SHOWING THE USER WHERE THINGS STAND:
 - agent_task_board — opens a live panel listing every task with its status, elapsed time and output, which keeps refreshing on its own and can cancel a running task. Progress notifications only exist while a call is in flight, so a backgrounded task is invisible once agent_start_task returns; the board is what fixes that. Call it right after agent_start_task, and whenever the user asks how their tasks are going.
@@ -248,6 +263,50 @@ type outputInput struct {
 	SinceLine int    `json:"since_line,omitempty" jsonschema:"0-based line index to start from (for incremental reads)."`
 	MaxLines  int    `json:"max_lines,omitempty" jsonschema:"Maximum number of lines to return. Leave unset to get the end of the transcript (the last few hundred lines), which is where the agent's conclusion is; set it explicitly to page through from since_line."`
 	Raw       bool   `json:"raw,omitempty" jsonschema:"Return the raw JSONL transcript instead of the compact, filtered view."`
+}
+
+type answerInput struct {
+	TaskID    string `json:"task_id" jsonschema:"The task whose worker is waiting."`
+	Allow     bool   `json:"allow" jsonschema:"True to let the worker do it, false to refuse. Ask the user first — this is their decision, not yours."`
+	Remember  bool   `json:"remember,omitempty" jsonschema:"Record the permission so it is never asked for again, on this or any future task. Set it only when the user says to allow it from now on, not merely that they allow it once."`
+	Message   string `json:"message,omitempty" jsonschema:"Optional reason shown to the agent when refusing, so it can work around the refusal instead of guessing."`
+	RequestID string `json:"request_id,omitempty" jsonschema:"Which request to answer, when a task somehow has more than one waiting. Normally leave unset."`
+}
+
+type revokeInput struct {
+	Tool    string `json:"tool" jsonschema:"The tool whose permission to withdraw, e.g. \"PowerShell\"."`
+	Command string `json:"command,omitempty" jsonschema:"The command it was granted for, e.g. \"docker\". Omit to revoke every grant for that tool."`
+}
+
+type permissionsResult struct {
+	Granted []grants.Grant           `json:"granted"`
+	Waiting []task.PermissionRequest `json:"waiting,omitempty"`
+}
+
+// permissionsText renders permissions for a person: what a worker is blocked on
+// comes first, because it is the only part that needs an answer right now.
+func permissionsText(res permissionsResult) string {
+	var b strings.Builder
+
+	if len(res.Waiting) > 0 {
+		fmt.Fprintf(&b, "WAITING FOR AN ANSWER (%d):\n", len(res.Waiting))
+		for _, w := range res.Waiting {
+			fmt.Fprintf(&b, "  task %s — %s: %s  (asked %s ago)\n",
+				w.TaskID, w.Tool, truncate(w.Detail, 160), w.Age().Round(time.Second))
+		}
+		b.WriteString("\nAnswer with agent_answer_permission.\n\n")
+	}
+
+	if len(res.Granted) == 0 {
+		b.WriteString("No permissions have been granted permanently. " +
+			"A worker will ask before using anything outside the server's pre-approved list.")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "GRANTED PERMANENTLY (%d):\n", len(res.Granted))
+	for _, g := range res.Granted {
+		fmt.Fprintf(&b, "  %-40s granted %s\n", g.String(), g.GrantedAt.Format("2006-01-02 15:04"))
+	}
+	return b.String()
 }
 
 type cleanupInput struct {
@@ -608,7 +667,7 @@ func truncateHead(s string, n int) string {
 	return s[start:]
 }
 
-func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config, desk *permissionDesk) {
+func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config, desk *permissionDesk, grantStore *grants.Store) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "agent_run_task",
 		Description: "Delegate a task to a local headless CLI agent (Claude Code or Cursor) and WAIT for it to finish, streaming live progress notifications as the agent works. This is the seamless, in-line mode — no polling — so it feels like you did the work yourself. " +
@@ -759,6 +818,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		}
 		snap := t.Snapshot()
 		msg := fmt.Sprintf("Task %s: status=%s", snap.ID, snap.Status)
+		if p := snap.Pending; p != nil {
+			msg += fmt.Sprintf("\n\n⏸ WAITING FOR PERMISSION (%s): the worker wants to use %s: %s\n"+
+				"It is blocked and will stay blocked. Ask the user, then call agent_answer_permission.",
+				p.Age().Round(time.Second), p.Tool, truncate(p.Detail, 300))
+		}
 		if snap.Result != "" {
 			msg += "\nResult: " + snap.Result
 		}
@@ -1011,6 +1075,64 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return errResult(err.Error()), gitx.Report{}, nil
 		}
 		return textResult(rep.Text()), rep, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "agent_answer_permission",
+		Description: "Answer a worker that is WAITING for permission to use a tool it was not pre-approved for. " +
+			"A task in that state is running but making no progress, and only a person can release it — so put the request to the user, in their words, and call this with their answer. " +
+			"Set remember=true when they say to allow it from now on: the permission is then recorded and that tool never has to be asked for again, on this task or any future one. " +
+			"Denying is safe — the worker is told why and carries on with what it can do without it.",
+		Annotations: mutatingTool(),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in answerInput) (*mcp.CallToolResult, task.Snapshot, error) {
+		r, err := mgr.AnswerPermission(in.TaskID, in.RequestID, task.PermissionAnswer{
+			Allow:    in.Allow,
+			Remember: in.Remember,
+			Message:  in.Message,
+		})
+		if err != nil {
+			return errResult(err.Error()), task.Snapshot{}, nil
+		}
+		t, _ := mgr.Get(r.TaskID)
+		snap := t.Snapshot()
+
+		verb := "Denied"
+		if in.Allow {
+			verb = "Allowed"
+		}
+		msg := fmt.Sprintf("%s %s for task %s. The worker has resumed.", verb, r.Tool, r.TaskID)
+		if in.Allow && in.Remember {
+			msg += fmt.Sprintf(" %s is now pre-approved for every future task, so it will not be asked again — undo that with agent_revoke_permission.",
+				grants.Grant{Tool: r.Tool, Command: r.Command})
+		}
+		return textResult(msg), snap, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "agent_list_permissions",
+		Description: "List the permissions the user has granted permanently, and any request a worker is waiting on right now. " +
+			"Use it when they ask what the agent is allowed to do, or when a task seems stuck.",
+		Annotations: readOnlyTool(),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, permissionsResult, error) {
+		res := permissionsResult{Granted: grantStore.List(), Waiting: mgr.PendingPermissions()}
+		return textResult(permissionsText(res)), res, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "agent_revoke_permission",
+		Description: "Withdraw a permanently granted permission, so workers have to ask for it again. " +
+			"Give the tool name, and the command to narrow it (e.g. tool=\"PowerShell\", command=\"docker\"); omitting the command revokes every grant for that tool.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: ptr(false), IdempotentHint: true, OpenWorldHint: ptr(false)},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in revokeInput) (*mcp.CallToolResult, permissionsResult, error) {
+		removed, err := grantStore.Remove(in.Tool, in.Command)
+		if err != nil {
+			return errResult(err.Error()), permissionsResult{}, nil
+		}
+		res := permissionsResult{Granted: grantStore.List(), Waiting: mgr.PendingPermissions()}
+		if !removed {
+			return textResult("Nothing to revoke: no such permission was granted.\n\n" + permissionsText(res)), res, nil
+		}
+		return textResult("Revoked. Workers will ask about it again.\n\n" + permissionsText(res)), res, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

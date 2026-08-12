@@ -26,6 +26,7 @@ import (
 	"github.com/andresh0816/cli-agent-mcp/internal/agent"
 	"github.com/andresh0816/cli-agent-mcp/internal/audit"
 	"github.com/andresh0816/cli-agent-mcp/internal/gitx"
+	"github.com/andresh0816/cli-agent-mcp/internal/grants"
 	"github.com/andresh0816/cli-agent-mcp/internal/state"
 )
 
@@ -92,6 +93,11 @@ type Task struct {
 	// worktree cut for this task alone.
 	workspace Workspace
 
+	// pending is the permission request this task is currently blocked on, if
+	// any. It is the difference between "the agent could not do that" and "the
+	// agent is waiting for you".
+	pending *PermissionRequest
+
 	// approver, when set, lets each turn hand the worker a way to ask a human
 	// for permission instead of stalling on a prompt nobody can answer.
 	approver Approver
@@ -140,6 +146,11 @@ type Snapshot struct {
 	Worktree string `json:"worktree,omitempty"`
 	Repo     string `json:"repo,omitempty"`
 	Branch   string `json:"branch,omitempty"`
+
+	// Pending is set while the worker is blocked waiting for someone to allow a
+	// tool it was not given. A task in this state is running but making no
+	// progress, and only a person can change that.
+	Pending *PermissionRequest `json:"pending_permission,omitempty"`
 }
 
 // baseCommit records the starting point of a task's repository, or "" when the
@@ -180,6 +191,7 @@ func (t *Task) snapshot() Snapshot {
 		ModelUsed:  t.modelUsed,
 		BaseCommit: t.baseCommit,
 	}
+	s.Pending = t.pending
 	if t.workspace.Isolated() {
 		s.Worktree = t.workspace.Path
 		s.Repo = t.workspace.Repo
@@ -338,6 +350,12 @@ type Manager struct {
 	audit         *audit.Logger
 	store         *state.Store
 	timeout       time.Duration
+
+	// desk holds the permission requests workers are currently blocked on.
+	desk *permissionDesk
+
+	// grants are the permissions the user granted permanently.
+	grants *grants.Store
 }
 
 // NewManager builds a task manager retaining up to maxTasks tasks.
@@ -345,7 +363,7 @@ func NewManager(maxTasks int) *Manager {
 	if maxTasks <= 0 {
 		maxTasks = 100
 	}
-	return &Manager{tasks: make(map[string]*Task), maxTasks: maxTasks}
+	return &Manager{tasks: make(map[string]*Task), maxTasks: maxTasks, desk: newDesk()}
 }
 
 // SetAudit attaches an audit logger; nil or a disabled logger is fine.
@@ -353,6 +371,9 @@ func (m *Manager) SetAudit(a *audit.Logger) { m.audit = a }
 
 // SetMaxConcurrent caps how many workers may run at once; zero means unlimited.
 func (m *Manager) SetMaxConcurrent(n int) { m.maxConcurrent = n }
+
+// SetGrants attaches the store of permissions the user has granted permanently.
+func (m *Manager) SetGrants(g *grants.Store) { m.grants = g }
 
 // Running reports how many tasks currently have a live worker.
 func (m *Manager) Running() int {
@@ -713,6 +734,14 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 			spec.MCPConfigPath = cfgPath
 			spec.PermissionTool = tool
 		}
+	}
+
+	// A permission the user granted permanently is handed to the agent as a
+	// pre-approved tool, so the worker never reaches the point of asking for it
+	// again. Answering the same question twice is the fastest way to train
+	// someone into approving everything without reading it.
+	if m.grants != nil {
+		spec.AllowedTools = append(spec.AllowedTools, m.grants.Patterns()...)
 	}
 
 	cmd, err := t.adapter.Command(ctx, spec)

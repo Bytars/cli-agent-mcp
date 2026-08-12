@@ -92,6 +92,13 @@
   }
   .cwd { font-size: 11px; color: var(--muted); word-break: break-all; }
   .isolated { border-color: var(--running); color: var(--running); }
+  .waiting { border-color: var(--failed); color: var(--failed); }
+  .ask {
+    border: 1px solid var(--failed); border-radius: 8px; padding: 8px 10px;
+    margin-bottom: 8px; font-size: 12px; line-height: 1.5;
+  }
+  .ask code { word-break: break-all; }
+  .dot.waiting-dot { background: var(--failed); animation: pulse 1.6s ease-in-out infinite; }
 </style>
 </head>
 <body>
@@ -389,10 +396,26 @@
       var diff = diffs.get(t.task_id);
       var usage = usageText(t);
 
+      // A task blocked on permission is running and getting nowhere, and only a
+      // person can change that — so it is shown whether or not the row is
+      // expanded, and it is the first thing in the row when it is.
+      var ask = t.pending_permission;
+      var askBlock = ask
+        ? '<div class="ask">⏸ <b>Waiting for permission</b> to use ' + esc(ask.tool) +
+            (ask.detail ? ": <code>" + esc(ask.detail) + "</code>" : "") +
+            '<div class="row" style="margin-top:8px">' +
+              '<button data-allow="' + esc(t.task_id) + '">Allow once</button>' +
+              '<button data-allow-always="' + esc(t.task_id) + '">Allow from now on</button>' +
+              '<button class="danger" data-deny="' + esc(t.task_id) + '">Deny</button>' +
+            "</div>" +
+          "</div>"
+        : "";
+
       var body = "";
       if (open) {
         body =
           '<div class="body">' +
+            askBlock +
             (t.error ? '<div class="err">' + esc(t.error) + "</div>" : "") +
             '<div class="row">' +
               '<span class="id">' + esc(t.task_id) + "</span>" +
@@ -424,8 +447,9 @@
         '<div class="task">' +
           '<div class="head" data-toggle="' + esc(t.task_id) + '">' +
             '<span class="chev">' + (open ? "▾" : "▸") + "</span>" +
-            '<span class="dot ' + esc(t.status) + '"></span>' +
+            '<span class="dot ' + (ask ? "waiting-dot" : esc(t.status)) + '"></span>' +
             '<span class="prompt">' + esc(prompt) + "</span>" +
+            (ask ? '<span class="badge waiting">needs permission</span>' : "") +
             (t.worktree ? '<span class="badge isolated">isolated</span>' : "") +
             (t.usage && t.usage.cost_usd ? '<span class="meta">' + esc(money(t.usage.cost_usd)) + "</span>" : "") +
             '<span class="badge">' + esc(t.agent) + "</span>" +
@@ -461,6 +485,24 @@
           .catch(fail);
       });
     });
+
+    // Answering releases a worker that is otherwise going to sit there until it
+    // times out, so it is worth being able to do from here as well as from the
+    // conversation.
+    [["data-allow", true, false], ["data-allow-always", true, true], ["data-deny", false, false]]
+      .forEach(function (spec) {
+        listEl.querySelectorAll("[" + spec[0] + "]").forEach(function (el) {
+          el.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            el.disabled = true;
+            callTool("agent_answer_permission", {
+              task_id: el.getAttribute(spec[0]),
+              allow: spec[1],
+              remember: spec[2]
+            }).then(refresh).catch(fail);
+          });
+        });
+      });
 
     listEl.querySelectorAll("[data-diff]").forEach(function (el) {
       el.addEventListener("click", function (ev) {

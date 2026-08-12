@@ -12,6 +12,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/andresh0816/cli-agent-mcp/internal/approval"
+	"github.com/andresh0816/cli-agent-mcp/internal/grants"
 	"github.com/andresh0816/cli-agent-mcp/internal/task"
 )
 
@@ -25,6 +26,8 @@ import (
 type permissionDesk struct {
 	broker  *approval.Broker
 	timeout time.Duration
+	mgr     *task.Manager
+	grants  *grants.Store
 
 	mu       sync.Mutex
 	sessions map[string]*mcp.ServerSession // task id -> who to ask
@@ -34,17 +37,69 @@ func newPermissionDesk(timeout time.Duration) *permissionDesk {
 	return &permissionDesk{timeout: timeout, sessions: map[string]*mcp.ServerSession{}}
 }
 
-// Decide is the broker's Decider: it finds the session that owns the asking
-// task and puts the question to it.
+// Decide is the broker's Decider. It has three answers in descending order of
+// how much of the user's attention they cost.
+//
+// A permission already granted is applied without asking again — asking twice
+// is the fastest way to train someone to stop reading the question. A client
+// that can be elicited is asked directly. Anything else is parked against the
+// task and waits: the orchestrating model is talking to the same person and
+// polls this server constantly, so the question reaches them by that route
+// instead, and the worker holds rather than losing the work it was doing.
 func (d *permissionDesk) Decide(ctx context.Context, req approval.Request) approval.Decision {
+	command := commandOf(req.Input)
+
+	if d.grants.Allows(req.ToolName, command) {
+		return approval.Decision{Allow: true}
+	}
+
 	d.mu.Lock()
 	session := d.sessions[req.TaskID]
 	d.mu.Unlock()
 
-	if session == nil {
-		return approval.Decision{Message: "there is no longer anyone connected who can approve this, so it was not run."}
+	if session != nil && cannotAsk(session) == "" {
+		return d.ask(ctx, session, req)
 	}
-	return d.ask(ctx, session, req)
+	return d.park(ctx, req, command)
+}
+
+// park holds the request against its task until a person answers it through
+// agent_answer_permission.
+func (d *permissionDesk) park(ctx context.Context, req approval.Request, command string) approval.Decision {
+	if d.mgr == nil {
+		return approval.Decision{Message: "nobody can be asked about this, so it was not run"}
+	}
+
+	ans := d.mgr.AskPermission(ctx, req.TaskID, req.ToolName, inputDetail(req.Input), command, d.timeout)
+	if !ans.Allow {
+		msg := ans.Message
+		if msg == "" {
+			msg = "the user declined this action. Do not retry it; find another way or stop and explain what you cannot do without it."
+		}
+		return approval.Decision{Message: msg}
+	}
+
+	// Remembering happens here rather than in the tool handler, because this is
+	// the only place that knows what was actually asked for.
+	if ans.Remember && d.grants != nil {
+		g := grants.Grant{Tool: req.ToolName, Command: command, Note: "granted while running " + req.TaskID}
+		if err := d.grants.Add(g); err != nil {
+			log.Printf("warning: could not remember the grant for %s: %v", g, err)
+		} else {
+			log.Printf("remembered: %s", g)
+		}
+	}
+	return approval.Decision{Allow: true}
+}
+
+// commandOf pulls the program out of a shell tool's arguments, which is what a
+// grant is keyed on. Tools that are not shells have no command, and a grant for
+// them covers the whole tool.
+func commandOf(input map[string]any) string {
+	if v, ok := input["command"]; ok {
+		return grants.CommandVerb(fmt.Sprint(v))
+	}
+	return ""
 }
 
 // Approver returns the approver for one client session, or nil when
@@ -59,9 +114,9 @@ func (d *permissionDesk) Approver(session *mcp.ServerSession) task.Approver {
 	if d == nil || d.broker == nil || session == nil {
 		return nil
 	}
-	if reason := cannotAsk(session); reason != "" {
-		return nil
-	}
+	// Offered to every client now, not only the ones that can be elicited: a
+	// client that cannot be asked directly still has a person behind it, and
+	// parking reaches them through the orchestrator instead.
 	return &sessionApprover{desk: d, session: session}
 }
 
@@ -111,7 +166,9 @@ func (d *permissionDesk) status(session *mcp.ServerSession, configured bool) (bo
 		return false, "no client session"
 	}
 	if reason := cannotAsk(session); reason != "" {
-		return false, reason
+		// Not being elicitable is no longer the end of it: the request is parked
+		// and relayed instead, which is slower but reaches the same person.
+		return true, "by parking the request — " + reason
 	}
 	return true, ""
 }

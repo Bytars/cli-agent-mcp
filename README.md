@@ -92,6 +92,9 @@ newline-delimited output. That gives a clean programmatic contract:
 | `agent_cancel_task` | Terminate a running task. |
 | `agent_list_tasks` | List all tasks, newest first. |
 | `agent_list_agents` | Show which agents are available on this machine. |
+| **`agent_answer_permission`** | Release a worker that stopped and is waiting for permission. `remember: true` grants it for good. |
+| `agent_list_permissions` | What has been granted permanently, and what a worker is waiting on now. |
+| `agent_revoke_permission` | Withdraw a permanent grant, so workers ask again. |
 | `agent_diagnose` | Why an agent fails with no explanation: package identity, whether spawning works, how each launcher resolves, whether permission questions can reach you. |
 
 ## What a task cost
@@ -158,22 +161,50 @@ task, showing the actual command rather than "may the agent use Bash". A refusal
 reaches the agent as a reason it can work around. The grant is revoked with its
 config file the moment the turn ends.
 
-**It does not engage for every client.** It needs one that declared the
-elicitation capability, *and* a negotiated protocol older than `2026-07-28` —
-from that version the spec ([SEP-2322](https://blog.modelcontextprotocol.io/posts/2026-07-28/))
+**Elicitation does not work for every client.** It needs one that declared the
+capability, *and* a negotiated protocol older than `2026-07-28` — from that
+version the spec ([SEP-2322](https://blog.modelcontextprotocol.io/posts/2026-07-28/))
 forbids a server from opening an elicitation on its own and requires the question
 to be embedded in the result of a call the client itself made. A worker's
 permission request does not arrive during such a call, so there is nothing to
 attach it to.
 
-When it cannot engage, behaviour is exactly what it was before — the operator's
-pre-approved list decides — and `agent_diagnose` says so in as many words:
+So there is a second route, and it works everywhere. The request is **parked**
+against the task and the worker waits. The task's snapshot carries
+`pending_permission`, the transcript gets a `⏸ WAITING FOR PERMISSION` line —
+which is what wakes `agent_watch` and what the board polls for — and the
+orchestrating model, which is talking to the same person anyway, relays it:
 
 ```
-ask to run  : no — MCP 2026-07-28 no longer lets a server open an elicitation on its own (SEP-2322) …
-              A tool that is neither pre-approved nor denied will stall instead of asking;
-              pre-approve what tasks need with CLI_AGENT_MCP_ALLOWED_TOOLS or allowed_tools.
+⏸ WAITING FOR PERMISSION — task-1-273a2… wants to use Bash: mkdir -p out && echo ok > out/f.txt
+   Answer with agent_answer_permission (task_id=task-1-273a2586, allow=true|false)
 ```
+
+The worker blocking is the point rather than a cost: it turns "the agent
+couldn't do that" into "the agent is waiting for you". `agent_answer_permission`
+releases it. An unanswered request times out into a refusal after
+`CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS`, so an unattended run still finishes.
+
+### Granting a permission for good
+
+Answer with `remember: true` and the permission is recorded in the state
+directory and handed to the agent as a pre-approved tool on every future run —
+so the worker never reaches the point of asking again:
+
+```
+Allowed Bash for task task-1-db4624be. The worker has resumed.
+Bash running mkdir is now pre-approved for every future task.
+```
+
+Grants are deliberately coarse: *the tool, plus the program being run*.
+"PowerShell running docker" is something you can still reason about a week later
+and revoke on purpose; a hash of an exact command line is not, and would ask
+again the moment a flag changed. `agent_list_permissions` shows what has been
+granted and what is waiting; `agent_revoke_permission` takes one back.
+
+Asking twice is the fastest way to train someone into approving everything
+without reading it, which is why the remembered answer is applied before anyone
+is bothered.
 
 ## One server, several clients
 
