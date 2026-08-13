@@ -7,10 +7,10 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/agent"
-	"github.com/andresh0816/cli-agent-mcp/internal/config"
-	"github.com/andresh0816/cli-agent-mcp/internal/task"
-	"github.com/andresh0816/cli-agent-mcp/internal/ui"
+	"github.com/Bytars/cli-agent-mcp/internal/agent"
+	"github.com/Bytars/cli-agent-mcp/internal/config"
+	"github.com/Bytars/cli-agent-mcp/internal/task"
+	"github.com/Bytars/cli-agent-mcp/internal/ui"
 )
 
 // connect stands up the real server over an in-memory transport, so these tests

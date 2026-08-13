@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/agent"
-	"github.com/andresh0816/cli-agent-mcp/internal/state"
+	"github.com/Bytars/cli-agent-mcp/internal/agent"
+	"github.com/Bytars/cli-agent-mcp/internal/state"
 )
 
 // The incident this exists for: a second server instance came up with an empty

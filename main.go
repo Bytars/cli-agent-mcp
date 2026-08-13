@@ -23,12 +23,13 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/agent"
-	"github.com/andresh0816/cli-agent-mcp/internal/audit"
-	"github.com/andresh0816/cli-agent-mcp/internal/config"
-	"github.com/andresh0816/cli-agent-mcp/internal/state"
-	"github.com/andresh0816/cli-agent-mcp/internal/task"
-	"github.com/andresh0816/cli-agent-mcp/internal/ui"
+	"github.com/Bytars/cli-agent-mcp/internal/agent"
+	"github.com/Bytars/cli-agent-mcp/internal/audit"
+	"github.com/Bytars/cli-agent-mcp/internal/config"
+	"github.com/Bytars/cli-agent-mcp/internal/inspect"
+	"github.com/Bytars/cli-agent-mcp/internal/state"
+	"github.com/Bytars/cli-agent-mcp/internal/task"
+	"github.com/Bytars/cli-agent-mcp/internal/ui"
 )
 
 // instanceWarning is set once during startup, before the server begins serving,
@@ -56,6 +57,15 @@ func main() {
 		case "--help", "-h", "help":
 			printHelp()
 			return
+		case "tasks", "logs", "ui":
+			// Read-only viewers over the task store. They are a separate process
+			// from the server and never touch it: everything a task produces is
+			// already on disk while it is producing it, so watching a run live
+			// only needs a reader. See internal/inspect.
+			log.SetOutput(os.Stderr)
+			log.SetPrefix("cli-agent-mcp: ")
+			log.SetFlags(0)
+			os.Exit(inspect.Run(os.Args[1:]))
 		case "--list-agents":
 			// Handled further down, once the registry exists.
 		default:
@@ -183,6 +193,7 @@ BACKGROUND MODE (a tracked task you watch):
 
 SHOWING THE USER WHERE THINGS STAND:
 - agent_task_board — opens a live panel listing every task with its status, elapsed time and output, which keeps refreshing on its own and can cancel a running task. Progress notifications only exist while a call is in flight, so a backgrounded task is invisible once agent_start_task returns; the board is what fixes that. Call it right after agent_start_task, and whenever the user asks how their tasks are going.
+- Outside this conversation the user can watch the same tasks themselves, from a terminal: ` + "`cli-agent-mcp tasks`" + ` lists them; ` + "`cli-agent-mcp logs <id>`" + ` (or with no id, for a picker) follows one live; ` + "`cli-agent-mcp logs --all`" + ` follows every running task at once; ` + "`cli-agent-mcp ui`" + ` opens a local web viewer. Mention this if the board does not render in their host, or if they want to follow a task without keeping this chat open. Those viewers are read-only — cancelling still goes through agent_cancel_task.
 
 Also: agent_task_status / agent_get_output (poll/read on demand), agent_list_tasks, agent_list_agents.
 
@@ -787,7 +798,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_diagnose",
-		Description: "Diagnostica la cadena de ejecución: identidad de paquete del proceso (MSIX en Windows), si el spawn de procesos hijos funciona, y cómo resuelve cada agente su binario. Usar cuando un agente falla sin explicación o con exit code sin salida.",
+		Description: "Diagnose the execution chain: the process's package identity (MSIX on Windows), whether spawning child processes works, and how each agent resolves its binary. Use when an agent fails with no explanation, or with an exit code but no output.",
 		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, agent.DiagnosticReport, error) {
 		rep := agent.Diagnose(ctx, reg)
@@ -876,6 +887,11 @@ background worker, with live progress streaming.
 
 Usage:
   cli-agent-mcp                 Run the MCP server over stdio (how an MCP client launches it).
+  cli-agent-mcp tasks           List delegated tasks and their status, then exit.
+  cli-agent-mcp logs [TASK]     Follow a task's output live in the terminal. Without
+                                TASK it shows a picker; --all follows every running
+                                task at once.
+  cli-agent-mcp ui              Serve a local web viewer of tasks and live logs.
   cli-agent-mcp --list-agents   Print detected agents and availability, then exit.
   cli-agent-mcp --version       Print version.
   cli-agent-mcp --help          This help.

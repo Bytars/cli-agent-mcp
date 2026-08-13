@@ -1,9 +1,9 @@
 # cli-agent-mcp
 
-[![ci](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/ci.yml)
-[![release](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/andresh0816/cli-agent-mcp/actions/workflows/release.yml)
-[![latest release](https://img.shields.io/github/v/release/andresh0816/cli-agent-mcp?sort=semver)](https://github.com/andresh0816/cli-agent-mcp/releases/latest)
-[![Go Reference](https://pkg.go.dev/badge/github.com/andresh0816/cli-agent-mcp.svg)](https://pkg.go.dev/github.com/andresh0816/cli-agent-mcp)
+[![ci](https://github.com/Bytars/cli-agent-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Bytars/cli-agent-mcp/actions/workflows/ci.yml)
+[![release](https://github.com/Bytars/cli-agent-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/Bytars/cli-agent-mcp/actions/workflows/release.yml)
+[![latest release](https://img.shields.io/github/v/release/Bytars/cli-agent-mcp?sort=semver)](https://github.com/Bytars/cli-agent-mcp/releases/latest)
+[![Go Reference](https://pkg.go.dev/badge/github.com/Bytars/cli-agent-mcp.svg)](https://pkg.go.dev/github.com/Bytars/cli-agent-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A single-binary **MCP (Model Context Protocol) stdio server** that lets an MCP
@@ -122,6 +122,81 @@ of hosts negotiating the capability but not rendering the iframe. If the panel
 never appears, that is why: you get the text listing, and `agent_watch` stays the
 reliable way to follow a task live.
 
+## Watching from outside the client — `logs` and `ui`
+
+The board lives inside the conversation, so it depends on the host rendering it
+and on you having that conversation open. Sometimes you just want a terminal
+that shows what the worker is doing right now.
+
+Everything a task produces is already on disk *while* it is producing it: one
+JSON record per task, rewritten at every transition, and a transcript appended
+line by line. So the same binary can act as a **read-only viewer** in a second
+process — nothing to configure in the server, no port for it to open, and no way
+for the viewer to disturb a run in flight.
+
+```bash
+cli-agent-mcp tasks
+```
+
+```
+state: C:\Users\you\AppData\Roaming\cli-agent-mcp
+server running: pid 24188 since 09:41:02
+
+  #  ID                STATUS     AGENT         TIME    LINES  PROMPT
+  1  task-12-9f3a1c04  running    claude       2m14s      412  migrate the auth module to the new client
+  2  task-11-4b8e0d21  done       claude       8m02s     1893  run the integration suite and fix what breaks
+  3  task-10-71ac33f0  failed     cursor         47s       88  bump the pinned deps
+```
+
+Then follow one:
+
+```bash
+cli-agent-mcp logs task-12
+```
+
+`logs` takes a full id, any unambiguous fragment of one, `latest`, or `running`.
+Run it with no argument in an interactive terminal and it lists the tasks and
+asks which one — pick a number, and it tails from there. It prints the last 200
+lines for context and then follows live, stopping on its own when the task
+settles.
+
+| flag | what it does |
+| --- | --- |
+| `--all` | follow **every** running task at once, each line tagged with its task; picks up tasks that start later |
+| `-n N` | how many previous lines to show first (`0` = only new, `-1` = the whole transcript) |
+| `--raw` | the agent's own JSONL instead of the compact rendering |
+| `-f` | keep following even after the task finishes (Ctrl-C to stop) |
+| `--no-follow` | print what is there and exit — exits non-zero if the task failed, so it composes in scripts |
+| `--agent NAME` | limit the picker and `--all` to one agent |
+
+And the same thing in a browser, if you would rather click than type:
+
+```bash
+cli-agent-mcp ui --open
+```
+
+Tasks on the left (filter by text, or show only what is running), the selected
+task's log streaming on the right, a raw/compact toggle, and follow-the-tail that
+disarms when you scroll up to read and re-arms when you scroll back down. It
+polls once a second while something runs and asks only for the lines it has not
+seen yet.
+
+It binds to `127.0.0.1:7788` by default. `--host` accepts anything, but a
+transcript contains everything the worker saw and did — prompts, file contents,
+command output — and the viewer has no authentication, so binding it off
+loopback requires `--allow-remote` as well. That refusal is the point: make it a
+decision, not an accident.
+
+**Both viewers are strictly read-only.** Cancelling a task means killing the
+worker's process tree, which only the server process that owns it can do — so
+that stays with `agent_cancel_task` and the board's cancel button.
+
+**One caveat worth knowing.** The viewer reads the same state directory the
+server writes. If your MCP client launches the server with
+`CLI_AGENT_MCP_STATE_DIR` set and your shell doesn't have it, you are looking at
+a different (probably empty) directory. That is why every command prints the
+path it is reading at the top — pass `--state-dir` to point it at the right one.
+
 ## Following a long task without getting cut off
 
 Clients cap how long they will wait on a tool call — Claude Desktop at 60
@@ -185,7 +260,7 @@ elsewhere, unless `CLI_AGENT_MCP_STATE_DIR` says otherwise.
 ### Download a binary (recommended)
 
 Grab a prebuilt binary from the
-[**Releases**](https://github.com/andresh0816/cli-agent-mcp/releases/latest) page.
+[**Releases**](https://github.com/Bytars/cli-agent-mcp/releases/latest) page.
 The assets are raw binaries — no unzip needed.
 
 | Platform | Asset |
@@ -203,13 +278,13 @@ macOS/Linux remember to `chmod +x` the downloaded file.
 ### With Go
 
 ```bash
-go install github.com/andresh0816/cli-agent-mcp@latest
+go install github.com/Bytars/cli-agent-mcp@latest
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/andresh0816/cli-agent-mcp
+git clone https://github.com/Bytars/cli-agent-mcp
 cd cli-agent-mcp
 go build -o cli-agent-mcp .
 ```
@@ -624,7 +699,7 @@ be run manually from the Actions tab against an existing tag.
 ## Project layout
 
 ```
-main.go                     entry point, MCP tool wiring, __mock subcommand
+main.go                     entry point, MCP tool wiring, viewer subcommands, __mock
 internal/config/            env-var configuration
 internal/agent/
   adapter.go                Adapter interface + registry + exec helper
@@ -641,12 +716,19 @@ internal/task/
 internal/audit/audit.go     append-only JSONL audit trail
 internal/state/
   state.go                  durable task records + the instance PID lock
+  follow.go                 read-only tail of a transcript another process writes
   alive_windows.go          is that PID still running? (Windows)
   alive_other.go            is that PID still running? (Unix)
 internal/task/persist.go    saving tasks and restoring a previous process's
+internal/task/render.go     one definition of the compact transcript rendering
 internal/ui/
   ui.go                     MCP Apps wiring (capability, ui:// resource, tool _meta)
   board.html                the task board view, self-contained (deny-by-default CSP)
+internal/inspect/           read-only viewers, out of process
+  source.go                 the shared reader over the state directory
+  cli.go                    `tasks` and `logs` (picker, live tail, --all)
+  web.go                    `ui`: local HTTP server + JSON API
+  live.html                 the web viewer, self-contained
 cmd/smoketest/              end-to-end test via the MCP client
 ```
 

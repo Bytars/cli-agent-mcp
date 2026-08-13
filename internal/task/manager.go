@@ -23,9 +23,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/andresh0816/cli-agent-mcp/internal/agent"
-	"github.com/andresh0816/cli-agent-mcp/internal/audit"
-	"github.com/andresh0816/cli-agent-mcp/internal/state"
+	"github.com/Bytars/cli-agent-mcp/internal/agent"
+	"github.com/Bytars/cli-agent-mcp/internal/audit"
+	"github.com/Bytars/cli-agent-mcp/internal/state"
 )
 
 // Status is the lifecycle state of a task's most recent turn.

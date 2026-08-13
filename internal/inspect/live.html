@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents · cli-agent-mcp</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #1c1d1f; --muted: #6b7280; --line: #e5e7eb;
+    --card: #fafafa; --card-hover: #f3f4f6; --sel: #e8eefc;
+    --running: #2563eb; --done: #15803d; --failed: #dc2626; --canceled: #9ca3af;
+    --code-bg: #f6f7f9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1b1b1d; --fg: #e8e8ea; --muted: #9ca3af; --line: #34343a;
+      --card: #232326; --card-hover: #2b2b30; --sel: #2a3350;
+      --running: #60a5fa; --done: #4ade80; --failed: #f87171; --canceled: #7c7c85;
+      --code-bg: #171719;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.45 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  .sub { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .live { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--running); animation: pulse 1.6s ease-in-out infinite; }
+  .pulse.idle { background: var(--canceled); animation: none; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+  main { flex: 1 1 auto; display: flex; min-height: 0; }
+  aside {
+    width: 340px; flex: 0 0 340px; border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .filters { padding: 8px 10px; border-bottom: 1px solid var(--line); display: flex; gap: 6px; flex-wrap: wrap; }
+  input[type=search] {
+    flex: 1 1 120px; min-width: 0; font: inherit; font-size: 12px; padding: 4px 8px;
+    border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg);
+  }
+  .list { overflow-y: auto; flex: 1 1 auto; }
+  .item { padding: 8px 10px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .item:hover { background: var(--card-hover); }
+  .item.sel { background: var(--sel); }
+  .item .top { display: flex; align-items: center; gap: 7px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--canceled); }
+  .dot.running { background: var(--running); animation: pulse 1.6s ease-in-out infinite; }
+  .dot.done { background: var(--done); }
+  .dot.failed { background: var(--failed); }
+  .prompt { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .meta { color: var(--muted); font-size: 11px; white-space: nowrap; flex: 0 0 auto; }
+  .item .bottom { display: flex; gap: 6px; margin-top: 3px; color: var(--muted); font-size: 11px; }
+
+  section { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .id { font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace; font-size: 12px; }
+  button {
+    font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 6px;
+    border: 1px solid var(--line); background: transparent; color: var(--fg); cursor: pointer;
+  }
+  button:hover { background: var(--card-hover); }
+  button.on { background: var(--sel); border-color: var(--running); }
+  pre {
+    margin: 0; padding: 10px 12px; background: var(--code-bg); flex: 1 1 auto; overflow: auto;
+    font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+    font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+  .empty { color: var(--muted); padding: 30px 14px; text-align: center; }
+  .err { color: var(--failed); font-size: 12px; padding: 6px 12px; white-space: pre-wrap; }
+  .badge { font-size: 11px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); }
+  @media (max-width: 720px) {
+    main { flex-direction: column; }
+    aside { width: auto; flex: 0 0 auto; max-height: 40vh; border-right: none; border-bottom: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agents</h1>
+  <span class="sub" id="dir"></span>
+  <span class="live"><span class="pulse idle" id="pulse"></span><span id="livetext">loading…</span></span>
+</header>
+
+<main>
+  <aside>
+    <div class="filters">
+      <input type="search" id="q" placeholder="filter by prompt, agent or id" autocomplete="off">
+      <button id="onlyRunning">running only</button>
+    </div>
+    <div class="list" id="list"><div class="empty">loading…</div></div>
+  </aside>
+
+  <section>
+    <div class="bar" id="bar"><span class="meta">pick a task on the left</span></div>
+    <div class="err" id="err" hidden></div>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  var el = function (id) { return document.getElementById(id); };
+  var listEl = el("list"), logEl = el("log"), barEl = el("bar"), errEl = el("err");
+  var pulseEl = el("pulse"), liveEl = el("livetext"), dirEl = el("dir");
+  var qEl = el("q"), onlyRunningEl = el("onlyRunning");
+
+  var tasks = [];          // newest first, as served
+  var selected = null;     // task id
+  var cursor = 0;          // next raw line index to request for the selected task
+  var raw = false;         // show the agent's own JSONL instead of the compact view
+  var stick = true;        // keep the log pinned to the bottom
+  var onlyRunning = false;
+  var query = "";
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  function elapsed(t) {
+    var start = Date.parse(t.started_at);
+    if (isNaN(start)) return "";
+    var end = t.ended_at ? Date.parse(t.ended_at) : Date.now();
+    if (isNaN(end)) end = Date.now();
+    var s = Math.max(0, Math.round((end - start) / 1000));
+    if (s < 60) return s + "s";
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + "m " + (s % 60) + "s";
+    return Math.floor(m / 60) + "h " + (m % 60) + "m";
+  }
+
+  function lastPrompt(t) {
+    return (t.prompts && t.prompts.length) ? t.prompts[t.prompts.length - 1] : "(no prompt)";
+  }
+
+  function firstLine(s) {
+    var i = String(s).search(/[\r\n]/);
+    return i < 0 ? String(s) : String(s).slice(0, i);
+  }
+
+  function visible() {
+    return tasks.filter(function (t) {
+      if (onlyRunning && t.status !== "running") return false;
+      if (!query) return true;
+      var hay = (t.task_id + " " + t.agent + " " + lastPrompt(t) + " " + (t.cwd || "")).toLowerCase();
+      return hay.indexOf(query) >= 0;
+    });
+  }
+
+  function renderList() {
+    var rows = visible();
+    if (!rows.length) {
+      listEl.innerHTML = '<div class="empty">' + (tasks.length ? "nothing matches" : "no tasks yet") + "</div>";
+      return;
+    }
+    listEl.innerHTML = rows.map(function (t) {
+      return (
+        '<div class="item' + (t.task_id === selected ? " sel" : "") + '" data-id="' + esc(t.task_id) + '">' +
+          '<div class="top">' +
+            '<span class="dot ' + esc(t.status) + '"></span>' +
+            '<span class="prompt">' + esc(firstLine(lastPrompt(t))) + "</span>" +
+            '<span class="meta">' + esc(elapsed(t)) + "</span>" +
+          "</div>" +
+          '<div class="bottom">' +
+            "<span>" + esc(t.agent) + "</span><span>·</span>" +
+            "<span>" + esc(t.status) + "</span><span>·</span>" +
+            "<span>" + t.total_output_lines + " lines</span>" +
+          "</div>" +
+        "</div>"
+      );
+    }).join("");
+
+    Array.prototype.forEach.call(listEl.querySelectorAll("[data-id]"), function (node) {
+      node.addEventListener("click", function () { select(node.getAttribute("data-id")); });
+    });
+  }
+
+  function current() {
+    for (var i = 0; i < tasks.length; i++) if (tasks[i].task_id === selected) return tasks[i];
+    return null;
+  }
+
+  function renderBar() {
+    var t = current();
+    if (!t) {
+      barEl.innerHTML = '<span class="meta">pick a task on the left</span>';
+      return;
+    }
+    barEl.innerHTML =
+      '<span class="dot ' + esc(t.status) + '"></span>' +
+      '<span class="id">' + esc(t.task_id) + "</span>" +
+      '<span class="badge">' + esc(t.agent) + "</span>" +
+      '<span class="meta">' + esc(t.status) + " · " + esc(elapsed(t)) + " · " +
+        t.total_output_lines + " lines · " + t.turns + (t.turns === 1 ? " turn" : " turns") + "</span>" +
+      '<span class="meta" style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(t.cwd || "") + "</span>" +
+      '<button id="btnRaw" class="' + (raw ? "on" : "") + '">raw</button>' +
+      '<button id="btnStick" class="' + (stick ? "on" : "") + '">follow</button>';
+
+    el("btnRaw").addEventListener("click", function () {
+      // The line indices are the same in both modes, but the text is not, so the
+      // transcript has to be re-rendered from the start rather than appended to.
+      raw = !raw;
+      reloadLog();
+      renderBar();
+    });
+    el("btnStick").addEventListener("click", function () {
+      stick = !stick;
+      if (stick) logEl.scrollTop = logEl.scrollHeight;
+      renderBar();
+    });
+
+    if (t.error) {
+      errEl.hidden = false;
+      errEl.textContent = t.error;
+    } else {
+      errEl.hidden = true;
+    }
+  }
+
+  function select(id) {
+    if (selected === id) return;
+    selected = id;
+    reloadLog();
+    renderList();
+    renderBar();
+  }
+
+  function reloadLog() {
+    cursor = 0;
+    stick = true;
+    logEl.textContent = "";
+    if (selected) fetchLog();
+  }
+
+  var logBusy = false;
+
+  function fetchLog() {
+    if (!selected || logBusy) return Promise.resolve();
+    logBusy = true;
+    var id = selected;
+    var url = "api/log?id=" + encodeURIComponent(id) + "&since=" + cursor + (raw ? "&raw=1" : "");
+    return fetch(url, { cache: "no-store" })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        if (id !== selected) return;             // the user moved on mid-flight
+        if (!res.ok) throw new Error(res.body && res.body.error || "could not read the log");
+        cursor = res.body.total;
+        if (res.body.lines && res.body.lines.length) {
+          var atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+          logEl.textContent += res.body.lines.join("\n") + "\n";
+          if (stick || atBottom) logEl.scrollTop = logEl.scrollHeight;
+        }
+      })
+      .catch(function (e) {
+        errEl.hidden = false;
+        errEl.textContent = e.message;
+      })
+      .then(function () { logBusy = false; });
+  }
+
+  function fetchTasks() {
+    return fetch("api/tasks", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (body) {
+        if (body.error) throw new Error(body.error);
+        tasks = body.tasks || [];
+        dirEl.textContent = body.dir + (body.owner ? "  ·  server pid " + body.owner.pid : "  ·  no server running");
+        var running = tasks.filter(function (t) { return t.status === "running"; }).length;
+        pulseEl.className = running ? "pulse" : "pulse idle";
+        liveEl.textContent = running ? running + " running" : "up to date";
+        if (selected && !current()) {
+          // The task was pruned out from under us.
+          selected = null;
+          logEl.textContent = "";
+        }
+        renderList();
+        renderBar();
+      })
+      .catch(function (e) {
+        pulseEl.className = "pulse idle";
+        liveEl.textContent = e.message;
+      });
+  }
+
+  // Poll fast while something is running and slowly once everything has settled;
+  // the log only re-requests what it has not seen, so a quiet task costs one
+  // small round-trip.
+  function loop() {
+    if (document.hidden) { setTimeout(loop, 2000); return; }
+    var t = current();
+    var busy = tasks.some(function (x) { return x.status === "running"; });
+    // Also fetch when the record already has more lines than we have read: a
+    // task can flip to "done" between two polls, and stopping on the status
+    // alone would silently drop the last lines — the ones being waited for.
+    var behind = t && (t.status === "running" || cursor < t.total_output_lines);
+    Promise.all([fetchTasks(), behind ? fetchLog() : Promise.resolve()])
+      .then(function () { setTimeout(loop, busy ? 1000 : 5000); });
+  }
+
+  qEl.addEventListener("input", function () {
+    query = qEl.value.trim().toLowerCase();
+    renderList();
+  });
+  onlyRunningEl.addEventListener("click", function () {
+    onlyRunning = !onlyRunning;
+    onlyRunningEl.className = onlyRunning ? "on" : "";
+    renderList();
+  });
+  logEl.addEventListener("scroll", function () {
+    // Scrolling up means "let me read"; scrolling back to the bottom re-arms
+    // the follow, which is what every log viewer trains people to expect.
+    var atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+    if (stick !== atBottom) { stick = atBottom; renderBar(); }
+  });
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) { fetchTasks(); fetchLog(); }
+  });
+
+  fetchTasks().then(function () {
+    // Open the most interesting task on arrival: whatever is running, else the
+    // most recent one. Landing on an empty pane would waste the first click.
+    var first = tasks.filter(function (t) { return t.status === "running"; })[0] || tasks[0];
+    if (first) select(first.task_id);
+    loop();
+  });
+})();
+</script>
+</body>
+</html>

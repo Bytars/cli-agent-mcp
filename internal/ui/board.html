@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Tareas del agente</title>
+<title>Agent tasks</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -90,12 +90,12 @@
 </head>
 <body>
 <header>
-  <h1>Tareas del agente</h1>
+  <h1>Agent tasks</h1>
   <span class="count" id="count"></span>
-  <span class="live"><span class="pulse idle" id="pulse"></span><span id="livetext">conectando…</span></span>
+  <span class="live"><span class="pulse idle" id="pulse"></span><span id="livetext">connecting…</span></span>
 </header>
 <div id="banner"></div>
-<div id="list"><div class="empty">Cargando…</div></div>
+<div id="list"><div class="empty">Loading…</div></div>
 
 <script>
 (function () {
@@ -115,7 +115,7 @@
       setTimeout(function () {
         if (pending.has(id)) {
           pending.delete(id);
-          reject(new Error("sin respuesta del host: " + method));
+          reject(new Error("no response from host: " + method));
         }
       }, 30000);
     });
@@ -133,7 +133,7 @@
       var p = pending.get(m.id);
       if (!p) return;
       pending.delete(m.id);
-      if (m.error) p.reject(new Error(m.error.message || "error RPC"));
+      if (m.error) p.reject(new Error(m.error.message || "RPC error"));
       else p.resolve(m.result);
       return;
     }
@@ -222,9 +222,9 @@
         role: "user",
         content: {
           type: "text",
-          text: "La tarea " + t.task_id + " (" + t.agent + ") terminó con estado \"" + t.status + "\"." +
-            (prompt ? " Era: " + prompt + "." : "") +
-            " Lee su salida con agent_get_output y cuéntame cómo fue."
+          text: "Task " + t.task_id + " (" + t.agent + ") finished with status \"" + t.status + "\"." +
+            (prompt ? " It was: " + prompt + "." : "") +
+            " Read its output with agent_get_output and tell me how it went."
         }
       }).catch(function () {
         // Hosts may withhold ui/message. Losing the announcement is acceptable;
@@ -239,18 +239,18 @@
     var running = lastTasks.filter(function (t) { return t.status === "running"; }).length;
 
     countEl.textContent = lastTasks.length
-      ? lastTasks.length + " tarea" + (lastTasks.length === 1 ? "" : "s") +
-        (running ? " · " + running + " en curso" : "")
+      ? lastTasks.length + " task" + (lastTasks.length === 1 ? "" : "s") +
+        (running ? " · " + running + " running" : "")
       : "";
 
     if (!lastTasks.length) {
-      listEl.innerHTML = '<div class="empty">Todavía no hay tareas.</div>';
+      listEl.innerHTML = '<div class="empty">No tasks yet.</div>';
       return;
     }
 
     listEl.innerHTML = lastTasks.map(function (t) {
       var open = expanded.has(t.task_id);
-      var prompt = (t.prompts && t.prompts.length) ? t.prompts[t.prompts.length - 1] : "(sin prompt)";
+      var prompt = (t.prompts && t.prompts.length) ? t.prompts[t.prompts.length - 1] : "(no prompt)";
       var out = outputs.get(t.task_id);
 
       var body = "";
@@ -260,14 +260,14 @@
             (t.error ? '<div class="err">' + esc(t.error) + "</div>" : "") +
             '<div class="row">' +
               '<span class="id">' + esc(t.task_id) + "</span>" +
-              '<span class="meta">' + esc(statusLabel(t)) + " · " + t.total_output_lines + " líneas · " +
-                t.turns + " turno" + (t.turns === 1 ? "" : "s") + "</span>" +
+              '<span class="meta">' + esc(statusLabel(t)) + " · " + t.total_output_lines + " lines · " +
+                t.turns + " turn" + (t.turns === 1 ? "" : "s") + "</span>" +
               (t.status === "running"
-                ? '<button class="danger" data-cancel="' + esc(t.task_id) + '">Cancelar</button>'
+                ? '<button class="danger" data-cancel="' + esc(t.task_id) + '">Cancel</button>'
                 : "") +
             "</div>" +
             '<div class="row"><span class="cwd">' + esc(t.cwd) + "</span></div>" +
-            "<pre>" + esc(out === undefined ? "cargando…" : (out || "(sin salida todavía)")) + "</pre>" +
+            "<pre>" + esc(out === undefined ? "loading…" : (out || "(no output yet)")) + "</pre>" +
           "</div>";
       }
 
@@ -303,7 +303,7 @@
       el.addEventListener("click", function (ev) {
         ev.stopPropagation();
         el.disabled = true;
-        el.textContent = "Cancelando…";
+        el.textContent = "Cancelling…";
         callTool("agent_cancel_task", { task_id: el.getAttribute("data-cancel") })
           .then(refresh)
           .catch(fail);
@@ -325,7 +325,7 @@
         render(lastTasks);
       })
       .catch(function (e) {
-        outputs.set(id, "no se pudo leer la salida: " + e.message);
+        outputs.set(id, "could not read the output: " + e.message);
         render(lastTasks);
       });
   }
@@ -347,7 +347,7 @@
         render((sc && sc.tasks) || []);
         var anyRunning = lastTasks.some(function (t) { return t.status === "running"; });
         pulseEl.className = anyRunning ? "pulse" : "pulse idle";
-        liveEl.textContent = anyRunning ? "en vivo" : "al día";
+        liveEl.textContent = anyRunning ? "live" : "up to date";
         return Promise.all(Array.from(expanded).map(fetchOutput));
       })
       .catch(fail)
