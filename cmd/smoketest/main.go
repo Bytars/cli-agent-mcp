@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Command smoketest drives the built cli-agent-mcp server over stdio using the
 // MCP client, exercising the full delegate → poll → read pipeline against the
 // built-in "mock" agent. It needs no Claude Code or Cursor install.

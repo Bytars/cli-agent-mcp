@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package task runs CLI-agent turns as background jobs and tracks their state.
 //
 // A Task owns one agent *session*: the first turn starts it, and follow-up

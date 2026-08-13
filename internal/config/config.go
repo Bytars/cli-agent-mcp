@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package config holds runtime configuration for the CLI-agent MCP server.
 //
 // All settings are read from environment variables so the server can be

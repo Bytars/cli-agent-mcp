@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package state persists what the server knows across process lifetimes.
 //
 // The task registry used to live only in RAM. That was fine as long as there

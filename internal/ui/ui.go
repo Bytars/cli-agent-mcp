@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package ui serves the interactive task board that hosts render inside the
 // conversation.
 //

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package audit writes a structured, append-only JSONL trail of what the server
 // asked the worker agents to do: which tasks started, the exact command lines
 // executed, the tools the worker invoked, and how each turn ended.

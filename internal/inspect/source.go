@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package inspect reads the task store from outside the server process.
 //
 // Everything the server knows already lands on disk as it happens: one JSON

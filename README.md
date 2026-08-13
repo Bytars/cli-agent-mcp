@@ -4,7 +4,7 @@
 [![release](https://github.com/Bytars/cli-agent-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/Bytars/cli-agent-mcp/actions/workflows/release.yml)
 [![latest release](https://img.shields.io/github/v/release/Bytars/cli-agent-mcp?sort=semver)](https://github.com/Bytars/cli-agent-mcp/releases/latest)
 [![Go Reference](https://pkg.go.dev/badge/github.com/Bytars/cli-agent-mcp.svg)](https://pkg.go.dev/github.com/Bytars/cli-agent-mcp)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
 A single-binary **MCP (Model Context Protocol) stdio server** that lets an MCP
 client — such as **Claude Desktop** — drive a **local headless CLI coding agent**
@@ -738,4 +738,6 @@ Issues and PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE)
+[Apache-2.0](./LICENSE). Anything built on this has to keep the
+[`NOTICE`](NOTICE) file with it (§4(d)), and §6 grants no rights in the Bytars
+name or marks.

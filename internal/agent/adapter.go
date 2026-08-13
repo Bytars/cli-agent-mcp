@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package agent defines the pluggable adapter interface that lets the MCP
 // server drive different headless CLI coding agents (Claude Code, Cursor, or any
 // tool configured through CustomAdapter) through one uniform surface.

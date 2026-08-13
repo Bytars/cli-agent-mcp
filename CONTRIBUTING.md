@@ -78,6 +78,13 @@ Include:
 - the relevant server log (it goes to **stderr**; stdout is the MCP wire),
 - and the task transcript from `agent_get_output` if you have it.
 
+## Licensing of contributions
+
+This project is licensed under [Apache-2.0](./LICENSE), and contributions come in
+under those same terms — inbound equals outbound. By opening a pull request you
+certify that you wrote the change, or otherwise have the right to submit it under
+that licence. There is no CLA to sign.
+
 ## Code of conduct
 
 Be respectful and constructive. That's it.

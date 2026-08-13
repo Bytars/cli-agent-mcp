@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Command cli-agent-mcp is a Model Context Protocol server that lets an
 // orchestrating client (e.g. Claude Desktop) drive a local headless CLI coding
 // agent — Claude Code, Cursor, or any tool you configure — as a background
