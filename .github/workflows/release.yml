@@ -67,6 +67,11 @@ jobs:
           name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # LICENSE and NOTICE ride along with every release: Apache-2.0 §4
+          # requires anyone redistributing these binaries to carry them, and
+          # fail_on_unmatched_files means a release cannot go out without them.
           files: |
             dist/cli-agent-mcp_*
             dist/checksums.txt
+            LICENSE
+            NOTICE
