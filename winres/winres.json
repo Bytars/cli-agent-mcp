@@ -1,0 +1,53 @@
+{
+  "RT_MANIFEST": {
+    "#1": {
+      "0409": {
+        "identity": {
+          "name": "com.bytars.cli-agent-mcp",
+          "version": ""
+        },
+        "description": "MCP server that drives a local headless CLI coding agent.",
+        "minimum-os": "win7",
+        "execution-level": "as invoker",
+        "ui-access": false,
+        "auto-elevate": false,
+        "dpi-awareness": "unaware",
+        "disable-theming": false,
+        "disable-window-filtering": false,
+        "high-resolution-scrolling-aware": false,
+        "ultra-high-resolution-scrolling-aware": false,
+        "long-path-aware": true,
+        "printer-driver-isolation": false,
+        "gdi-scaling": false,
+        "segment-heap": false,
+        "use-common-controls-v6": false
+      }
+    }
+  },
+  "RT_VERSION": {
+    "#1": {
+      "0000": {
+        "fixed": {
+          "file_version": "0.0.0.0",
+          "product_version": "0.0.0.0"
+        },
+        "info": {
+          "0409": {
+            "Comments": "https://github.com/Bytars/cli-agent-mcp",
+            "CompanyName": "Bytars",
+            "FileDescription": "cli-agent-mcp — MCP server driving a local headless CLI coding agent",
+            "FileVersion": "0.0.0.0",
+            "InternalName": "cli-agent-mcp",
+            "LegalCopyright": "Copyright 2026 Bytars. Licensed under the Apache License, Version 2.0.",
+            "LegalTrademarks": "",
+            "OriginalFilename": "cli-agent-mcp.exe",
+            "PrivateBuild": "",
+            "ProductName": "cli-agent-mcp",
+            "ProductVersion": "0.0.0.0",
+            "SpecialBuild": ""
+          }
+        }
+      }
+    }
+  }
+}

@@ -9,6 +9,11 @@
 /cli-agent-mcp
 /dist/
 
+# Windows resource objects, generated from winres/winres.json at build time.
+# Not committed: they carry the release version, so a checked-in copy would go
+# stale the moment the next tag is cut.
+*.syso
+
 # Test binaries / coverage
 *.test
 *.out

@@ -257,7 +257,17 @@ elsewhere, unless `CLI_AGENT_MCP_STATE_DIR` says otherwise.
 
 ## Install
 
-### Download a binary (recommended)
+### With Go (recommended)
+
+```bash
+go install github.com/Bytars/cli-agent-mcp@latest
+```
+
+It compiles on your machine, so nothing arrives as a downloaded executable and
+neither SmartScreen nor Gatekeeper has anything to object to. The binary lands in
+`$(go env GOPATH)/bin`.
+
+### Download a binary
 
 Grab a prebuilt binary from the
 [**Releases**](https://github.com/Bytars/cli-agent-mcp/releases/latest) page.
@@ -272,14 +282,28 @@ The assets are raw binaries — no unzip needed.
 | Linux (x64) | `cli-agent-mcp_linux_amd64` |
 | Linux (ARM) | `cli-agent-mcp_linux_arm64` |
 
-`checksums.txt` (SHA-256) is attached to every release to verify the download. On
-macOS/Linux remember to `chmod +x` the downloaded file.
+`checksums.txt` (SHA-256) is attached to every release. On macOS/Linux remember to
+`chmod +x` the downloaded file.
 
-### With Go
+#### About the browser warning
+
+Chrome and Edge will say the file *"isn't commonly downloaded"*, and Windows may
+add an *"unknown publisher"* prompt. That is a **reputation** signal, not a malware
+verdict: these binaries are not code-signed, and every release is a brand new file
+that almost nobody has downloaded yet. A code signing certificate is what carries
+reputation from one release to the next, and this project does not have one.
+
+You do not have to take that on faith. Every release is built by
+[a public workflow](.github/workflows/release.yml) from a public commit, and
+carries a signed provenance attestation:
 
 ```bash
-go install github.com/Bytars/cli-agent-mcp@latest
+gh attest verify cli-agent-mcp_windows_amd64.exe --repo Bytars/cli-agent-mcp
 ```
+
+That proves which commit and which workflow run produced the exact file on your
+disk — a stronger guarantee than a signature alone. Check it against
+`checksums.txt` too, or sidestep the question entirely with `go install` above.
 
 ### From source
 

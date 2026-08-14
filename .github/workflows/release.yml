@@ -16,6 +16,9 @@ on:
 
 permissions:
   contents: write
+  # Build provenance: id-token signs the attestation, attestations stores it.
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -48,6 +51,16 @@ jobs:
           VERSION="${TAG#v}"
           echo "Building cli-agent-mcp ${VERSION}"
           mkdir -p dist
+          # Windows executables carry no publisher information unless a VERSIONINFO
+          # resource is embedded, which leaves Explorer and the SmartScreen prompt
+          # showing a blank company. go-winres compiles winres/winres.json into
+          # rsrc_windows_<arch>.syso; Go's linker picks those up automatically for
+          # GOOS=windows only, so the other targets are unaffected.
+          # `go run` rather than `go install`, so this does not depend on
+          # GOPATH/bin being on PATH; pinned rather than @latest, because this
+          # runs in the release path.
+          go run github.com/tc-hib/go-winres@v0.3.3 make --arch amd64,arm64 \
+            --file-version "${VERSION}" --product-version "${VERSION}"
           targets="windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64"
           for t in $targets; do
             os="${t%/*}"; arch="${t#*/}"
@@ -59,6 +72,16 @@ jobs:
           done
           ( cd dist && sha256sum * > checksums.txt )
           ls -lh dist
+
+      # Cryptographic proof of where these binaries came from: which commit, which
+      # workflow, which runner. Free, and verifiable by anyone with
+      #   gh attest verify cli-agent-mcp_windows_amd64.exe --repo Bytars/cli-agent-mcp
+      # This is not code signing and does not affect SmartScreen — it is the
+      # supply-chain answer, not the "unknown publisher" one.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/cli-agent-mcp_*
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
