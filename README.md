@@ -298,7 +298,7 @@ You do not have to take that on faith. Every release is built by
 carries a signed provenance attestation:
 
 ```bash
-gh attest verify cli-agent-mcp_windows_amd64.exe --repo Bytars/cli-agent-mcp
+gh attestation verify cli-agent-mcp_windows_amd64.exe --repo Bytars/cli-agent-mcp
 ```
 
 That proves which commit and which workflow run produced the exact file on your
