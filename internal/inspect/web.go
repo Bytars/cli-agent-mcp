@@ -41,8 +41,9 @@ func runUI(args []string) int {
 	dir := fs.String("state-dir", "", "State directory to read.")
 	port := fs.Int("port", 7788, "Port to listen on.")
 	host := fs.String("host", "127.0.0.1", "Interface to listen on.")
-	allowRemote := fs.Bool("allow-remote", false, "Allow listening beyond localhost (the viewer has no authentication).")
+	allowRemote := fs.Bool("allow-remote", false, "Allow listening beyond localhost.")
 	openBrowser := fs.Bool("open", false, "Open the browser on startup.")
+	noToken := fs.Bool("no-token", false, "Serve without a session token, to anything that can reach the port.")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: cli-agent-mcp ui [options]
 
@@ -58,13 +59,21 @@ Options:
 	}
 
 	// A transcript holds everything the worker saw and did: prompts, file
-	// contents, command output. Binding that to a public interface with no
-	// authentication is a decision, not a default.
+	// contents, command output. Binding that to a public interface is a
+	// decision, not a default.
 	if !isLoopback(*host) && !*allowRemote {
 		fmt.Fprintf(os.Stderr,
-			"error: %q is not localhost and the viewer has no authentication: anyone who can reach that\n"+
-				"       port reads the full transcripts (prompts, file contents, command output).\n"+
+			"error: %q is not localhost: anyone who can reach that port would be able to attempt\n"+
+				"       reading the full transcripts (prompts, file contents, command output).\n"+
 				"       If that is genuinely what you want, add --allow-remote.\n", *host)
+		return 2
+	}
+	// Off-machine, the session token is the only thing left standing between a
+	// transcript and the network. Refuse the combination rather than serve it.
+	if !isLoopback(*host) && *noToken {
+		fmt.Fprint(os.Stderr,
+			"error: --no-token with a non-local address would publish every transcript to anyone who\n"+
+				"       can reach the port, with nothing to authenticate them. Drop one of the two.\n")
 		return 2
 	}
 
@@ -80,6 +89,14 @@ Options:
 	mux.HandleFunc("/api/tasks", src.handleTasks)
 	mux.HandleFunc("/api/log", src.handleLog)
 
+	var token string
+	if !*noToken {
+		if token, err = newSessionToken(); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		}
+	}
+
 	addr := net.JoinHostPort(*host, strconv.Itoa(*port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -88,12 +105,27 @@ Options:
 	}
 
 	srv := &http.Server{
-		Handler:           mux,
+		Handler: &guard{
+			next:  mux,
+			token: token,
+			// The loopback Host check only applies to a loopback listener.
+			// Someone who deliberately bound elsewhere reaches it by a name
+			// this process cannot know, and the token is their protection.
+			local: isLoopback(*host),
+		},
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	url := "http://" + addr + "/"
+	if token != "" {
+		url += "?" + queryParam + "=" + token
+	}
 	fmt.Printf("viewer at %s\n", url)
+	if token == "" {
+		fmt.Println("warning:  --no-token: anything that can reach this port reads every transcript")
+	} else {
+		fmt.Println("          (the link carries a one-off session token; it dies with this process)")
+	}
 	fmt.Printf("state:    %s\n", src.Dir())
 	if o := src.Owner(); o != nil {
 		fmt.Printf("server running: pid %d\n", o.PID)

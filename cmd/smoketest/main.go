@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ func main() {
 	prompt := getenv("SMOKE_PROMPT", "say hello from the worker")
 	cwd := getenv("SMOKE_CWD", mustCwd())
 	doFollowup := os.Getenv("SMOKE_FOLLOWUP") != "0"
+	stateDir := getenv("SMOKE_STATE_DIR", filepath.Join(os.TempDir(), "cli-agent-mcp-smoketest"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
@@ -42,6 +44,12 @@ func main() {
 		// Pin the gate closed so the extra_args assertion is hermetic regardless
 		// of what the developer happens to have exported.
 		"CLI_AGENT_MCP_ALLOW_EXTRA_ARGS=false",
+		// Its own state directory, for two reasons. The smoke test would
+		// otherwise write mock runs into the developer's real task history —
+		// and, on a machine where the server has been paired, it is exactly the
+		// unauthorized launcher that pairing exists to turn away. A fresh
+		// directory is unpaired, so the server serves it.
+		"CLI_AGENT_MCP_STATE_DIR="+stateDir,
 	)
 	cmd.Stderr = os.Stderr
 

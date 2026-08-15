@@ -181,10 +181,25 @@ disarms when you scroll up to read and re-arms when you scroll back down. It
 polls once a second while something runs and asks only for the lines it has not
 seen yet.
 
-It binds to `127.0.0.1:7788` by default. `--host` accepts anything, but a
-transcript contains everything the worker saw and did — prompts, file contents,
-command output — and the viewer has no authentication, so binding it off
-loopback requires `--allow-remote` as well. That refusal is the point: make it a
+It binds to `127.0.0.1:7788` by default, and the URL it prints carries a session
+token:
+
+```
+viewer at http://127.0.0.1:7788/?t=r_v48P7JOvKV5JLPKCI-0Q
+```
+
+That token is minted per run, traded for a `SameSite=Strict` cookie on first
+load, and never written to disk. It is there because a transcript holds
+everything the worker saw and did — prompts, file contents, command output — and
+a plain localhost port is not a permission: anything on the machine that can open
+a socket could read the lot. Two more checks come with it: requests naming a
+`Host` other than localhost are refused, and so are requests carrying a
+cross-origin `Origin`, which is what stops a web page you happen to visit from
+reading the port through DNS rebinding.
+
+`--no-token` turns the authentication off (the origin checks stay). `--host`
+accepts anything, but binding off loopback requires `--allow-remote` as well —
+and cannot be combined with `--no-token`. That refusal is the point: make it a
 decision, not an accident.
 
 **Both viewers are strictly read-only.** Cancelling a task means killing the
@@ -354,6 +369,59 @@ Restart the client, and the `cli-agent` tools appear. Then ask it something like
 > The worker agent must be installed and **authenticated** on its own
 > (e.g. run `claude` or `cursor-agent` once interactively to log in).
 
+### Pair the client — do this once
+
+Until you pair, **any process on this machine can start this server** and
+delegate work to a coding agent that inherits your environment: your SSH keys,
+your VPN routes, an unlocked credential agent, and by default permission to edit
+files. Nothing distinguishes the client you configured from an npm postinstall
+script that decided to run the same binary.
+
+```bash
+cli-agent-mcp pair --install
+```
+
+That mints a secret, stores only its hash under your state directory, and writes
+the secret into Claude Desktop's config for you (it merges — your other servers
+and settings are left alone, and the previous file is backed up). Restart the
+client. From then on, a launcher that cannot present the secret gets a server
+whose every tool answers with an explanation instead of doing anything.
+
+Pair each client separately, so revoking one does not disturb the other:
+
+```bash
+cli-agent-mcp pair --label cowork        # prints the snippet to paste
+cli-agent-mcp pair --status              # what is paired, and to what
+cli-agent-mcp pair --revoke cowork       # take one client's access away
+cli-agent-mcp pair --label claude-desktop  # re-run to rotate a secret in place
+```
+
+**What this does and does not do.** The MCP conversation itself needs no
+protecting: it runs over an anonymous pipe between the client and this process,
+with no port and nothing on the wire to intercept. What pairing adds is
+authorization to *launch*. And it has a limit worth stating plainly — the secret
+sits in the client's config file, readable by anything running as you, so an
+attacker who already has that access can take it. Pairing stops code that can
+execute but not rummage through your profile; it is not a wall against a
+same-user attacker.
+
+That limit is why each token also binds to the program that first used it. A
+secret copied out of your config does not let some other process on the machine
+drive the server:
+
+```
+refusing to serve: token "claude-desktop" is bound to C:\...\Claude.exe but this
+server was launched by C:\Users\you\AppData\Local\Temp\something.exe
+```
+
+If you move or reinstall the client yourself, that is the same message — clear
+the binding with `cli-agent-mcp pair --unbind claude-desktop` and start it again.
+`pair --unpair` removes the whole record and goes back to serving any launcher.
+
+Rejected launches land in the [audit log](#audit-log) as `pairing_rejected`, with
+the program that attempted it. That is the only trace you get that something
+local tried.
+
 ## Configuration
 
 All configuration is environment variables, so it lives entirely in your client's
@@ -380,6 +448,7 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_CUSTOM_BIN` | — | Executable for the custom agent (see below). |
 | `CLI_AGENT_MCP_CUSTOM_ARGS` | — | Argument template for the custom agent, `;`-separated. |
 | `CLI_AGENT_MCP_CUSTOM_NAME` | `custom` | Name to expose the custom agent as. |
+| `CLI_AGENT_MCP_TOKEN` | — | The pairing credential the client presents at launch. Set it with [`cli-agent-mcp pair`](#pair-the-client--do-this-once), not by hand. |
 
 ## Drive any CLI agent (no code)
 
@@ -487,6 +556,9 @@ Each line is one event:
   `↳ ✗ (failed with no output — possibly blocked by security software / sandbox)`.
 - `turn_end` — status, exit code, duration, and a snippet of the result.
 - `cancel` — when a task was interrupted.
+- `pairing_rejected` — a launcher that could not authenticate, with why and the
+  program that tried. Unlike the rest, this one records work that *did not*
+  happen; it is the only trace that something local attempted to use the server.
 
 ```json
 {"ts":"2026-07-16T02:22:26Z","event":"turn_start","task_id":"task-1-…","agent":"claude","cwd":"/code/app","prompt":"run the tests","command":["claude","-p","run the tests","--output-format","stream-json","--verbose","--permission-mode","acceptEdits"]}
@@ -587,6 +659,13 @@ authenticate through 1Password with no further hand-holding.
 ## ⚠️ Permissions & safety
 
 Read this section before pointing the server at anything you care about.
+
+### Decide who may start the server at all
+
+Everything below bounds what the worker may *do*. It says nothing about *who
+gets to ask*, and unpaired, the answer is "anything on this machine". Run
+[`cli-agent-mcp pair --install`](#pair-the-client--do-this-once) once, before the
+rest of this section is worth much.
 
 ### The client cannot stop the worker
 
@@ -738,6 +817,13 @@ internal/task/
   kill_windows.go           process-tree kill on cancel (Windows)
   kill_other.go             process-group kill on cancel (Unix)
 internal/audit/audit.go     append-only JSONL audit trail
+internal/pairing/           who may launch and drive this server
+  pairing.go                token issue/verify, and what it does not protect
+  gate.go                   how a rejection reaches the user and the model
+  cli.go                    the `pair` command
+  install.go                merging the token into a client's config
+  parent_windows.go         which program launched us? (Windows)
+  parent_other.go           which program launched us? (Unix)
 internal/state/
   state.go                  durable task records + the instance PID lock
   follow.go                 read-only tail of a transcript another process writes
@@ -752,6 +838,7 @@ internal/inspect/           read-only viewers, out of process
   source.go                 the shared reader over the state directory
   cli.go                    `tasks` and `logs` (picker, live tail, --all)
   web.go                    `ui`: local HTTP server + JSON API
+  guard.go                  session token, Host and Origin checks for that server
   live.html                 the web viewer, self-contained
 cmd/smoketest/              end-to-end test via the MCP client
 ```

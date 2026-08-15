@@ -117,6 +117,16 @@ type Config struct {
 	// human-readable transcript by default (dropping the noisy init/config dump)
 	// rather than raw JSONL.
 	Compact bool
+
+	// Token is the pairing credential the launching client presented, proving it
+	// is one this server was configured for. It is set by `cli-agent-mcp pair`
+	// in the client's own config, never by hand here. Empty means none was
+	// offered, which only matters once the server has been paired.
+	//
+	// It authorizes the launch. It does not protect the MCP conversation, which
+	// runs over a private pipe with nothing on it to intercept — see
+	// internal/pairing for what this does and does not buy.
+	Token string
 }
 
 func getenv(key, def string) string {
@@ -233,5 +243,6 @@ func Load() Config {
 		WatchWindow:        watchWindow,
 		TaskTimeout:        taskTimeout,
 		Compact:            getbool("CLI_AGENT_MCP_COMPACT", true),
+		Token:              getenv("CLI_AGENT_MCP_TOKEN", ""),
 	}
 }

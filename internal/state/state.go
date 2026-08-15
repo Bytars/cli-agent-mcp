@@ -58,6 +58,21 @@ func DefaultDir() string {
 	return filepath.Join(base, "cli-agent-mcp")
 }
 
+// ResolveDir turns a configured directory into the absolute path actually used,
+// applying the default for an empty value. Callers that need to read state
+// without opening a store — the pairing check runs before anything else, and
+// must not create directories on behalf of a launcher it has yet to authorize —
+// go through this.
+func ResolveDir(dir string) string {
+	if strings.TrimSpace(dir) == "" {
+		dir = DefaultDir()
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
+}
+
 // Open prepares dir for use, creating it if needed.
 func Open(dir string) (*Store, error) {
 	if strings.TrimSpace(dir) == "" {
