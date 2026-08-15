@@ -29,6 +29,11 @@ environment**. That means it can reach whatever the host machine can reach:
 The MCP client never sees your keys or tokens — it just delegates a task to a
 worker that already has access.
 
+That access is the feature, and it is also the reason to decide *who may ask*.
+Anything that can start this binary inherits the same reach, so pair your client
+once — [see below](#pair-the-client--do-this-once) — and a launcher you did not
+configure gets nothing.
+
 ```
 MCP client (e.g. Claude Desktop)
         │  MCP over stdio
@@ -268,7 +273,14 @@ than having two.
 > closing the owner terminates them mid-write. Let them finish first.
 
 State lives in `%AppData%\cli-agent-mcp` on Windows and `~/.config/cli-agent-mcp`
-elsewhere, unless `CLI_AGENT_MCP_STATE_DIR` says otherwise.
+elsewhere, unless `CLI_AGENT_MCP_STATE_DIR` says otherwise. The
+[pairing record](#pair-the-client--do-this-once) sits alongside it as
+`pairing.json` — hashes and launcher paths, never a secret — which is why moving
+`CLI_AGENT_MCP_STATE_DIR` also moves what the server checks credentials against.
+
+A locked instance is the one exception to all of the above: it writes nothing
+here, not even the PID lock. Letting an unauthorized launcher take that lock
+would make the real server report a rival it cannot see.
 
 ## Install
 
@@ -781,6 +793,13 @@ The smoke test is env-driven, so you can point it at a real agent:
 SMOKE_AGENT=claude SMOKE_PROMPT="say hi" SMOKE_FOLLOWUP=0 \
   go run ./cmd/smoketest ./cli-agent-mcp
 ```
+
+It launches the server with its own state directory (`SMOKE_STATE_DIR`, default a
+temp path), which keeps mock runs out of your real task history — and matters on
+a machine where you have paired: the smoke test is precisely the unrecognised
+launcher that [pairing](#pair-the-client--do-this-once) turns away, and a fresh
+state directory is unpaired, so the server serves it. Point `SMOKE_STATE_DIR` at
+a paired directory to exercise the refusal instead.
 
 CI ([`ci.yml`](.github/workflows/ci.yml)) runs all of the above on every push and PR.
 
