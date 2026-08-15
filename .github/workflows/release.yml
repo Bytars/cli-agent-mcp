@@ -33,12 +33,19 @@ jobs:
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ steps.tag.outputs.tag }}
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      # setup-go v6 onwards exports GOTOOLCHAIN=local, so the Go it installs is
+      # the Go that builds — no silent download of a newer toolchain because
+      # some module asked for one. That is what you want from a release path,
+      # but it turns a version mismatch into a hard failure instead of a
+      # transparent upgrade. If a build here ever stops with "go.mod requires
+      # go >= X (running Y; GOTOOLCHAIN=local)", the fix is to raise the `go`
+      # directive in go.mod, which is what this step reads its version from.
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           check-latest: true
@@ -84,7 +91,7 @@ jobs:
           subject-path: dist/cli-agent-mcp_*
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
