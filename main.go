@@ -1324,8 +1324,10 @@ Configuration (environment variables):
                                    a heavyweight process.                (default: 3)
   CLI_AGENT_MCP_ASK_PERMISSION     Let the worker ask the person who delegated the task
                                    before running something it isn't pre-approved for,
-                                   instead of stalling. Only engages for a client that can
-                                   elicit.                               (default: true)
+                                   instead of stalling. A client that can elicit is asked
+                                   directly; for every other client the request is parked on
+                                   the task until agent_answer_permission releases it.
+                                                                         (default: true)
   CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS
                                    How long a worker waits for that answer before the
                                    request is denied.                    (default: 600)

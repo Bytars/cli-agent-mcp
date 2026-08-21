@@ -63,6 +63,9 @@ func newDesk() *permissionDesk {
 
 func newRequestID() string {
 	var b [6]byte
+	// crypto/rand.Read never returns an error: it crashes the process rather
+	// than hand back short or predictable bytes. There is no failure here to
+	// handle, only one to pretend to handle.
 	_, _ = rand.Read(b[:])
 	return "perm-" + hex.EncodeToString(b[:])
 }

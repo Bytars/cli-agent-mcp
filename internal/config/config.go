@@ -125,9 +125,11 @@ type Config struct {
 	// AskPermission lets a worker put a permission request to the person who
 	// delegated the task, instead of stalling on a prompt nobody can answer.
 	//
-	// It is on by default and costs nothing when unusable: it only engages for
-	// a client that declared it can elicit, and a client that cannot gets
-	// exactly the behaviour it had before.
+	// It is on by default and reaches every client. One that declared the
+	// elicitation capability is asked directly; for the rest the request is
+	// parked on the task and released by agent_answer_permission. Turning it
+	// off restores the older behaviour, where a tool that is neither
+	// pre-approved nor denied stalls until the task timeout.
 	AskPermission bool
 
 	// PermissionTimeout bounds how long a worker waits for that answer. It has

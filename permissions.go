@@ -102,21 +102,18 @@ func commandOf(input map[string]any) string {
 	return ""
 }
 
-// Approver returns the approver for one client session, or nil when
-// interactive approval is not available to it.
+// Approver returns the approver for one client session, or nil when the
+// approval endpoint is not running at all.
 //
-// nil rather than something that always denies, because "ask the user" and
-// "refuse everything" are very different runs. A client that cannot elicit gets
-// exactly the behaviour it had before: the operator's pre-approved tool list
-// decides and anything outside it stalls — bad, but the failure the operator
-// configured for, not a new one introduced here.
+// Every client gets one, including those that cannot elicit: Decide falls back
+// to parking the request on its task, where the orchestrator relays it and
+// agent_answer_permission releases the worker. Returning nil means something
+// else entirely — the worker is never given a way to ask, and a tool that is
+// neither pre-approved nor denied stalls until the task timeout.
 func (d *permissionDesk) Approver(session *mcp.ServerSession) task.Approver {
 	if d == nil || d.broker == nil || session == nil {
 		return nil
 	}
-	// Offered to every client now, not only the ones that can be elicited: a
-	// client that cannot be asked directly still has a person behind it, and
-	// parking reaches them through the orchestrator instead.
 	return &sessionApprover{desk: d, session: session}
 }
 
