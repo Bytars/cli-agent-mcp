@@ -738,6 +738,11 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		fail("building command: " + err.Error())
 		return
 	}
+	// A cancel asked for by another instance arrives as a file rather than a
+	// call, because that instance has no handle on this worker. Watching for it
+	// here is what makes the request mean anything.
+	go watchCancelRequest(ctx, t, cancel)
+
 	cmd.Dir = spec.Cwd
 	// The child inherits our environment — that is the point: whatever the host
 	// can reach (VPN routes, an SSH agent, credentials) becomes available to the
@@ -1066,8 +1071,22 @@ func (m *Manager) Cancel(id string) (Snapshot, error) {
 	}
 	t.mu.Lock()
 	if !t.running {
+		orphaned := t.status == StatusOrphaned
 		s := t.snapshot()
+		store := t.store
 		t.mu.Unlock()
+
+		// An orphan is running under another server instance, so this process
+		// has no handle on its worker and cannot stop it directly. Returning the
+		// snapshot as though the cancel had happened is the one answer that must
+		// not be given: a caller reads success and believes the task is stopping
+		// while it carries on spending.
+		if orphaned && store != nil {
+			if err := store.RequestCancel(t.ID); err != nil {
+				return s, fmt.Errorf("this task belongs to another server instance and the request to stop it could not be left for that instance: %w", err)
+			}
+			return s, nil
+		}
 		return s, nil
 	}
 	t.canceledRequested = true
@@ -1090,4 +1109,44 @@ func (m *Manager) Cancel(id string) (Snapshot, error) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return t.Snapshot(), nil
+}
+
+// cancelPollInterval is how often a running turn checks whether another server
+// instance has asked it to stop. A second is slower than a local cancel and far
+// faster than a person notices, and the check is a single stat.
+const cancelPollInterval = time.Second
+
+// watchCancelRequest stops the turn when another instance leaves a request for
+// it. It exits with the turn, so a finished task leaves nothing polling.
+func watchCancelRequest(ctx context.Context, t *Task, cancel context.CancelFunc) {
+	t.mu.Lock()
+	store := t.store
+	t.mu.Unlock()
+	if store == nil {
+		return
+	}
+
+	// Anything left over from an earlier task with this id would otherwise stop
+	// this one the moment it started.
+	_ = store.ClearCancel(t.ID)
+
+	ticker := time.NewTicker(cancelPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !store.CancelRequested(t.ID) {
+				continue
+			}
+			_ = store.ClearCancel(t.ID)
+			t.mu.Lock()
+			t.canceledRequested = true
+			t.mu.Unlock()
+			t.audit.Log("cancel", map[string]any{"task_id": t.ID, "source": "another server instance"})
+			cancel()
+			return
+		}
+	}
 }

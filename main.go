@@ -135,7 +135,8 @@ func main() {
 			log.Printf("warning: could not take the instance lock: %v", err)
 		} else if prev != nil {
 			instanceWarning = fmt.Sprintf(
-				"another cli-agent-mcp server (pid %d, started %s) is still running and owns tasks this instance cannot watch or cancel. "+
+				"another cli-agent-mcp server (pid %d, started %s) is still running and owns tasks this instance did not start. "+
+					"Their output and status stay readable here, and agent_cancel_task reaches them by leaving the request for that instance. "+
 					"Tasks it started appear here as %q once they are restored from disk. "+
 					"If that process is no longer wanted, stop it — but note that doing so kills any worker still running under it.",
 				prev.PID, prev.Started.Format(time.RFC3339), task.StatusOrphaned)
@@ -828,6 +829,18 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		snap, err := mgr.Cancel(in.TaskID)
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
+		}
+		// An orphan belongs to another server instance, which is the only
+		// process that can stop its worker. Saying "status=orphaned" and leaving
+		// it there reads as though nothing happened, when in fact the request
+		// has been left where that instance will pick it up.
+		if snap.Status == task.StatusOrphaned {
+			return textResult(fmt.Sprintf(
+				"Task %s belongs to another cli-agent-mcp instance, which is the only process that can stop its worker. "+
+					"The request has been left for it and is normally picked up within a second or two. "+
+					"Watch the task with agent_task_status: it will settle to %q once that instance acts on it. "+
+					"If it does not, that instance is no longer running, and the task is already over.",
+				snap.ID, task.StatusCanceled)), snap, nil
 		}
 		return textResult(fmt.Sprintf("Task %s: status=%s", snap.ID, snap.Status)), snap, nil
 	})
