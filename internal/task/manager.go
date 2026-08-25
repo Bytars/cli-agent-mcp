@@ -227,6 +227,16 @@ func (t *Task) joinRange(from, to int, compact bool) string {
 // task safely.
 type EventSink func(ev agent.Event)
 
+// Options are the per-call knobs shared by every way of starting a turn.
+type Options struct {
+	// Sink receives each event as it arrives, for callers streaming progress.
+	Sink EventSink
+
+	// Window bounds how long a blocking call waits before handing back a task
+	// id. Zero means wait until the turn ends or the caller goes away.
+	Window time.Duration
+}
+
 // Manager owns all tasks.
 type Manager struct {
 	mu       sync.Mutex
@@ -237,6 +247,9 @@ type Manager struct {
 	audit    *audit.Logger
 	store    *state.Store
 	timeout  time.Duration
+
+	// maxConcurrent caps live workers. Zero means no limit.
+	maxConcurrent int
 }
 
 // NewManager builds a task manager retaining up to maxTasks tasks.
@@ -252,6 +265,25 @@ func (m *Manager) SetAudit(a *audit.Logger) { m.audit = a }
 
 // SetTaskTimeout sets a per-turn timeout; zero disables it.
 func (m *Manager) SetTaskTimeout(d time.Duration) { m.timeout = d }
+
+// SetMaxConcurrent caps how many workers may run at once; zero disables it.
+func (m *Manager) SetMaxConcurrent(n int) { m.maxConcurrent = n }
+
+// Running reports how many workers are alive right now.
+func (m *Manager) Running() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, id := range m.order {
+		tk := m.tasks[id]
+		tk.mu.Lock()
+		if tk.running {
+			n++
+		}
+		tk.mu.Unlock()
+	}
+	return n
+}
 
 func newID(n uint64) string {
 	var b [4]byte
@@ -304,25 +336,12 @@ func pathWithin(path, root string) bool {
 
 // StartTask creates a task and launches its first turn asynchronously.
 func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*Task, error) {
-	t := &Task{
-		ID:        newID(m.counter.Add(1)),
-		AgentName: a.Name(),
-		Cwd:       cwd,
-		Model:     spec.Model,
-		adapter:   a,
-		audit:     m.audit,
-		store:     m.store,
-		status:    StatusRunning,
-		running:   true,
-		startedAt: time.Now(),
-	}
+	t := m.newTask(a, cwd, spec)
 	spec.Cwd = cwd
 
-	m.mu.Lock()
-	m.tasks[t.ID] = t
-	m.order = append(m.order, t.ID)
-	m.evictLocked()
-	m.mu.Unlock()
+	if err := m.admit(t); err != nil {
+		return nil, err
+	}
 
 	t.persist()
 
@@ -330,12 +349,38 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*T
 	return t, nil
 }
 
-// RunTaskStreaming creates a task and runs its first turn synchronously,
-// forwarding each event to sink as it arrives. It blocks until the turn
-// finishes (or ctx is canceled, which terminates the agent) and returns the
-// task. Used by the streaming "run" tools so the MCP client sees live progress.
-func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd string, spec agent.RunSpec, sink EventSink) (*Task, error) {
-	t := &Task{
+// RunTaskStreaming creates a task and runs its first turn, forwarding each
+// event to opts.Sink as it arrives. It waits for the turn under the rules in
+// runDetached and reports whether it finished; either way the turn keeps
+// running. Used by the streaming "run" tools so the MCP client sees live
+// progress.
+func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd string, spec agent.RunSpec, opts Options) (t *Task, finished bool, err error) {
+	t = m.newTask(a, cwd, spec)
+	spec.Cwd = cwd
+
+	if err := m.admit(t); err != nil {
+		return nil, false, err
+	}
+
+	t.persist()
+
+	return t, m.runDetached(ctx, t, spec, opts), nil
+}
+
+// FollowupStreaming resumes a finished task's session with a new prompt,
+// waiting on it under the same rules as RunTaskStreaming.
+func (m *Manager) FollowupStreaming(ctx context.Context, id, prompt string, allowedTools, extraArgs []string, opts Options) (*Task, bool, error) {
+	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
+	if err != nil {
+		return nil, false, err
+	}
+	return t, m.runDetached(ctx, t, spec, opts), nil
+}
+
+// newTask builds a task record. Every entry point starts from here, so the
+// fields a task is born with are defined once rather than per caller.
+func (m *Manager) newTask(a agent.Adapter, cwd string, spec agent.RunSpec) *Task {
+	return &Task{
 		ID:        newID(m.counter.Add(1)),
 		AgentName: a.Name(),
 		Cwd:       cwd,
@@ -347,29 +392,82 @@ func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd str
 		running:   true,
 		startedAt: time.Now(),
 	}
-	spec.Cwd = cwd
+}
 
+// runDetached starts a turn on a context of its own and waits for it, reporting
+// whether it finished within the window. The turn keeps running either way.
+//
+// The turn deliberately does not inherit ctx. ctx belongs to the MCP call that
+// asked for the work, and that call has a much shorter life than the work does:
+// a client that gives up waiting, or a user who closes the panel, cancels it.
+// Running the turn under it meant the worker was killed mid-edit whenever the
+// caller stopped listening — the task was lost for the sole reason that nobody
+// was watching it. ctx still bounds how long *this call* waits, which is all it
+// was ever able to speak for.
+func (m *Manager) runDetached(ctx context.Context, t *Task, spec agent.RunSpec, opts Options) (finished bool) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.runTurn(context.Background(), t, spec, opts.Sink)
+	}()
+
+	window := opts.Window
+	if window <= 0 {
+		select {
+		case <-done:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	timer := time.NewTimer(window)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// admit registers a task, refusing it when the machine is already running as
+// many workers as the operator allows.
+//
+// The cap is on live workers, not on retained records: a headless coding agent
+// is a heavyweight process, so an orchestrator fanning out ten tasks can take
+// the machine down while maxTasks and every per-task limit still look
+// perfectly satisfied.
+func (m *Manager) admit(t *Task) error {
+	if err := m.checkCapacity(); err != nil {
+		return err
+	}
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.tasks[t.ID] = t
 	m.order = append(m.order, t.ID)
 	m.evictLocked()
-	m.mu.Unlock()
-
-	t.persist()
-
-	m.runTurn(ctx, t, spec, sink)
-	return t, nil
+	return nil
 }
 
-// FollowupStreaming resumes a finished task's session with a new prompt, running
-// synchronously and forwarding events to sink.
-func (m *Manager) FollowupStreaming(ctx context.Context, id, prompt string, allowedTools, extraArgs []string, sink EventSink) (*Task, error) {
-	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
-	if err != nil {
-		return nil, err
+// checkCapacity refuses a new worker once the configured limit is reached.
+//
+// It must be called without any task lock held, since Running takes each task's
+// lock to read its state. Two callers can therefore race past a cap of N and
+// briefly reach N+1; that is deliberate, because making it exact would mean
+// holding the manager lock across task locks in both directions, which is how
+// this deadlocks.
+func (m *Manager) checkCapacity() error {
+	if m.maxConcurrent <= 0 {
+		return nil
 	}
-	m.runTurn(ctx, t, spec, sink)
-	return t, nil
+	if live := m.Running(); live >= m.maxConcurrent {
+		return fmt.Errorf("%d task(s) are already running, which is this server's limit "+
+			"(CLI_AGENT_MCP_MAX_CONCURRENT=%d). Wait for one to finish, or cancel one with agent_cancel_task",
+			live, m.maxConcurrent)
+	}
+	return nil
 }
 
 // evictLocked drops the oldest finished tasks beyond maxTasks. Caller holds mu.

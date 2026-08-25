@@ -108,6 +108,7 @@ func main() {
 	defer auditLog.Close()
 	mgr.SetAudit(auditLog)
 	mgr.SetTaskTimeout(cfg.TaskTimeout)
+	mgr.SetMaxConcurrent(cfg.MaxConcurrent)
 	if auditLog.Enabled() {
 		log.Printf("audit log: %s", cfg.AuditLog)
 	}
@@ -430,6 +431,19 @@ func finishText(snap task.Snapshot) string {
 	return header + outcomeDetail(snap) + "\n\n" + body
 }
 
+// stillRunningText is what a blocking "run" tool returns when the turn outlives
+// the window it was allowed to wait. It has to be unmistakable that nothing
+// went wrong and that the work is still under way, because the obvious reading
+// of a truncated result is that the task died.
+func stillRunningText(snap task.Snapshot, window time.Duration) string {
+	return fmt.Sprintf(
+		"Task %s is STILL RUNNING after %s. Nothing failed and the worker was not interrupted — "+
+			"this call simply returned before the client would have abandoned it.\n\n"+
+			"Follow it with agent_watch (task_id=%s) until running is false. "+
+			"The result will be there when it finishes.",
+		snap.ID, window.Round(time.Second), snap.ID)
+}
+
 // planText frames the outcome of a plan-only run, making it unmistakable that
 // nothing ran and stating how to proceed.
 func planText(snap task.Snapshot) string {
@@ -475,16 +489,19 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err != nil {
 			return errResult(emsg), task.Snapshot{}, nil
 		}
-		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+		t, finished, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
-		}, newProgressSink(ctx, req))
+		}, task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
+		if !finished {
+			return textResult(stillRunningText(snap, cfg.WatchWindow)), snap, nil
+		}
 		return textResult(finishText(snap)), snap, nil
 	})
 
@@ -512,17 +529,20 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			msg := fmt.Sprintf("agent %q cannot guarantee plan-only execution, so refusing to run: it would carry the task out instead of planning it", a.Name())
 			return errResult(msg), task.Snapshot{}, nil
 		}
-		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+		t, finished, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
 			PlanOnly:     true,
-		}, newProgressSink(ctx, req))
+		}, task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
+		if !finished {
+			return textResult(stillRunningText(snap, cfg.WatchWindow)), snap, nil
+		}
 		return textResult(planText(snap)), snap, nil
 	})
 
@@ -537,11 +557,15 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
-		t, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs, newProgressSink(ctx, req))
+		t, finished, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs,
+			task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
+		if !finished {
+			return textResult(stillRunningText(snap, cfg.WatchWindow)), snap, nil
+		}
 		return textResult(finishText(snap)), snap, nil
 	})
 
@@ -913,6 +937,7 @@ Configuration (environment variables):
   CLI_AGENT_MCP_DEFAULT_CWD        Default working directory
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
+  CLI_AGENT_MCP_MAX_CONCURRENT     Max workers running at once, 0 = no cap (default: 3)
   CLI_AGENT_MCP_AUDIT_LOG          Path to a JSONL audit log of what the worker did
   CLI_AGENT_MCP_WATCH_WINDOW_SECONDS  How long one agent_watch call may block before
                                    returning a resumable partial. Keep it under the
