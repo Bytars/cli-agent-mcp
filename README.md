@@ -375,6 +375,7 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_ALLOWED_CWDS` | — | If set, every task `cwd` must live under one of these roots (`;`-separated). |
 | `CLI_AGENT_MCP_MAX_TASKS` | `100` | Max retained tasks in memory. |
 | `CLI_AGENT_MCP_MAX_CONCURRENT` | `3` | Max workers running at once; further tasks are refused until one finishes. `0` disables the cap. |
+| `CLI_AGENT_MCP_MAX_COST_USD` | `0` (off) | What one task may spend, in dollars. See [Cost](#cost). |
 | `CLI_AGENT_MCP_ASK_PERMISSION` | `true` | Let a worker ask you before using a tool it was not pre-approved for, instead of stalling. |
 | `CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS` | `600` | How long a worker waits for that answer before giving up on it. |
 | `CLI_AGENT_MCP_AUDIT_LOG` | — | Path to a JSONL audit log of what the worker did. See [Audit log](#audit-log). |
@@ -467,6 +468,45 @@ completion, you can't inject a prompt mid-turn; you steer *between* turns (cance
 and restart with a corrected prompt, or `agent_send_followup`). That mirrors how
 a human drives one of these agents by hand. For anything destructive, combine
 this with `agent_plan_task` so judgment happens *before* execution.
+
+## Cost
+
+Delegating hides what a person at a terminal would have watched accumulate, and
+cost is the part that compounds quietly. Every task now reports what it spent,
+appended to the result:
+
+```
+— $0.1041 · 2 in / 9 out tokens · 24.6k cached · 1 agent turn(s) · 3s · claude-opus-5
+```
+
+`CLI_AGENT_MCP_MAX_COST_USD` bounds what a single task may spend across all of
+its turns. It is enforced in two places, because neither alone is enough:
+
+- The figure is passed to Claude Code as `--max-budget-usd`, which **the agent
+  applies itself and can act on mid-turn**. That is the real protection —
+  nothing outside the agent can stop a runaway turn, because cost only reaches
+  this server on the terminal event, long after the spending happened.
+- The server also tracks what a task has spent across every turn and passes the
+  **remaining** budget, not the configured total. Without that, a task driven
+  through ten follow-ups would be handed the whole allowance ten times over
+  while each individual run stayed inside the limit.
+
+Two limits of this are worth stating plainly.
+
+**The first turn can overshoot.** A turn's cost is only known once it ends, so a
+single expensive turn exceeds the budget and is caught afterwards. Measured
+here: a `--max-budget-usd 0.01` run stopped after spending `$0.089`. The setting
+bounds a *session*, not one request.
+
+**A stopped run says so.** Claude Code reports a budget stop as `is_error` with
+an empty result and exits `0`, which on its own reads as an unexplained failure.
+The reason is lifted out and reported instead:
+
+```
+Planning task task-1-12ed1ace FAILED (status "failed"). Nothing was executed.
+
+Reached maximum budget ($0.01)
+```
 
 ## Audit log
 

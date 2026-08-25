@@ -48,6 +48,19 @@ func (g Grant) Pattern() string {
 	if g.Command == "" {
 		return g.Tool
 	}
+	// A command carrying the pattern's own punctuation cannot be written into
+	// one. A real grant recorded here for `/tmp/x.b64)` rendered as
+	// "Bash(/tmp/x.b64):*)", where the stray parenthesis closes the specifier
+	// early and the rest is left dangling — the agent then reads something
+	// nobody wrote.
+	//
+	// Returning nothing is the safe answer rather than the lossy one. The grant
+	// is not silently widened to the whole tool, and it still works: Allows
+	// matches on the recorded command, so the desk honours it when the request
+	// arrives. All that is lost is the pre-approval round trip.
+	if strings.ContainsAny(g.Command, "(),") {
+		return ""
+	}
 	return fmt.Sprintf("%s(%s:*)", g.Tool, g.Command)
 }
 
@@ -263,7 +276,9 @@ func (s *Store) Patterns() []string {
 
 	out := make([]string, 0, len(s.list))
 	for _, g := range s.list {
-		out = append(out, g.Pattern())
+		if p := g.Pattern(); p != "" {
+			out = append(out, p)
+		}
 	}
 	return out
 }

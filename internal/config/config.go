@@ -93,6 +93,16 @@ type Config struct {
 	// MaxTasks caps the number of tasks retained in memory.
 	MaxTasks int
 
+	// MaxCostUSD bounds what one task may spend, in US dollars. Zero disables it.
+	//
+	// It is enforced in two places because neither alone is enough. Claude Code
+	// is given the figure as --max-budget-usd, which it applies itself and can
+	// act on mid-turn — that is the real protection. But that flag is per
+	// invocation, so a task driven through ten follow-ups would get the whole
+	// budget ten times over; the server therefore also tracks what a task has
+	// spent across all its turns and refuses to start another once it is over.
+	MaxCostUSD float64
+
 	// MaxConcurrent caps how many workers may run at the same time. It is a
 	// different limit from MaxTasks, which only bounds retained records: a
 	// headless coding agent is a heavyweight process, so an orchestrator that
@@ -177,6 +187,24 @@ func getPositiveInt(key string, def int) int {
 	switch n, err := strconv.Atoi(v); {
 	case err != nil:
 		warnInvalid(key, v, "is not an integer", def)
+	case n <= 0:
+		warnInvalid(key, v, "must be greater than 0", def)
+	default:
+		return n
+	}
+	return def
+}
+
+// getPositiveFloat reads a decimal env value that must be greater than zero,
+// falling back to def and reporting anything unusable rather than accepting it.
+func getPositiveFloat(key string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	switch n, err := strconv.ParseFloat(v, 64); {
+	case err != nil:
+		warnInvalid(key, v, "is not a number", def)
 	case n <= 0:
 		warnInvalid(key, v, "must be greater than 0", def)
 	default:
@@ -270,6 +298,7 @@ func Load() Config {
 		AllowedCwds:        allowed,
 		MaxTasks:           maxTasks,
 		MaxConcurrent:      getPositiveInt("CLI_AGENT_MCP_MAX_CONCURRENT", 3),
+		MaxCostUSD:         getPositiveFloat("CLI_AGENT_MCP_MAX_COST_USD", 0),
 		AskPermission:      getbool("CLI_AGENT_MCP_ASK_PERMISSION", true),
 		PermissionTimeout:  time.Duration(getPositiveInt("CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS", 600)) * time.Second,
 		AuditLog:           getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),

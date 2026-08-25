@@ -93,7 +93,7 @@ $suite = @(
     @{ Name = 'concurrency'; Needs = 'none'; Script = { Invoke-Scenario -Scenario 'concurrency' -UseAgent 'mock' -Vars @{ CLI_AGENT_MCP_MAX_CONCURRENT = '3' } } },
 
     @{ Name = 'real';       Needs = 'agent'; Script = { Invoke-Scenario -Scenario '' -UseAgent $Agent } },
-    @{ Name = 'permission'; Needs = 'agent'; Script = { Invoke-Scenario -Scenario 'permission' -UseAgent $Agent -Vars @{ CLI_AGENT_MCP_WATCH_WINDOW_SECONDS = '10' } } },
+    @{ Name = 'permission'; Needs = 'agent'; Script = { Invoke-Scenario -Scenario 'permission' -UseAgent $Agent -Vars @{ CLI_AGENT_MCP_WATCH_WINDOW_SECONDS = '10'; CLI_AGENT_MCP_PERMISSION_MODE = 'default' } } },
     @{ Name = 'abandon';    Needs = 'agent'; Script = { Invoke-Scenario -Scenario 'abandon'    -UseAgent $Agent -Vars @{ CLI_AGENT_MCP_WATCH_WINDOW_SECONDS = '10' } } }
 )
 

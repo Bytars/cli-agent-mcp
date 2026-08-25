@@ -3,14 +3,23 @@
 package main
 
 // The "permission" scenario. It needs a real agent — the mock never asks for
-// anything — and it needs the operator to have lowered the watch window:
+// anything — and it needs two settings from the operator:
 //
+//	CLI_AGENT_MCP_PERMISSION_MODE=default \
 //	CLI_AGENT_MCP_WATCH_WINDOW_SECONDS=10 \
 //	SMOKE_ONLY=permission SMOKE_AGENT=claude SMOKE_CWD=/path/to/scratch/repo \
 //	go run ./cmd/smoketest ./cli-agent-mcp.exe
 //
-// Without that, step 1 sits on the default 50s window before it reports back,
-// and the whole run has only the 180s main allows it.
+// The window matters because step 1 otherwise sits on the default 50s before it
+// reports back, and the whole run has only the 180s main allows it.
+//
+// The permission mode matters more, and the reason is not obvious. The server
+// defaults to acceptEdits, under which Claude Code decides for itself that
+// creating a directory is an edit and approves it — but only sometimes.
+// Measured here it asked on roughly half the runs, which made this scenario look
+// like it was catching a regression when it was catching a coin flip. Under
+// "default" nothing outside the pre-approved list runs without an answer, so the
+// behaviour being tested actually happens every time.
 
 import (
 	"context"
@@ -96,9 +105,16 @@ func runPermissionScenario(ctx context.Context, e *env) {
 			break
 		}
 		if time.Now().After(deadline) {
-			log.Fatalf("FAIL: task %s never appeared under \"waiting\" within %s. "+
-				"Either the worker was never asked (the tool is pre-approved, or CLI_AGENT_MCP_ASK_PERMISSION=false) "+
-				"or the request was answered by something other than this scenario.\nlast task status:\n%s",
+			log.Fatalf("FAIL: task %s never appeared under \"waiting\" within %s.\n"+
+				"The likeliest cause is the permission mode. Under the server's default of\n"+
+				"acceptEdits, Claude Code treats creating a directory as an edit and approves it\n"+
+				"itself some of the time — measured here as roughly one run in two, which makes\n"+
+				"this scenario flaky rather than wrong. Run it with\n"+
+				"CLI_AGENT_MCP_PERMISSION_MODE=default, where nothing outside the pre-approved\n"+
+				"list runs without an answer.\n"+
+				"Otherwise: the tool really is pre-approved (check agent_list_permissions for a\n"+
+				"remembered grant), CLI_AGENT_MCP_ASK_PERMISSION=false, or something other than\n"+
+				"this scenario answered first.\nlast task status:\n%s",
 				taskID, permRequestWait, indent(textContent(
 					callTool(ctx, e.Session, "agent_task_status", map[string]any{"task_id": taskID}))))
 		}

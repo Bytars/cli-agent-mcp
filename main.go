@@ -112,6 +112,7 @@ func main() {
 	mgr.SetAudit(auditLog)
 	mgr.SetTaskTimeout(cfg.TaskTimeout)
 	mgr.SetMaxConcurrent(cfg.MaxConcurrent)
+	mgr.SetMaxCostUSD(cfg.MaxCostUSD)
 	if auditLog.Enabled() {
 		log.Printf("audit log: %s", cfg.AuditLog)
 	}
@@ -464,7 +465,7 @@ func finishText(snap task.Snapshot) string {
 	if snap.IsError || snap.Status == task.StatusFailed {
 		header = fmt.Sprintf("Task %s FAILED (status %q).", snap.ID, snap.Status)
 	}
-	return header + outcomeDetail(snap) + "\n\n" + body
+	return header + outcomeDetail(snap) + "\n\n" + body + usageLine(snap)
 }
 
 // stillRunningText is what a blocking "run" tool returns when the turn outlives
@@ -491,8 +492,8 @@ func planText(snap task.Snapshot) string {
 		return fmt.Sprintf("Planning task %s FAILED (status %q).%s Nothing was executed.\n\n%s",
 			snap.ID, snap.Status, outcomeDetail(snap), body)
 	}
-	return fmt.Sprintf("Task %s planned (status %q) — NOTHING WAS EXECUTED.%s\n\n%s\n\nReview this with the user. To carry it out, call agent_run_followup with task_id=%s.",
-		snap.ID, snap.Status, outcomeDetail(snap), body, snap.ID)
+	return fmt.Sprintf("Task %s planned (status %q) — NOTHING WAS EXECUTED.%s\n\n%s\n\nReview this with the user. To carry it out, call agent_run_followup with task_id=%s.%s",
+		snap.ID, snap.Status, outcomeDetail(snap), body, snap.ID, usageLine(snap))
 }
 
 func firstLine(s string) string {
@@ -977,6 +978,7 @@ Configuration (environment variables):
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
   CLI_AGENT_MCP_MAX_CONCURRENT     Max workers running at once, 0 = no cap (default: 3)
+  CLI_AGENT_MCP_MAX_COST_USD       Dollars one task may spend, 0 = no cap  (default: 0)
   CLI_AGENT_MCP_ASK_PERMISSION     Let a worker ask before using a tool it was
                                    not pre-approved for            (default: true)
   CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS  How long it waits for that answer
@@ -1022,4 +1024,51 @@ Custom agent (drive any CLI without writing Go):
     CLI_AGENT_MCP_CUSTOM_BIN=aider
     CLI_AGENT_MCP_CUSTOM_ARGS=--no-pretty;--yes;--message;{{prompt}}
 `
+}
+
+// usageLine renders what the turn cost, or "" when the agent reported nothing.
+// Delegating hides what a person at a terminal would have watched accumulate,
+// and cost is the part that compounds quietly, so it is shown by default rather
+// than left for someone to go looking for.
+func usageLine(snap task.Snapshot) string {
+	u := snap.Usage
+	if u == nil {
+		return ""
+	}
+	var parts []string
+	if u.CostUSD > 0 {
+		parts = append(parts, fmt.Sprintf("$%.4f", u.CostUSD))
+	}
+	if in, out := u.InputTokens, u.OutputTokens; in > 0 || out > 0 {
+		parts = append(parts, fmt.Sprintf("%s in / %s out tokens", compactNum(in), compactNum(out)))
+	}
+	if cached := u.CacheReadTokens; cached > 0 {
+		parts = append(parts, compactNum(cached)+" cached")
+	}
+	if u.NumTurns > 0 {
+		parts = append(parts, fmt.Sprintf("%d agent turn(s)", u.NumTurns))
+	}
+	if u.DurationMS > 0 {
+		parts = append(parts, (time.Duration(u.DurationMS) * time.Millisecond).Round(time.Second).String())
+	}
+	if snap.ModelUsed != "" {
+		parts = append(parts, snap.ModelUsed)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "\n\n— " + strings.Join(parts, " · ")
+}
+
+// compactNum abbreviates token counts, which routinely run into the millions
+// and are unreadable written out in full.
+func compactNum(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
