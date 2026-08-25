@@ -373,8 +373,9 @@ func pathWithin(path, root string) bool {
 }
 
 // StartTask creates a task and launches its first turn asynchronously.
-func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*Task, error) {
+func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec, opts Options) (*Task, error) {
 	t := m.newTask(a, cwd, spec)
+	t.approver = opts.Approver
 	spec.Cwd = cwd
 
 	if err := m.admit(t); err != nil {
@@ -590,10 +591,15 @@ func (m *Manager) prepareFollowup(id, prompt string, allowedTools, extraArgs []s
 }
 
 // Followup resumes a task's session with a new prompt, asynchronously.
-func (m *Manager) Followup(id, prompt string, allowedTools, extraArgs []string) (*Task, error) {
+func (m *Manager) Followup(id, prompt string, allowedTools, extraArgs []string, opts Options) (*Task, error) {
 	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
 	if err != nil {
 		return nil, err
+	}
+	if opts.Approver != nil {
+		t.mu.Lock()
+		t.approver = opts.Approver
+		t.mu.Unlock()
 	}
 	go m.runTurn(context.Background(), t, spec, nil)
 	return t, nil

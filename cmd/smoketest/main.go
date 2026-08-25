@@ -69,6 +69,37 @@ func main() {
 		fmt.Printf("  - %s\n", t.Name)
 	}
 
+	// Registered scenarios come first, so a name that exists is never shadowed
+	// by one of the branches below.
+	if only := os.Getenv("SMOKE_ONLY"); only != "" {
+		if s, ok := scenarios[only]; ok {
+			if s.Needs == "real" && agentName == "mock" {
+				log.Fatalf("SMOKE_ONLY=%s needs a real agent: it asserts behaviour the mock does not have. "+
+					"Re-run with SMOKE_AGENT=claude (and SMOKE_CWD pointing at a scratch repo).", only)
+			}
+			fmt.Printf("\n== %s ==\n%s\n\n", only, s.What)
+			s.Run(ctx, &env{
+				Session: session,
+				Agent:   agentName,
+				Cwd:     cwd,
+				Prompt:  prompt,
+				Progress: func() []string {
+					progressMu.Lock()
+					defer progressMu.Unlock()
+					return append([]string(nil), progressMsgs...)
+				},
+			})
+			fmt.Println("\nSMOKETEST PASSED")
+			return
+		}
+		switch only {
+		case "plan", "watchstream", "timeout", "cancel":
+			// handled by the branches below
+		default:
+			log.Fatalf("unknown SMOKE_ONLY=%q; known scenarios: %s, plan, watchstream, timeout, cancel", only, scenarioNames())
+		}
+	}
+
 	// SMOKE_ONLY=plan isolates a single plan-only call, so a caller can prove the
 	// agent executed nothing (e.g. by checking the filesystem afterward).
 	if os.Getenv("SMOKE_ONLY") == "plan" {

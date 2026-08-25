@@ -81,16 +81,13 @@ func (d *permissionDesk) park(ctx context.Context, req approval.Request, command
 		return approval.Decision{Message: msg}
 	}
 
-	// Remembering happens here rather than in the tool handler, because this is
-	// the only place that knows what was actually asked for.
-	if ans.Remember && d.grants != nil {
-		g := grants.Grant{Tool: req.ToolName, Command: command, Note: "granted while running " + req.TaskID}
-		if err := d.grants.Add(g); err != nil {
-			log.Printf("warning: could not remember the grant for %s: %v", g, err)
-		} else {
-			log.Printf("remembered: %s", g)
-		}
-	}
+	// Remembering is deliberately NOT done here. It used to be, and the failure
+	// mode was that agent_answer_permission told the user the permission was
+	// recorded for every future task while the store quietly refused to save it:
+	// the tool answering the question could not see the outcome of an action
+	// taken on this goroutine, after it had already replied. Whoever reports the
+	// result has to be the one who performed it, so the grant is added in the
+	// tool handler instead.
 	return approval.Decision{Allow: true}
 }
 
