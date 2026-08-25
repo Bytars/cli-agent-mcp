@@ -33,6 +33,10 @@ func TestASecondInstanceCanStopTheFirstsTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartTask: %v", err)
 	}
+	// If anything below fails, the worker would otherwise sit out its twenty
+	// seconds holding the temp directory open, and Windows reports that as a
+	// second failure on top of the real one.
+	t.Cleanup(func() { _, _ = owner.Cancel(tk.ID) })
 	waitFor(t, 5*time.Second, "the owner's task to start running", func() bool {
 		return tk.Snapshot().Status == StatusRunning
 	})
@@ -71,10 +75,17 @@ func TestASecondInstanceCanStopTheFirstsTask(t *testing.T) {
 	}
 }
 
-// A request left over from an earlier run must not stop the next task to carry
-// that id. The window is small but the failure it causes — a task that dies
-// instantly for no visible reason — is the kind nobody diagnoses quickly.
-func TestAStaleRequestDoesNotStopTheNextRun(t *testing.T) {
+// A request can be written before the turn's watcher is even scheduled: the
+// caller doing the writing waits on nothing, while the turn's goroutine is busy
+// starting a process. Such a request must still be honoured.
+//
+// This is not hypothetical. The watcher used to clear anything it found on
+// entry, as a precaution against a leftover from a task with the same id — a
+// situation that cannot really arise, since ids carry a random suffix and Forget
+// removes the request with the record. What the precaution did instead was
+// swallow real requests that landed in that window, which passed on a fast
+// machine and failed on the first loaded one.
+func TestARequestArrivingBeforeTheWatcherIsHonoured(t *testing.T) {
 	t.Setenv(helperEnv, "1")
 
 	store, err := state.Open(t.TempDir())
@@ -86,20 +97,24 @@ func TestAStaleRequestDoesNotStopTheNextRun(t *testing.T) {
 	m := NewManager(10)
 	m.SetStore(store)
 
-	tk := m.newTask(sleepAdapter{ms: 1500}, t.TempDir(), agent.RunSpec{Prompt: "work"})
-	if err := store.RequestCancel(tk.ID); err != nil {
-		t.Fatalf("RequestCancel: %v", err)
-	}
+	tk := m.newTask(sleepAdapter{ms: 20000}, t.TempDir(), agent.RunSpec{Prompt: "work"})
 	if err := m.admit(tk); err != nil {
 		t.Fatalf("admit: %v", err)
 	}
-	go m.runTurn(context.Background(), tk, agent.RunSpec{Prompt: "work", Cwd: t.TempDir()}, nil)
 
-	waitFor(t, 15*time.Second, "the task to finish", func() bool {
+	// Written before the turn starts at all, which is the worst case for the
+	// window this guards.
+	if err := store.RequestCancel(tk.ID); err != nil {
+		t.Fatalf("RequestCancel: %v", err)
+	}
+	go m.runTurn(context.Background(), tk, agent.RunSpec{Prompt: "work", Cwd: t.TempDir()}, nil)
+	t.Cleanup(func() { _, _ = m.Cancel(tk.ID) })
+
+	waitFor(t, 20*time.Second, "the turn to act on a request that preceded it", func() bool {
 		return tk.Snapshot().Status != StatusRunning
 	})
-	if s := tk.Snapshot().Status; s != StatusDone {
-		t.Errorf("status = %q, want %q — a stale request from a previous run stopped it", s, StatusDone)
+	if s := tk.Snapshot().Status; s != StatusCanceled {
+		t.Errorf("status = %q, want %q — the request was written first and must not have been discarded", s, StatusCanceled)
 	}
 }
 

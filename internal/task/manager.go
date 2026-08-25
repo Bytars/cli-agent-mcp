@@ -1126,10 +1126,19 @@ func watchCancelRequest(ctx context.Context, t *Task, cancel context.CancelFunc)
 		return
 	}
 
-	// Anything left over from an earlier task with this id would otherwise stop
-	// this one the moment it started.
-	_ = store.ClearCancel(t.ID)
-
+	// Deliberately no "clear anything stale first" step here, though it looks
+	// like an obvious precaution and was one until it caused a failure.
+	//
+	// A request can be written the moment a task becomes visible, which is
+	// before this goroutine is scheduled — the caller doing the writing is not
+	// waiting on any I/O, and the turn's goroutine is. Clearing on entry
+	// therefore erases legitimate requests that arrive in that window, and does
+	// so more often the more loaded the machine is. It went unnoticed locally
+	// and failed on the first CI run.
+	//
+	// What it was guarding against does not really occur: task ids carry a
+	// random suffix and are not reused, and Forget removes the request along
+	// with the record when a task is evicted.
 	ticker := time.NewTicker(cancelPollInterval)
 	defer ticker.Stop()
 	for {
