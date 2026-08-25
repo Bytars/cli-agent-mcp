@@ -120,6 +120,21 @@ type Config struct {
 	// prompt with no human to approve it. Zero means no timeout.
 	TaskTimeout time.Duration
 
+	// AskPermission lets a worker put a permission request to the person who
+	// delegated the task, instead of stalling on a prompt nobody can answer.
+	//
+	// It is on by default and reaches every client. One that declared the
+	// elicitation capability is asked directly; for the rest the request is
+	// parked on the task and released by agent_answer_permission. Turning it
+	// off restores the older behaviour, where a tool that is neither
+	// pre-approved nor denied stalls until the task timeout.
+	AskPermission bool
+
+	// PermissionTimeout bounds how long a worker waits for that answer. It has
+	// to be generous — there is a human at the other end who may be looking at
+	// something else — but finite, or an unattended run waits forever.
+	PermissionTimeout time.Duration
+
 	// Compact controls whether agent_get_output / agent_watch return a filtered,
 	// human-readable transcript by default (dropping the noisy init/config dump)
 	// rather than raw JSONL.
@@ -255,6 +270,8 @@ func Load() Config {
 		AllowedCwds:        allowed,
 		MaxTasks:           maxTasks,
 		MaxConcurrent:      getPositiveInt("CLI_AGENT_MCP_MAX_CONCURRENT", 3),
+		AskPermission:      getbool("CLI_AGENT_MCP_ASK_PERMISSION", true),
+		PermissionTimeout:  time.Duration(getPositiveInt("CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS", 600)) * time.Second,
 		AuditLog:           getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
 		StateDir:           getenv("CLI_AGENT_MCP_STATE_DIR", ""),
 		WatchWindow:        watchWindow,

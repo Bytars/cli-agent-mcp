@@ -27,6 +27,7 @@ import (
 
 	"github.com/Bytars/cli-agent-mcp/internal/agent"
 	"github.com/Bytars/cli-agent-mcp/internal/audit"
+	"github.com/Bytars/cli-agent-mcp/internal/grants"
 	"github.com/Bytars/cli-agent-mcp/internal/state"
 )
 
@@ -87,6 +88,15 @@ type Task struct {
 
 	// lastRefresh throttles re-reading an orphan's files; see refreshOrphan.
 	lastRefresh time.Time
+
+	// pending is the permission request this task is currently blocked on, if
+	// any. It is what turns "the task is running but nothing is happening" into
+	// something a person can act on.
+	pending *PermissionRequest
+
+	// approver, when set, lets each turn hand the worker a way to ask a human
+	// before it gives up on a tool it is not allowed to use.
+	approver Approver
 }
 
 // Snapshot is an immutable view of a Task for serialization.
@@ -106,6 +116,11 @@ type Snapshot struct {
 	TotalLines int      `json:"total_output_lines"`
 	Turns      int      `json:"turns"`
 	Prompts    []string `json:"prompts,omitempty"`
+
+	// Pending is set while the worker is blocked waiting for someone to allow a
+	// tool call. A task in that state is running and getting nowhere, which is
+	// indistinguishable from a slow one unless it is said outright.
+	Pending *PermissionRequest `json:"pending_permission,omitempty"`
 }
 
 func (t *Task) snapshot() Snapshot {
@@ -127,6 +142,7 @@ func (t *Task) snapshot() Snapshot {
 	if !t.endedAt.IsZero() {
 		s.EndedAt = t.endedAt.Format(time.RFC3339)
 	}
+	s.Pending = t.pending
 	for _, tr := range t.turns {
 		s.Prompts = append(s.Prompts, tr.Prompt)
 	}
@@ -235,6 +251,19 @@ type Options struct {
 	// Window bounds how long a blocking call waits before handing back a task
 	// id. Zero means wait until the turn ends or the caller goes away.
 	Window time.Duration
+
+	// Approver, when set, lets the worker ask for permission during the run.
+	Approver Approver
+}
+
+// Approver supplies the wiring that lets a worker ask a human for permission
+// mid-run, rather than stalling on a prompt nobody is there to answer.
+type Approver interface {
+	// Grant issues per-run approval for a task. ok is false when the run should
+	// proceed without it — because the orchestrating client cannot ask, or
+	// because the operator turned it off. release must be called when the turn
+	// ends, and revokes the grant.
+	Grant(taskID string) (configPath, toolName string, release func(), ok bool)
 }
 
 // Manager owns all tasks.
@@ -250,6 +279,12 @@ type Manager struct {
 
 	// maxConcurrent caps live workers. Zero means no limit.
 	maxConcurrent int
+
+	// desk holds the permission requests workers are currently blocked on.
+	desk *permissionDesk
+
+	// grants are the permissions the user granted permanently.
+	grants *grants.Store
 }
 
 // NewManager builds a task manager retaining up to maxTasks tasks.
@@ -257,7 +292,7 @@ func NewManager(maxTasks int) *Manager {
 	if maxTasks <= 0 {
 		maxTasks = 100
 	}
-	return &Manager{tasks: make(map[string]*Task), maxTasks: maxTasks}
+	return &Manager{tasks: make(map[string]*Task), maxTasks: maxTasks, desk: newDesk()}
 }
 
 // SetAudit attaches an audit logger; nil or a disabled logger is fine.
@@ -268,6 +303,9 @@ func (m *Manager) SetTaskTimeout(d time.Duration) { m.timeout = d }
 
 // SetMaxConcurrent caps how many workers may run at once; zero disables it.
 func (m *Manager) SetMaxConcurrent(n int) { m.maxConcurrent = n }
+
+// SetGrants attaches the store of permissions the user has granted permanently.
+func (m *Manager) SetGrants(g *grants.Store) { m.grants = g }
 
 // Running reports how many workers are alive right now.
 func (m *Manager) Running() int {
@@ -356,6 +394,7 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*T
 // progress.
 func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd string, spec agent.RunSpec, opts Options) (t *Task, finished bool, err error) {
 	t = m.newTask(a, cwd, spec)
+	t.approver = opts.Approver
 	spec.Cwd = cwd
 
 	if err := m.admit(t); err != nil {
@@ -373,6 +412,11 @@ func (m *Manager) FollowupStreaming(ctx context.Context, id, prompt string, allo
 	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
 	if err != nil {
 		return nil, false, err
+	}
+	if opts.Approver != nil {
+		t.mu.Lock()
+		t.approver = opts.Approver
+		t.mu.Unlock()
 	}
 	return t, m.runDetached(ctx, t, spec, opts), nil
 }
@@ -595,6 +639,28 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 			"error":       msg,
 			"duration_ms": time.Since(turnStarted).Milliseconds(),
 		})
+	}
+
+	// Issue this turn's permission grant, if the orchestrator can answer for it.
+	// It is revoked the moment the turn ends: the URL it names can approve
+	// commands on this machine, so it must outlive nothing.
+	t.mu.Lock()
+	approver := t.approver
+	t.mu.Unlock()
+	if approver != nil {
+		if cfgPath, tool, release, ok := approver.Grant(t.ID); ok {
+			defer release()
+			spec.MCPConfigPath = cfgPath
+			spec.PermissionTool = tool
+		}
+	}
+
+	// A permission the user granted permanently is handed to the agent as a
+	// pre-approved tool, so the worker never reaches the point of asking for it
+	// again. Answering the same question twice is the fastest way to train
+	// someone into approving everything without reading it.
+	if m.grants != nil {
+		spec.AllowedTools = append(spec.AllowedTools, m.grants.Patterns()...)
 	}
 
 	cmd, err := t.adapter.Command(ctx, spec)

@@ -82,6 +82,15 @@ func (a *ClaudeAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 	if a.AppendPrompt != "" {
 		args = append(args, "--append-system-prompt", a.AppendPrompt)
 	}
+	// Never on a plan-only run: nothing executes there, so there is nothing to
+	// approve, and offering an approval endpoint would only invite the agent to
+	// ask about work it is not going to do.
+	if !spec.PlanOnly && spec.MCPConfigPath != "" && spec.PermissionTool != "" {
+		args = append(args,
+			"--mcp-config", spec.MCPConfigPath,
+			"--permission-prompt-tool", spec.PermissionTool,
+		)
+	}
 	if spec.Model != "" {
 		args = append(args, "--model", spec.Model)
 	}

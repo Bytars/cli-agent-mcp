@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +27,10 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/Bytars/cli-agent-mcp/internal/agent"
+	"github.com/Bytars/cli-agent-mcp/internal/approval"
 	"github.com/Bytars/cli-agent-mcp/internal/audit"
 	"github.com/Bytars/cli-agent-mcp/internal/config"
+	"github.com/Bytars/cli-agent-mcp/internal/grants"
 	"github.com/Bytars/cli-agent-mcp/internal/inspect"
 	"github.com/Bytars/cli-agent-mcp/internal/state"
 	"github.com/Bytars/cli-agent-mcp/internal/task"
@@ -156,6 +159,30 @@ func main() {
 		return
 	}
 
+	// Interactive approval. It only does anything for a client that can put a
+	// question to its user, and it fails soft: if the endpoint cannot be brought
+	// up, tasks run exactly as they did before.
+	grantStore, err := grants.Open(cfg.StateDir)
+	if err != nil {
+		log.Printf("warning: remembered permissions are unavailable: %v", err)
+		grantStore = &grants.Store{}
+	}
+
+	desk := newPermissionDesk(cfg.PermissionTimeout)
+	desk.mgr = mgr
+	desk.grants = grantStore
+	mgr.SetGrants(grantStore)
+	if cfg.AskPermission {
+		broker, err := approval.Start(filepath.Join(cfg.StateDir, "approval"), desk.Decide)
+		if err != nil {
+			log.Printf("warning: interactive permission prompts are off: %v", err)
+		} else {
+			defer broker.Close()
+			desk.broker = broker
+			log.Printf("interactive approval: %s", broker.Addr())
+		}
+	}
+
 	// Advertise the MCP Apps extension so hosts that support interactive views
 	// know this server can render one, and fetch the board's ui:// resource.
 	// Setting Capabilities at all replaces the SDK's default, so logging has to
@@ -171,7 +198,7 @@ func main() {
 		Capabilities: caps,
 	})
 
-	registerTools(srv, reg, mgr, cfg)
+	registerTools(srv, reg, mgr, cfg, desk, grantStore)
 
 	log.Printf("starting (default agent=%s, max_tasks=%d)", cfg.DefaultAgent, cfg.MaxTasks)
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
@@ -473,7 +500,9 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
-func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config) {
+func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config, desk *permissionDesk, grantStore *grants.Store) {
+	registerPermissionTools(srv, mgr, grantStore)
+
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_run_task",
 		Description: "Delegate a task to a local headless CLI agent (Claude Code or Cursor) and WAIT for it to finish, streaming live progress notifications as the agent works. This is the seamless, in-line mode — no polling — so it feels like you did the work yourself. Use agent_start_task instead only when you want fire-and-forget or several tasks running in parallel.",
@@ -494,7 +523,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
-		}, task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow})
+		}, task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow, Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
@@ -535,7 +564,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
 			PlanOnly:     true,
-		}, task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow})
+		}, task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow, Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
@@ -558,7 +587,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		t, finished, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs,
-			task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow})
+			task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow, Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
@@ -828,6 +857,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, agent.DiagnosticReport, error) {
 		rep := agent.Diagnose(ctx, reg)
+		rep.InteractivePermission, rep.PermissionDetail = desk.status(req.Session, cfg.AskPermission)
 		return textResult(rep.Text()), rep, nil
 	})
 
@@ -938,6 +968,10 @@ Configuration (environment variables):
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
   CLI_AGENT_MCP_MAX_CONCURRENT     Max workers running at once, 0 = no cap (default: 3)
+  CLI_AGENT_MCP_ASK_PERMISSION     Let a worker ask before using a tool it was
+                                   not pre-approved for            (default: true)
+  CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS  How long it waits for that answer
+                                                              (default: 600)
   CLI_AGENT_MCP_AUDIT_LOG          Path to a JSONL audit log of what the worker did
   CLI_AGENT_MCP_WATCH_WINDOW_SECONDS  How long one agent_watch call may block before
                                    returning a resumable partial. Keep it under the

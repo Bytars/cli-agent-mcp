@@ -375,6 +375,8 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_ALLOWED_CWDS` | — | If set, every task `cwd` must live under one of these roots (`;`-separated). |
 | `CLI_AGENT_MCP_MAX_TASKS` | `100` | Max retained tasks in memory. |
 | `CLI_AGENT_MCP_MAX_CONCURRENT` | `3` | Max workers running at once; further tasks are refused until one finishes. `0` disables the cap. |
+| `CLI_AGENT_MCP_ASK_PERMISSION` | `true` | Let a worker ask you before using a tool it was not pre-approved for, instead of stalling. |
+| `CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS` | `600` | How long a worker waits for that answer before giving up on it. |
 | `CLI_AGENT_MCP_AUDIT_LOG` | — | Path to a JSONL audit log of what the worker did. See [Audit log](#audit-log). |
 | `CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS` | `0` (off) | Kill a turn that runs longer than this — a safety net for a worker hung on a permission prompt. |
 | `CLI_AGENT_MCP_COMPACT` | `true` | `agent_get_output`/`agent_watch` return a filtered, readable transcript instead of raw JSONL (pass `raw: true` on a call to override). |

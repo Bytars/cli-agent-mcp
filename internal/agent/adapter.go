@@ -33,6 +33,12 @@ type RunSpec struct {
 	ExtraArgs    []string // extra flags appended verbatim
 	AllowedTools []string // per-run tools to pre-approve (merged with server policy)
 	PlanOnly     bool     // propose a plan without executing anything
+
+	// MCPConfigPath and PermissionTool wire the agent to an approval endpoint,
+	// so a tool call it would otherwise stall on becomes a question asked of
+	// the human upstream. Both are set together or not at all.
+	MCPConfigPath  string
+	PermissionTool string
 }
 
 // Event is the adapter's interpretation of a single line of agent stdout.
