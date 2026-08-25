@@ -97,6 +97,9 @@ type Task struct {
 	// approver, when set, lets each turn hand the worker a way to ask a human
 	// before it gives up on a tool it is not allowed to use.
 	approver Approver
+
+	usage     agent.Usage // accumulated over every turn of this task
+	modelUsed string      // the model the agent said it was running
 }
 
 // Snapshot is an immutable view of a Task for serialization.
@@ -121,6 +124,14 @@ type Snapshot struct {
 	// tool call. A task in that state is running and getting nowhere, which is
 	// indistinguishable from a slow one unless it is said outright.
 	Pending *PermissionRequest `json:"pending_permission,omitempty"`
+
+	// ModelUsed is what the agent reported it actually ran, which is the only
+	// way to know when the caller requested no particular model.
+	ModelUsed string `json:"model_used,omitempty"`
+
+	// Usage accumulates every turn's accounting. Nil when the agent reported
+	// none, so a caller can tell "free" from "not measured".
+	Usage *agent.Usage `json:"usage,omitempty"`
 }
 
 func (t *Task) snapshot() Snapshot {
@@ -143,6 +154,11 @@ func (t *Task) snapshot() Snapshot {
 		s.EndedAt = t.endedAt.Format(time.RFC3339)
 	}
 	s.Pending = t.pending
+	s.ModelUsed = t.modelUsed
+	if !t.usage.Empty() {
+		u := t.usage
+		s.Usage = &u
+	}
 	for _, tr := range t.turns {
 		s.Prompts = append(s.Prompts, tr.Prompt)
 	}
@@ -280,6 +296,10 @@ type Manager struct {
 	// maxConcurrent caps live workers. Zero means no limit.
 	maxConcurrent int
 
+	// maxCostUSD bounds what one task may spend across all its turns. Zero
+	// means no limit.
+	maxCostUSD float64
+
 	// desk holds the permission requests workers are currently blocked on.
 	desk *permissionDesk
 
@@ -306,6 +326,30 @@ func (m *Manager) SetMaxConcurrent(n int) { m.maxConcurrent = n }
 
 // SetGrants attaches the store of permissions the user has granted permanently.
 func (m *Manager) SetGrants(g *grants.Store) { m.grants = g }
+
+// SetMaxCostUSD bounds what a single task may spend; zero disables it.
+func (m *Manager) SetMaxCostUSD(v float64) { m.maxCostUSD = v }
+
+// budgetFor returns what this turn may spend and whether it may run at all.
+//
+// The figure is what the task has LEFT, not the configured total, because the
+// agent applies it per invocation: handing a task its full allowance on every
+// follow-up would mean ten turns cost ten budgets. Once nothing is left the
+// turn is refused outright rather than started with an allowance of zero, which
+// the agent would read as "no limit".
+func (m *Manager) budgetFor(t *Task) (remaining float64, ok bool) {
+	if m.maxCostUSD <= 0 {
+		return 0, true
+	}
+	t.mu.Lock()
+	spent := t.usage.CostUSD
+	t.mu.Unlock()
+
+	if left := m.maxCostUSD - spent; left > 0 {
+		return left, true
+	}
+	return 0, false
+}
 
 // Running reports how many workers are alive right now.
 func (m *Manager) Running() int {
@@ -661,10 +705,30 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		}
 	}
 
+	// Refusing here rather than at the tool boundary is deliberate: a follow-up
+	// is the path that spends a budget repeatedly, and it reaches runTurn from
+	// several entry points that would each have to remember the check.
+	if left, ok := m.budgetFor(t); !ok {
+		t.mu.Lock()
+		spent := t.usage.CostUSD
+		t.mu.Unlock()
+		fail(fmt.Sprintf("this task has spent $%.4f, which is at or past its budget of $%.2f "+
+			"(CLI_AGENT_MCP_MAX_COST_USD). Nothing was run. Start a new task, or raise the limit.",
+			spent, m.maxCostUSD))
+		return
+	} else if left > 0 {
+		spec.MaxCostUSD = left
+	}
+
 	// A permission the user granted permanently is handed to the agent as a
 	// pre-approved tool, so the worker never reaches the point of asking for it
 	// again. Answering the same question twice is the fastest way to train
 	// someone into approving everything without reading it.
+	//
+	// The desk applies the same grants a second time, for the requests that do
+	// reach it. That redundancy is deliberate: this path only saves a round trip
+	// to the approval endpoint, and a grant must still be honoured when a
+	// pattern fails to match the way the agent spells the command.
 	if m.grants != nil {
 		spec.AllowedTools = append(spec.AllowedTools, m.grants.Patterns()...)
 	}
@@ -930,6 +994,12 @@ func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup)
 				}
 				if ev.Text != "" {
 					t.lastText = ev.Text
+				}
+				if ev.Model != "" {
+					t.modelUsed = ev.Model
+				}
+				if ev.Usage != nil {
+					t.usage.Add(*ev.Usage)
 				}
 				if ev.Final {
 					t.isError = ev.FinalError

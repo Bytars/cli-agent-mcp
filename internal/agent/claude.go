@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -90,6 +91,12 @@ func (a *ClaudeAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 			"--mcp-config", spec.MCPConfigPath,
 			"--permission-prompt-tool", spec.PermissionTool,
 		)
+	}
+	// Claude Code enforces this itself and can act on it mid-turn, which nothing
+	// outside the agent can do: cost only reaches us on the terminal event, long
+	// after a runaway turn has finished spending.
+	if spec.MaxCostUSD > 0 {
+		args = append(args, "--max-budget-usd", strconv.FormatFloat(spec.MaxCostUSD, 'f', -1, 64))
 	}
 	if spec.Model != "" {
 		args = append(args, "--model", spec.Model)

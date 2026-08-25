@@ -117,3 +117,29 @@ func TestUnreadableStoreIsAnErrorNotAnEmptyList(t *testing.T) {
 		t.Error("a corrupt grants file was accepted as an empty list")
 	}
 }
+
+// A command carrying the pattern's own punctuation cannot be written into one.
+// This is not hypothetical: a real store held a grant for "/tmp/diag-fe.b64)",
+// which rendered as "Bash(/tmp/diag-fe.b64):*)" — the stray parenthesis closes
+// the specifier early, leaving the agent to read something nobody wrote.
+func TestPatternRefusesCommandsItCannotExpress(t *testing.T) {
+	for _, cmd := range []string{"/tmp/diag-fe.b64)", "foo(bar", "a,b"} {
+		g := Grant{Tool: "Bash", Command: cmd}
+		if p := g.Pattern(); p != "" {
+			t.Errorf("Grant{%q}.Pattern() = %q, want it withheld rather than malformed", cmd, p)
+		}
+	}
+}
+
+// Withholding the pattern must not withhold the grant: the desk still has to
+// honour it, or a permission the user granted would quietly stop working.
+func TestAGrantWithoutAPatternStillApplies(t *testing.T) {
+	s := &Store{list: []Grant{{Tool: "Bash", Command: "/tmp/diag-fe.b64)"}}}
+
+	if got := s.Patterns(); len(got) != 0 {
+		t.Errorf("Patterns() = %v, want the malformed one dropped", got)
+	}
+	if !s.Allows("Bash", "/tmp/diag-fe.b64) --flag") {
+		t.Error("the grant stopped being honoured once its pattern was withheld")
+	}
+}
