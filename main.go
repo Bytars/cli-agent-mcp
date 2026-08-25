@@ -173,7 +173,16 @@ func main() {
 	desk.grants = grantStore
 	mgr.SetGrants(grantStore)
 	if cfg.AskPermission {
-		broker, err := approval.Start(filepath.Join(cfg.StateDir, "approval"), desk.Decide)
+		// The resolved directory, not cfg.StateDir: empty means "the per-user
+		// default", which state.Open expands internally. Joining "approval" onto
+		// the empty string yields a RELATIVE path, and the agent resolves it
+		// against its own working directory — the task's workspace — where the
+		// file does not exist. Claude Code then refuses to start at all.
+		stateDir := cfg.StateDir
+		if stateDir == "" {
+			stateDir = state.DefaultDir()
+		}
+		broker, err := approval.Start(filepath.Join(stateDir, "approval"), desk.Decide)
 		if err != nil {
 			log.Printf("warning: interactive permission prompts are off: %v", err)
 		} else {

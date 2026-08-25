@@ -191,6 +191,17 @@ func main() {
 	nProgress := len(progressMsgs)
 	progressMu.Unlock()
 	fmt.Printf("  run_task returned status=%s (received %d progress notifications)\n", runStatus, nProgress)
+	// The outcome, not merely that something was streamed. A failing run still
+	// emits progress — its error lines are progress — so asserting only on the
+	// notification count reports PASSED for a task that never ran. That is how a
+	// broken --mcp-config path reached main: the mock agent never reads the flag,
+	// and against a real agent this step failed while the suite said it passed.
+	if runStatus != "done" {
+		log.Fatalf("FAIL: expected run_task status done, got %q:\n%s", runStatus, indent(textContent(runRes)))
+	}
+	if strings.TrimSpace(jsonField(runRes, "result")) == "" {
+		log.Fatalf("FAIL: run_task reported done but produced no result:\n%s", indent(textContent(runRes)))
+	}
 	if nProgress < 1 {
 		log.Fatal("FAIL: expected at least one progress notification during agent_run_task")
 	}

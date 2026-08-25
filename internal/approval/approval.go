@@ -102,6 +102,13 @@ func Start(configDir string, decide Decider) (*Broker, error) {
 	if decide == nil {
 		return nil, fmt.Errorf("approval: no decider")
 	}
+	// The path ends up in --mcp-config, which the agent resolves against its own
+	// working directory — the task's workspace, not ours. A relative path
+	// therefore points somewhere the file will never be, and the agent aborts
+	// before running anything. Refuse it here rather than fail per task.
+	if !filepath.IsAbs(configDir) {
+		return nil, fmt.Errorf("approval: config dir %q must be absolute, because the agent resolves it from its own working directory", configDir)
+	}
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		return nil, fmt.Errorf("approval: config dir %s: %w", configDir, err)
 	}
