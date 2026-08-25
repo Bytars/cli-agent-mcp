@@ -10,8 +10,9 @@ A single-binary **MCP (Model Context Protocol) stdio server** that lets an MCP
 client — such as **Claude Desktop** — drive a **local headless CLI coding agent**
 as a background worker, with **live progress streaming**.
 
-Out of the box it drives **Claude Code** and **Cursor**, and any other CLI tool
-can be wired up with environment variables alone — no code required.
+Out of the box it drives **Claude Code**, **Cursor** and **Prime Agent**, and any
+other CLI tool can be wired up with environment variables alone — no code
+required.
 
 Instead of copy-pasting between a chat window and a terminal agent, the client
 delegates a task, watches the worker narrate its progress in real time, and gets
@@ -36,7 +37,7 @@ MCP client (e.g. Claude Desktop)
   cli-agent-mcp                      ← this project
         │  spawn (headless)
         ▼
-  claude / cursor-agent / your CLI   ← inherits env: VPN, SSH agent, credentials
+  claude / cursor-agent / pi / …     ← inherits env: VPN, SSH agent, credentials
         │
         ▼
   your code, your servers
@@ -364,6 +365,11 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_DEFAULT_AGENT` | `claude` | Agent used when a call omits `agent`. |
 | `CLI_AGENT_MCP_CLAUDE_BIN` | `claude` | Claude Code launcher (name in PATH or absolute path). |
 | `CLI_AGENT_MCP_CURSOR_BIN` | `cursor-agent` | Cursor launcher, used if the bundled runtime isn't auto-detected. |
+| `CLI_AGENT_MCP_PRIME_BIN` | auto | Prime Agent launcher. Empty tries `pi` (the npm package's binary) then `prime-agent` (the vendor installer's). |
+| `CLI_AGENT_MCP_PRIME_PROVIDER` | Prime Agent's own | Model provider for Prime Agent, e.g. `anthropic`. Credentials come from that provider's env var or Prime Agent's auth file — this server never handles them. |
+| `CLI_AGENT_MCP_PRIME_TOOLS` | — | Prime Agent's `--tools`. **Restricts** which tools exist at all, so naming one disables every tool you did not name. Not the same idea as `ALLOWED_TOOLS`. |
+| `CLI_AGENT_MCP_PRIME_EXCLUDE_TOOLS` | — | Prime Agent's `--exclude-tools`. |
+| `CLI_AGENT_MCP_PRIME_EXTRA_ARGS` | — | Appended verbatim to every Prime Agent launch (`;`-separated). |
 | `CLI_AGENT_MCP_PERMISSION_MODE` | `acceptEdits` | Claude Code `--permission-mode`: `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`. |
 | `CLI_AGENT_MCP_DISALLOWED_TOOLS` | — | Claude Code `--disallowedTools` (patterns, e.g. `Bash(rm:*),Bash(git push:*)`). **The reliable deny gate for a headless worker.** |
 | `CLI_AGENT_MCP_ALLOWED_TOOLS` | — | Claude Code `--allowedTools` — pre-approves tools; **additive, does not restrict.** |

@@ -96,6 +96,7 @@ func main() {
 	reg := agent.NewRegistry(
 		agent.NewClaudeAdapter(cfg.ClaudeBin, cfg.PermissionMode, cfg.AllowedTools, cfg.DisallowedTools, cfg.AppendSystemPrompt, cfg.ClaudeExtraArgs),
 		agent.NewCursorAdapter(cfg.CursorBin, cfg.CursorExtraArgs),
+		agent.NewPrimeAdapter(cfg.PrimeBin, cfg.PrimeProvider, cfg.PrimeTools, cfg.PrimeExcludeTools, cfg.AppendSystemPrompt, cfg.PrimeExtraArgs),
 		agent.NewCustomAdapter(cfg.CustomName, cfg.CustomBin, cfg.CustomArgs),
 		agent.NewMockAdapter(),
 	)
@@ -965,6 +966,10 @@ Configuration (environment variables):
   CLI_AGENT_MCP_DEFAULT_AGENT      Default agent: claude|cursor|custom|mock (default: claude)
   CLI_AGENT_MCP_CLAUDE_BIN         Claude Code launcher                 (default: claude)
   CLI_AGENT_MCP_CURSOR_BIN         Cursor launcher fallback             (default: cursor-agent)
+  CLI_AGENT_MCP_PRIME_BIN          Prime Agent launcher     (default: auto, pi or prime-agent)
+  CLI_AGENT_MCP_PRIME_PROVIDER     Prime Agent model provider, e.g. anthropic
+  CLI_AGENT_MCP_PRIME_TOOLS        Prime Agent --tools (restricts, does not pre-approve)
+  CLI_AGENT_MCP_PRIME_EXCLUDE_TOOLS  Prime Agent --exclude-tools
   CLI_AGENT_MCP_PERMISSION_MODE    Claude --permission-mode             (default: acceptEdits)
                                      acceptEdits|auto|bypassPermissions|manual|dontAsk|plan
   CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS  Extra Claude flags (';'-separated)

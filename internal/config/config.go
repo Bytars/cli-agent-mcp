@@ -36,6 +36,25 @@ type Config struct {
 	// auto-detection fails. Defaults to "cursor-agent".
 	CursorBin string
 
+	// PrimeBin is the command used to launch Prime Agent. Empty auto-detects:
+	// the npm package installs a "pi" binary while the vendor's own installer
+	// produces "prime-agent", and both are plausible on a given machine.
+	PrimeBin string
+
+	// PrimeProvider selects which model provider Prime Agent uses. Empty leaves
+	// its own default ("google"). Credentials come from that provider's
+	// environment variable or Prime Agent's own auth file — this server never
+	// handles them.
+	PrimeProvider string
+
+	// PrimeTools / PrimeExcludeTools are Prime Agent's --tools and
+	// --exclude-tools. Note these are NOT the same idea as AllowedTools below:
+	// Prime Agent's allowlist RESTRICTS which tools exist at all, rather than
+	// pre-approving prompts, so naming one here disables every tool you did not
+	// name.
+	PrimeTools        string
+	PrimeExcludeTools string
+
 	// PermissionMode is passed to Claude Code's --permission-mode. Because the
 	// agent runs headless (no human at the terminal to approve prompts), this
 	// governs how autonomous it is. See README for the safety trade-offs.
@@ -67,6 +86,7 @@ type Config struct {
 	// letting the user tune flags without a rebuild.
 	ClaudeExtraArgs []string
 	CursorExtraArgs []string
+	PrimeExtraArgs  []string
 
 	// AppendSystemPrompt is added to Claude Code's system prompt on every task
 	// (--append-system-prompt). Use it for standing, machine-specific guidance —
@@ -256,12 +276,17 @@ func Load() Config {
 		DefaultAgent:       getenv("CLI_AGENT_MCP_DEFAULT_AGENT", "claude"),
 		ClaudeBin:          getenv("CLI_AGENT_MCP_CLAUDE_BIN", "claude"),
 		CursorBin:          getenv("CLI_AGENT_MCP_CURSOR_BIN", "cursor-agent"),
+		PrimeBin:           getenv("CLI_AGENT_MCP_PRIME_BIN", ""),
+		PrimeProvider:      getenv("CLI_AGENT_MCP_PRIME_PROVIDER", ""),
+		PrimeTools:         getenv("CLI_AGENT_MCP_PRIME_TOOLS", ""),
+		PrimeExcludeTools:  getenv("CLI_AGENT_MCP_PRIME_EXCLUDE_TOOLS", ""),
 		PermissionMode:     getenv("CLI_AGENT_MCP_PERMISSION_MODE", "acceptEdits"),
 		AllowedTools:       getenv("CLI_AGENT_MCP_ALLOWED_TOOLS", ""),
 		DisallowedTools:    getenv("CLI_AGENT_MCP_DISALLOWED_TOOLS", ""),
 		AllowExtraArgs:     getbool("CLI_AGENT_MCP_ALLOW_EXTRA_ARGS", false),
 		ClaudeExtraArgs:    splitList("CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS"),
 		CursorExtraArgs:    splitList("CLI_AGENT_MCP_CURSOR_EXTRA_ARGS"),
+		PrimeExtraArgs:     splitList("CLI_AGENT_MCP_PRIME_EXTRA_ARGS"),
 		AppendSystemPrompt: getenv("CLI_AGENT_MCP_APPEND_SYSTEM_PROMPT", ""),
 		CustomName:         getenv("CLI_AGENT_MCP_CUSTOM_NAME", "custom"),
 		CustomBin:          getenv("CLI_AGENT_MCP_CUSTOM_BIN", ""),
