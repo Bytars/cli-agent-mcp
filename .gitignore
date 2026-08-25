@@ -28,3 +28,7 @@ go.work.sum
 .idea/
 .DS_Store
 Thumbs.db
+
+# Transcripts from scripts/e2e.ps1 (real-agent runs; may contain prompts and output)
+.e2e/
+cli-agent-mcp.exe

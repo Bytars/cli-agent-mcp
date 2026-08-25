@@ -131,14 +131,14 @@ func TestConcurrencyLimitRefusesExtraWorkers(t *testing.T) {
 
 	var started []*Task
 	for i := 0; i < 2; i++ {
-		tk, err := m.StartTask(sleepAdapter{ms: 2000}, t.TempDir(), agent.RunSpec{Prompt: "work"})
+		tk, err := m.StartTask(sleepAdapter{ms: 2000}, t.TempDir(), agent.RunSpec{Prompt: "work"}, Options{})
 		if err != nil {
 			t.Fatalf("task %d should have been admitted: %v", i, err)
 		}
 		started = append(started, tk)
 	}
 
-	if _, err := m.StartTask(sleepAdapter{ms: 2000}, t.TempDir(), agent.RunSpec{Prompt: "work"}); err == nil {
+	if _, err := m.StartTask(sleepAdapter{ms: 2000}, t.TempDir(), agent.RunSpec{Prompt: "work"}, Options{}); err == nil {
 		t.Fatal("a third concurrent task must be refused")
 	} else if !strings.Contains(err.Error(), "MAX_CONCURRENT") {
 		t.Errorf("the refusal must name the setting that caused it, got: %v", err)
@@ -158,7 +158,7 @@ func TestZeroConcurrencyLimitMeansNoLimit(t *testing.T) {
 
 	var started []*Task
 	for i := 0; i < 4; i++ {
-		tk, err := m.StartTask(sleepAdapter{ms: 1500}, t.TempDir(), agent.RunSpec{Prompt: "work"})
+		tk, err := m.StartTask(sleepAdapter{ms: 1500}, t.TempDir(), agent.RunSpec{Prompt: "work"}, Options{})
 		if err != nil {
 			t.Fatalf("task %d was refused although the limit is disabled: %v", i, err)
 		}

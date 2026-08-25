@@ -5,3 +5,10 @@
 *.mod  text eol=lf
 *.sum  text eol=lf
 *.md   text eol=lf
+
+# CRLF, because that is what every Windows editor writes and normalising to LF
+# invites a mixed-ending diff on the next edit. The UTF-8 BOM these files carry
+# is content rather than line endings, so it survives either way — and
+# PowerShell 5.1 needs it, or it decodes a .ps1 as the ANSI codepage and the
+# script fails to parse.
+*.ps1 text eol=crlf

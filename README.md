@@ -699,14 +699,52 @@ go build -o cli-agent-mcp .
 go run ./cmd/smoketest ./cli-agent-mcp
 ```
 
-The smoke test is env-driven, so you can point it at a real agent:
+### The real-agent gate
+
+Everything above is what CI runs, and there is a category of bug it cannot see.
+The mock agent never reads `--mcp-config`, never asks for permission and never
+spends a token, so anything that breaks only when a real worker runs stays green
+all the way to a release. That is not hypothetical: a relative `--mcp-config`
+path once made every `agent_run_task` fail while the suite reported PASSED.
+
+`scripts/e2e.ps1` is the gate for that category. It drives a real Claude Code
+through the same MCP surface an orchestrating client uses:
+
+```powershell
+./scripts/e2e.ps1                      # the whole matrix
+./scripts/e2e.ps1 -Only permission     # one scenario
+```
+
+It reports three outcomes, not two. **SKIPPED** — the agent is not on `PATH` —
+exits 2 and is not a pass, because skipping the real-agent runs is exactly the
+hole the script exists to close. Transcripts land under `.e2e/<timestamp>/`,
+including the server's stderr, since `interactive approval: http://...` is how
+you tell an enabled approval endpoint from one that quietly failed to start.
+
+| `SMOKE_ONLY` | proves |
+| --- | --- |
+| *(unset)* | the whole tool surface end to end |
+| `permission` | a blocked worker parks, is answered, and its work lands on disk |
+| `abandon` | a turn outlives the MCP call that asked for it |
+| `concurrency` | the live-worker cap refuses work and reopens on cancel |
+| `plan`, `watchstream`, `timeout`, `cancel` | one behaviour each, in isolation |
+
+Run it before opening a PR that changes how workers are launched, approved or
+accounted for. It needs a scratch git repository it may freely modify: the
+scenarios tell the agent to create and edit files in it.
+
+The smoke test is env-driven, so a single scenario can be pointed at any agent
+without the script:
 
 ```bash
-SMOKE_AGENT=claude SMOKE_PROMPT="say hi" SMOKE_FOLLOWUP=0 \
+SMOKE_AGENT=claude SMOKE_CWD=/path/to/scratch/repo SMOKE_ONLY=permission \
   go run ./cmd/smoketest ./cli-agent-mcp
 ```
 
-CI ([`ci.yml`](.github/workflows/ci.yml)) runs all of the above on every push and PR.
+CI ([`ci.yml`](.github/workflows/ci.yml)) runs the build, vet, unit tests and the
+mock smoke test on Linux and Windows for every push and PR. It does **not** run
+the real-agent gate — the runners have no Claude Code install and no API key —
+which is why `scripts/e2e.ps1` is run locally instead.
 
 ## Releases
 
@@ -756,7 +794,13 @@ internal/inspect/           read-only viewers, out of process
   cli.go                    `tasks` and `logs` (picker, live tail, --all)
   web.go                    `ui`: local HTTP server + JSON API
   live.html                 the web viewer, self-contained
-cmd/smoketest/              end-to-end test via the MCP client
+cmd/smoketest/              end-to-end tests via a real MCP client
+  main.go                   the full tool surface, plus the isolated branches
+  scenario.go               the SMOKE_ONLY registry
+  scenario_permission.go    a blocked worker parks, is answered, does the work
+  scenario_abandon.go       a turn outlives the call that asked for it
+  scenario_concurrency.go   the live-worker cap holds and reopens
+scripts/e2e.ps1             the real-agent gate CI cannot run
 ```
 
 ## Contributing

@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -86,9 +87,22 @@ func registerPermissionTools(srv *mcp.Server, mgr *task.Manager, grantStore *gra
 			verb = "Allowed"
 		}
 		msg := fmt.Sprintf("%s %s for task %s. The worker has resumed.", verb, r.Tool, r.TaskID)
+
+		// Recording happens here, not on the worker's goroutine, so that what is
+		// reported is what actually happened. It used to be done after this call
+		// had already replied, which meant a store that refused to save still
+		// produced "pre-approved for every future task" — the one sentence a user
+		// relies on to stop being asked.
 		if in.Allow && in.Remember {
-			msg += fmt.Sprintf(" %s is now pre-approved for every future task, so it will not be asked again — undo that with agent_revoke_permission.",
-				grants.Grant{Tool: r.Tool, Command: r.Command})
+			g := grants.Grant{Tool: r.Tool, Command: r.Command, Note: "granted while running " + r.TaskID}
+			switch err := grantStore.Add(g); {
+			case err != nil:
+				log.Printf("warning: could not remember the grant for %s: %v", g, err)
+				msg += fmt.Sprintf(" It could NOT be remembered, so it will be asked again next time (%v).", err)
+			default:
+				log.Printf("remembered: %s", g)
+				msg += fmt.Sprintf(" %s is now pre-approved for every future task, so it will not be asked again — undo that with agent_revoke_permission.", g)
+			}
 		}
 		return textResult(msg), snap, nil
 	})

@@ -159,10 +159,19 @@ func main() {
 		return
 	}
 
+	// Resolved once, because empty means "the per-user default" and both stores
+	// below need a real path. Passing cfg.StateDir straight through left grants
+	// with no directory at all, and the approval config on a relative path the
+	// agent resolved against its own workspace.
+	stateDir := cfg.StateDir
+	if stateDir == "" {
+		stateDir = state.DefaultDir()
+	}
+
 	// Interactive approval. It only does anything for a client that can put a
 	// question to its user, and it fails soft: if the endpoint cannot be brought
 	// up, tasks run exactly as they did before.
-	grantStore, err := grants.Open(cfg.StateDir)
+	grantStore, err := grants.Open(stateDir)
 	if err != nil {
 		log.Printf("warning: remembered permissions are unavailable: %v", err)
 		grantStore = &grants.Store{}
@@ -173,15 +182,6 @@ func main() {
 	desk.grants = grantStore
 	mgr.SetGrants(grantStore)
 	if cfg.AskPermission {
-		// The resolved directory, not cfg.StateDir: empty means "the per-user
-		// default", which state.Open expands internally. Joining "approval" onto
-		// the empty string yields a RELATIVE path, and the agent resolves it
-		// against its own working directory — the task's workspace — where the
-		// file does not exist. Claude Code then refuses to start at all.
-		stateDir := cfg.StateDir
-		if stateDir == "" {
-			stateDir = state.DefaultDir()
-		}
 		broker, err := approval.Start(filepath.Join(stateDir, "approval"), desk.Decide)
 		if err != nil {
 			log.Printf("warning: interactive permission prompts are off: %v", err)
@@ -627,7 +627,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
-		})
+		}, task.Options{Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
@@ -806,7 +806,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
-		t, err := mgr.Followup(in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs)
+		t, err := mgr.Followup(in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs, task.Options{Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
