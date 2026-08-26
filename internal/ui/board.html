@@ -92,6 +92,9 @@
      It borrows the failed colour rather than the running one: nothing is
      progressing, and it stays that way until a person acts. */
   .waiting { border-color: var(--failed); color: var(--failed); }
+  /* Isolated work is not in the directory the user asked about, and nothing
+     else on the row says so. */
+  .isolated { border-color: var(--running); color: var(--running); }
   .dot.waiting-dot { background: var(--failed); animation: pulse 1.6s ease-in-out infinite; }
   .ask {
     border: 1px solid var(--failed); border-radius: 8px; padding: 8px 10px;
@@ -331,6 +334,10 @@
                 : "") +
             "</div>" +
             (usage ? '<div class="row"><span class="meta">' + esc(usage) + "</span></div>" : "") +
+            (t.worktree
+              ? '<div class="row"><span class="meta">on branch ' + esc(t.branch) +
+                  ", cut from " + esc(t.repo) + "; review with agent_task_diff</span></div>"
+              : "") +
             '<div class="row"><span class="cwd">' + esc(t.cwd) + "</span></div>" +
             "<pre>" + esc(out === undefined ? "loading…" : (out || "(no output yet)")) + "</pre>" +
           "</div>";
@@ -343,6 +350,7 @@
             '<span class="dot ' + (ask ? "waiting-dot" : esc(t.status)) + '"></span>' +
             '<span class="prompt">' + esc(prompt) + "</span>" +
             (ask ? '<span class="badge waiting">needs permission</span>' : "") +
+            (t.worktree ? '<span class="badge isolated">isolated</span>' : "") +
             (t.usage && t.usage.cost_usd
               ? '<span class="meta">' + esc(money(t.usage.cost_usd)) + "</span>"
               : "") +

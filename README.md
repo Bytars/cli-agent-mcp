@@ -90,6 +90,8 @@ newline-delimited output. That gives a clean programmatic contract:
 | `agent_cancel_task` | Terminate a running task. |
 | `agent_list_tasks` | List all tasks, newest first. |
 | `agent_list_agents` | Show which agents are available on this machine. |
+| **`agent_task_diff`** | Show what a task actually changed, against where the repository stood when it started. |
+| `agent_remove_worktree` | Delete an isolated task's checkout and branch, once you are done with it. |
 
 ## Seeing where tasks stand
 
@@ -388,6 +390,7 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_MAX_TASKS` | `100` | Max retained tasks in memory. |
 | `CLI_AGENT_MCP_MAX_CONCURRENT` | `3` | Max workers running at once; further tasks are refused until one finishes. `0` disables the cap. |
 | `CLI_AGENT_MCP_MAX_COST_USD` | `0` (off) | What one task may spend, in dollars. See [Cost](#cost). |
+| `CLI_AGENT_MCP_WORKTREE_DIR` | under the state dir | Where isolated task checkouts are created. Never inside the repository. |
 | `CLI_AGENT_MCP_ASK_PERMISSION` | `true` | Let a worker ask you before using a tool it was not pre-approved for, instead of stalling. |
 | `CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS` | `600` | How long a worker waits for that answer before giving up on it. |
 | `CLI_AGENT_MCP_AUDIT_LOG` | — | Path to a JSONL audit log of what the worker did. See [Audit log](#audit-log). |
@@ -480,6 +483,43 @@ completion, you can't inject a prompt mid-turn; you steer *between* turns (cance
 and restart with a corrected prompt, or `agent_send_followup`). That mirrors how
 a human drives one of these agents by hand. For anything destructive, combine
 this with `agent_plan_task` so judgment happens *before* execution.
+
+## Running several agents at once — `isolate`
+
+Two workers in one checkout overwrite each other. They are editing the same
+files with no idea the other exists, and what you get back is a diff neither of
+them intended.
+
+Passing `isolate: true` to `agent_run_task` or `agent_start_task` gives that task
+a **git worktree of its own**, on a branch of its own, sharing the repository's
+history. Several agents can then work at the same time without touching each
+other's files.
+
+It is opt-in per call rather than a mode, because it is the right answer often
+but not always. **A worktree is a fresh checkout**, so anything the repository
+does not track — `node_modules`, a `.env`, a build cache — is not in it. A task
+that needs those should run in place.
+
+The cost of isolation is that the work is then **not** where you asked for it,
+which is invisible until someone looks in the original directory and finds
+nothing. So the result says so outright, and the task board marks the row
+`isolated`.
+
+```
+This task ran isolated in <path>, on branch <branch> (cut from <repo>).
+Its changes are NOT in the original working copy — review them with
+agent_task_diff, merge the branch when you want them, and call
+agent_remove_worktree to clean up.
+```
+
+`agent_task_diff` compares against **where the repository stood when the task
+started**, not against `HEAD`. That distinction matters: once a worker commits
+its own work, a diff against `HEAD` shows nothing, which reads as "the agent
+changed no files" — the opposite of the truth.
+
+`agent_remove_worktree` refuses while the checkout still holds uncommitted
+changes, unless forced. That work is the entire product of the task and exists
+nowhere else.
 
 ## A second server instance
 
@@ -802,6 +842,7 @@ you tell an enabled approval endpoint from one that quietly failed to start.
 | `abandon` | a turn outlives the MCP call that asked for it |
 | `concurrency` | the live-worker cap refuses work and reopens on cancel |
 | `crosscancel` | a cancel asked for in one server process stops a worker owned by another (needs `CLI_AGENT_MCP_STATE_DIR`) |
+| `worktree` | an isolated task edits its own checkout and leaves the original directory untouched |
 | `plan`, `watchstream`, `timeout`, `cancel` | one behaviour each, in isolation |
 
 Run it before opening a PR that changes how workers are launched, approved or

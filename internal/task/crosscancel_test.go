@@ -29,7 +29,7 @@ func TestASecondInstanceCanStopTheFirstsTask(t *testing.T) {
 	owner := NewManager(10)
 	owner.SetStore(store)
 
-	tk, err := owner.StartTask(sleepAdapter{ms: 20000}, t.TempDir(), agent.RunSpec{Prompt: "work"}, Options{})
+	tk, err := owner.StartTask(sleepAdapter{ms: 20000}, At(t.TempDir()), agent.RunSpec{Prompt: "work"}, Options{})
 	if err != nil {
 		t.Fatalf("StartTask: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestARequestArrivingBeforeTheWatcherIsHonoured(t *testing.T) {
 	m := NewManager(10)
 	m.SetStore(store)
 
-	tk := m.newTask(sleepAdapter{ms: 20000}, t.TempDir(), agent.RunSpec{Prompt: "work"})
+	tk := m.newTask(sleepAdapter{ms: 20000}, At(t.TempDir()), agent.RunSpec{Prompt: "work"})
 	if err := m.admit(tk); err != nil {
 		t.Fatalf("admit: %v", err)
 	}

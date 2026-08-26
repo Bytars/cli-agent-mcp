@@ -16,7 +16,7 @@ func TestBudgetShrinksAsATaskSpends(t *testing.T) {
 	m := NewManager(10)
 	m.SetMaxCostUSD(1.00)
 
-	tk := m.newTask(agent.NewMockAdapter(), t.TempDir(), agent.RunSpec{Prompt: "x"})
+	tk := m.newTask(agent.NewMockAdapter(), At(t.TempDir()), agent.RunSpec{Prompt: "x"})
 
 	left, ok := m.budgetFor(tk)
 	if !ok || left != 1.00 {
@@ -38,7 +38,7 @@ func TestBudgetShrinksAsATaskSpends(t *testing.T) {
 func TestBudgetRefusesOnceSpent(t *testing.T) {
 	m := NewManager(10)
 	m.SetMaxCostUSD(1.00)
-	tk := m.newTask(agent.NewMockAdapter(), t.TempDir(), agent.RunSpec{Prompt: "x"})
+	tk := m.newTask(agent.NewMockAdapter(), At(t.TempDir()), agent.RunSpec{Prompt: "x"})
 
 	for _, spent := range []float64{1.00, 1.50} {
 		tk.usage = agent.Usage{CostUSD: spent}
@@ -53,7 +53,7 @@ func TestBudgetRefusesOnceSpent(t *testing.T) {
 func TestZeroBudgetMeansNoLimit(t *testing.T) {
 	m := NewManager(10)
 	m.SetMaxCostUSD(0)
-	tk := m.newTask(agent.NewMockAdapter(), t.TempDir(), agent.RunSpec{Prompt: "x"})
+	tk := m.newTask(agent.NewMockAdapter(), At(t.TempDir()), agent.RunSpec{Prompt: "x"})
 	tk.usage.Add(agent.Usage{CostUSD: 999})
 
 	left, ok := m.budgetFor(tk)
@@ -69,7 +69,7 @@ func TestZeroBudgetMeansNoLimit(t *testing.T) {
 // the caller has to be able to tell "not measured" from "cost zero".
 func TestSnapshotDistinguishesUnmeasuredFromFree(t *testing.T) {
 	m := NewManager(10)
-	tk := m.newTask(agent.NewMockAdapter(), t.TempDir(), agent.RunSpec{Prompt: "x"})
+	tk := m.newTask(agent.NewMockAdapter(), At(t.TempDir()), agent.RunSpec{Prompt: "x"})
 
 	if snap := tk.Snapshot(); snap.Usage != nil {
 		t.Errorf("a task that reported no accounting must leave Usage nil, got %+v", snap.Usage)
