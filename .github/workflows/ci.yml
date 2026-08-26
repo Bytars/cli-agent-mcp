@@ -32,12 +32,33 @@ jobs:
         shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
+
+      # setup-go v6 changed how the toolchain is resolved, and go.mod is the
+      # only thing that should decide it. Asserting beats reading a log line:
+      # picking up a different Go would otherwise show as puzzling failures
+      # somewhere further down, or as no failure at all until it mattered.
+      #
+      # Only major.minor is compared. A patch difference is the installer doing
+      # its job; a minor difference means the file was not honoured.
+      - name: Toolchain matches go.mod
+        run: |
+          want="$(awk '/^go /{print $2; exit}' go.mod)"
+          got="$(go env GOVERSION)"
+          # cut rather than ${x%.*}: go.mod may carry a patch or not, and the
+          # suffix trick turns a bare "1.26" into "1".
+          wanted="$(printf '%s' "$want" | cut -d. -f1,2)"
+          active="$(printf '%s' "${got#go}" | cut -d. -f1,2)"
+          if [ "$wanted" != "$active" ]; then
+            echo "go.mod asks for $want but the toolchain is $got"
+            exit 1
+          fi
+          echo "go.mod wants $want, toolchain is $got"
 
       - name: Format check
         run: |
