@@ -108,6 +108,18 @@ live transcript, and a cancel button on anything still running. It polls every
 2s while something runs, backs off to 8s once everything has settled, and pauses
 while the panel is off-screen.
 
+Two things it surfaces that are otherwise easy to miss:
+
+**A task waiting for permission** is flagged in its row — nothing is progressing
+and only a person can change that, so it does not need opening to be noticed.
+Expanding shows the command at stake and three answers: allow it once, allow it
+from now on (which records the grant, so it is never asked again), or deny.
+Without this the request only reaches you through the orchestrating model.
+
+**What each task cost**, next to the task rather than behind a click, with the
+total across the board in the header. A task that reported no accounting shows
+no figure at all, which is different from one that reported zero.
+
 **Host support.** This needs a host implementing the MCP Apps extension (spec
 `2026-01-26`). The server advertises it during `initialize` under
 `capabilities.extensions["io.modelcontextprotocol/ui"]`. Hosts that don't

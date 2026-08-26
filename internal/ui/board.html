@@ -86,6 +86,18 @@
   }
   .dot.orphaned { background: var(--canceled); box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--canceled); }
   .cwd { font-size: 11px; color: var(--muted); word-break: break-all; }
+
+  /* A task waiting on a permission looks exactly like a slow one unless it is
+     marked, and it is the only state on this board that cannot resolve itself.
+     It borrows the failed colour rather than the running one: nothing is
+     progressing, and it stays that way until a person acts. */
+  .waiting { border-color: var(--failed); color: var(--failed); }
+  .dot.waiting-dot { background: var(--failed); animation: pulse 1.6s ease-in-out infinite; }
+  .ask {
+    border: 1px solid var(--failed); border-radius: 8px; padding: 8px 10px;
+    margin-bottom: 8px; font-size: 12px; line-height: 1.5;
+  }
+  .ask code { word-break: break-all; }
 </style>
 </head>
 <body>
@@ -188,6 +200,36 @@
     return Math.floor(m / 60) + "h " + (m % 60) + "m";
   }
 
+  function money(n) {
+    if (!n) return "";
+    // Four decimals under a cent, because most single turns land there and
+    // "$0.00" beside every task teaches you the number is not worth reading.
+    return "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2));
+  }
+
+  function compactNum(n) {
+    if (!n) return "0";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+    return String(n);
+  }
+
+  // What a task cost is the part of delegating that accumulates without anyone
+  // watching it, so it sits next to the task rather than behind a click.
+  function usageText(t) {
+    var u = t.usage;
+    if (!u) return "";
+    var bits = [];
+    if (u.cost_usd) bits.push(money(u.cost_usd));
+    if (u.input_tokens || u.output_tokens) {
+      bits.push(compactNum(u.input_tokens) + " in / " + compactNum(u.output_tokens) + " out");
+    }
+    if (u.cache_read_tokens) bits.push(compactNum(u.cache_read_tokens) + " cached");
+    if (u.num_turns) bits.push(u.num_turns + (u.num_turns === 1 ? " turn" : " turns"));
+    if (t.model_used) bits.push(t.model_used);
+    return bits.join(" · ");
+  }
+
   function statusLabel(t) {
     if (t.status !== "failed") return t.status;
     var bits = [];
@@ -238,9 +280,14 @@
     announceFinished(lastTasks);
     var running = lastTasks.filter(function (t) { return t.status === "running"; }).length;
 
+    var spent = lastTasks.reduce(function (sum, t) {
+      return sum + ((t.usage && t.usage.cost_usd) || 0);
+    }, 0);
+
     countEl.textContent = lastTasks.length
       ? lastTasks.length + " task" + (lastTasks.length === 1 ? "" : "s") +
-        (running ? " · " + running + " running" : "")
+        (running ? " · " + running + " running" : "") +
+        (spent ? " · " + money(spent) + " total" : "")
       : "";
 
     if (!lastTasks.length) {
@@ -253,10 +300,27 @@
       var prompt = (t.prompts && t.prompts.length) ? t.prompts[t.prompts.length - 1] : "(no prompt)";
       var out = outputs.get(t.task_id);
 
+      // A task blocked on a permission is running and getting nowhere, and only
+      // a person can change that. It leads the row when the row is open, and is
+      // flagged in the head so it does not need opening to be noticed.
+      var ask = t.pending_permission;
+      var askBlock = ask
+        ? '<div class="ask">⏸ <b>Waiting for permission</b> to use ' + esc(ask.tool) +
+            (ask.detail ? ": <code>" + esc(ask.detail) + "</code>" : "") +
+            '<div class="row" style="margin-top:8px">' +
+              '<button data-allow="' + esc(t.task_id) + '">Allow once</button>' +
+              '<button data-allow-always="' + esc(t.task_id) + '">Allow from now on</button>' +
+              '<button class="danger" data-deny="' + esc(t.task_id) + '">Deny</button>' +
+            "</div>" +
+          "</div>"
+        : "";
+      var usage = usageText(t);
+
       var body = "";
       if (open) {
         body =
           '<div class="body">' +
+            askBlock +
             (t.error ? '<div class="err">' + esc(t.error) + "</div>" : "") +
             '<div class="row">' +
               '<span class="id">' + esc(t.task_id) + "</span>" +
@@ -266,6 +330,7 @@
                 ? '<button class="danger" data-cancel="' + esc(t.task_id) + '">Cancel</button>'
                 : "") +
             "</div>" +
+            (usage ? '<div class="row"><span class="meta">' + esc(usage) + "</span></div>" : "") +
             '<div class="row"><span class="cwd">' + esc(t.cwd) + "</span></div>" +
             "<pre>" + esc(out === undefined ? "loading…" : (out || "(no output yet)")) + "</pre>" +
           "</div>";
@@ -275,8 +340,12 @@
         '<div class="task">' +
           '<div class="head" data-toggle="' + esc(t.task_id) + '">' +
             '<span class="chev">' + (open ? "▾" : "▸") + "</span>" +
-            '<span class="dot ' + esc(t.status) + '"></span>' +
+            '<span class="dot ' + (ask ? "waiting-dot" : esc(t.status)) + '"></span>' +
             '<span class="prompt">' + esc(prompt) + "</span>" +
+            (ask ? '<span class="badge waiting">needs permission</span>' : "") +
+            (t.usage && t.usage.cost_usd
+              ? '<span class="meta">' + esc(money(t.usage.cost_usd)) + "</span>"
+              : "") +
             '<span class="badge">' + esc(t.agent) + "</span>" +
             '<span class="meta">' + esc(elapsed(t)) + "</span>" +
           "</div>" + body +
@@ -305,10 +374,33 @@
         el.disabled = true;
         el.textContent = "Cancelling…";
         callTool("agent_cancel_task", { task_id: el.getAttribute("data-cancel") })
-          .then(refresh)
+          .then(function () { return refresh(true); })
           .catch(fail);
       });
     });
+
+    // The three answers differ only in two booleans, so they share one handler
+    // rather than three near-identical ones. "Allow from now on" is the only
+    // one that records anything: remember=true pre-approves that tool for every
+    // future task, which is why it is worded as a standing decision rather than
+    // as a second kind of yes.
+    [["data-allow", true, false], ["data-allow-always", true, true], ["data-deny", false, false]]
+      .forEach(function (spec) {
+        listEl.querySelectorAll("[" + spec[0] + "]").forEach(function (el) {
+          el.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            // Every button in the block, so a second click cannot answer the
+            // same request twice while the first answer is still in flight.
+            el.closest(".ask").querySelectorAll("button").forEach(function (b) { b.disabled = true; });
+            el.textContent = "…";
+            callTool("agent_answer_permission", {
+              task_id: el.getAttribute(spec[0]),
+              allow: spec[1],
+              remember: spec[2]
+            }).then(function () { return refresh(true); }).catch(fail);
+          });
+        });
+      });
   }
 
   // Tail the transcript: ask only for the last lines, using the line count the
@@ -337,8 +429,13 @@
 
   var polling = false;
 
-  function refresh() {
-    if (polling || document.hidden) return Promise.resolve();
+  // force is for refreshes the user just asked for by clicking something. The
+  // hidden guard exists to stop a panel nobody is looking at from polling; it
+  // must not also swallow the update that shows an action landed. Answering a
+  // permission and watching the row keep saying "needs permission" reads as the
+  // answer having been lost.
+  function refresh(force) {
+    if (polling || (document.hidden && !force)) return Promise.resolve();
     polling = true;
     return callTool("agent_list_tasks", {})
       .then(function (res) {
