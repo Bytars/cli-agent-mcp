@@ -46,6 +46,9 @@ type Owner struct {
 const (
 	tasksSubdir = "tasks"
 	lockFile    = "server.lock"
+
+	// cancelExt marks a task another instance has asked to stop.
+	cancelExt = ".cancel"
 )
 
 // DefaultDir is where state goes when the operator names no directory:
@@ -264,6 +267,9 @@ func (s *Store) Forget(id string) {
 	s.mu.Unlock()
 	os.Remove(s.taskPath(id, ".json"))
 	os.Remove(s.taskPath(id, ".log"))
+	// A request nobody acted on would otherwise outlive the task it named and
+	// sit in the directory for the life of the installation.
+	os.Remove(s.taskPath(id, cancelExt))
 }
 
 // Prune keeps the newest `keep` task records and deletes the rest. Without it
@@ -335,4 +341,45 @@ func (s *Store) Close() {
 		f.Close()
 		delete(s.logs, id)
 	}
+}
+
+// RequestCancel records that someone wants a task stopped.
+//
+// It exists because the process that can actually stop a worker is the one that
+// spawned it, and that is not always the process being asked. Clients do start a
+// second server instance alongside the first, and from there a task belonging to
+// the other one is visible — its record and transcript are on disk and keep
+// advancing — but untouchable.
+//
+// Killing the worker by pid from outside was the obvious alternative and is not
+// safe: pids are recycled, briskly on Windows, so a stale record would
+// eventually name a process that has nothing to do with us. Leaving the request
+// where the owner will find it costs a moment's delay and cannot kill the wrong
+// thing.
+func (s *Store) RequestCancel(id string) error {
+	if err := safeID(id); err != nil {
+		return err
+	}
+	return os.WriteFile(s.taskPath(id, cancelExt), []byte(time.Now().Format(time.RFC3339)), 0o600)
+}
+
+// CancelRequested reports whether a stop has been asked for.
+func (s *Store) CancelRequested(id string) bool {
+	if safeID(id) != nil {
+		return false
+	}
+	_, err := os.Stat(s.taskPath(id, cancelExt))
+	return err == nil
+}
+
+// ClearCancel drops the request once it has been acted on, so a task id reused
+// by a later run does not inherit it.
+func (s *Store) ClearCancel(id string) error {
+	if err := safeID(id); err != nil {
+		return err
+	}
+	if err := os.Remove(s.taskPath(id, cancelExt)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }

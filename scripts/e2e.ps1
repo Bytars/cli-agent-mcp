@@ -92,6 +92,14 @@ $suite = @(
     # so the mock proves it more cheaply and just as truthfully.
     @{ Name = 'concurrency'; Needs = 'none'; Script = { Invoke-Scenario -Scenario 'concurrency' -UseAgent 'mock' -Vars @{ CLI_AGENT_MCP_MAX_CONCURRENT = '3' } } },
 
+    # Two server processes over one state directory. Server-side, so the mock
+    # proves it; the state directory is a scratch one because the scenario
+    # cancels what it finds and must never be pointed at real tasks.
+    @{ Name = 'crosscancel'; Needs = 'none'; Script = {
+        $dir = Join-Path $logDir 'xcancel-state'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Invoke-Scenario -Scenario 'crosscancel' -UseAgent 'mock' -Vars @{ CLI_AGENT_MCP_STATE_DIR = $dir } } },
+
     @{ Name = 'real';       Needs = 'agent'; Script = { Invoke-Scenario -Scenario '' -UseAgent $Agent } },
     @{ Name = 'permission'; Needs = 'agent'; Script = { Invoke-Scenario -Scenario 'permission' -UseAgent $Agent -Vars @{ CLI_AGENT_MCP_WATCH_WINDOW_SECONDS = '10'; CLI_AGENT_MCP_PERMISSION_MODE = 'default' } } },
     @{ Name = 'abandon';    Needs = 'agent'; Script = { Invoke-Scenario -Scenario 'abandon'    -UseAgent $Agent -Vars @{ CLI_AGENT_MCP_WATCH_WINDOW_SECONDS = '10' } } }

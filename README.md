@@ -469,6 +469,28 @@ and restart with a corrected prompt, or `agent_send_followup`). That mirrors how
 a human drives one of these agents by hand. For anything destructive, combine
 this with `agent_plan_task` so judgment happens *before* execution.
 
+## A second server instance
+
+MCP clients do start a second `cli-agent-mcp` alongside the first rather than in
+place of it. The second one takes the state directory's lock, notices the first
+is still alive, and says so at startup.
+
+A task the other instance started shows up here as `orphaned`. That is a
+statement about ownership, not about visibility: everything a task produces is
+on disk while it is producing it, so an orphan's transcript and status keep
+advancing and it settles into its real outcome when its worker finishes.
+
+What the second instance does **not** have is a handle on that worker, so it
+cannot stop the process itself. `agent_cancel_task` therefore leaves the request
+in the state directory, and the instance that owns the worker picks it up within
+about a second and cancels it properly.
+
+Killing the worker by pid from outside was the obvious alternative and is not
+safe: pids are recycled, briskly on Windows, so a stale record would eventually
+name a process that has nothing to do with this server. The cost of going the
+long way round is a second of delay; the cost of getting it wrong is killing
+something unrelated.
+
 ## Cost
 
 Delegating hides what a person at a terminal would have watched accumulate, and
@@ -767,6 +789,7 @@ you tell an enabled approval endpoint from one that quietly failed to start.
 | `permission` | a blocked worker parks, is answered, and its work lands on disk |
 | `abandon` | a turn outlives the MCP call that asked for it |
 | `concurrency` | the live-worker cap refuses work and reopens on cancel |
+| `crosscancel` | a cancel asked for in one server process stops a worker owned by another (needs `CLI_AGENT_MCP_STATE_DIR`) |
 | `plan`, `watchstream`, `timeout`, `cancel` | one behaviour each, in isolation |
 
 Run it before opening a PR that changes how workers are launched, approved or
@@ -840,6 +863,7 @@ cmd/smoketest/              end-to-end tests via a real MCP client
   scenario_permission.go    a blocked worker parks, is answered, does the work
   scenario_abandon.go       a turn outlives the call that asked for it
   scenario_concurrency.go   the live-worker cap holds and reopens
+  scenario_crosscancel.go   two server processes, one state directory
 scripts/e2e.ps1             the real-agent gate CI cannot run
 ```
 

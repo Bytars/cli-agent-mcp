@@ -738,6 +738,11 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		fail("building command: " + err.Error())
 		return
 	}
+	// A cancel asked for by another instance arrives as a file rather than a
+	// call, because that instance has no handle on this worker. Watching for it
+	// here is what makes the request mean anything.
+	go watchCancelRequest(ctx, t, cancel)
+
 	cmd.Dir = spec.Cwd
 	// The child inherits our environment — that is the point: whatever the host
 	// can reach (VPN routes, an SSH agent, credentials) becomes available to the
@@ -761,20 +766,44 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		"env_repaired": repaired,
 	})
 
-	stdout, err := cmd.StdoutPipe()
+	// The pipes are ours rather than cmd.StdoutPipe()'s, and that is the whole
+	// point. os/exec closes a StdoutPipe as soon as Wait sees the process exit,
+	// discarding whatever the reader had not consumed yet — its own
+	// documentation says calling Wait before the reads have finished is
+	// incorrect. This code has to call Wait first (see below), so with a
+	// StdoutPipe the tail of the output was being thrown away: on a loaded
+	// machine that meant losing the agent's terminal result event, and with it
+	// the task's answer and its accounting. It showed up as a run that reported
+	// done and produced nothing.
+	//
+	// A pipe we own is not closed by Wait, so the reader keeps draining what is
+	// buffered and stops at a real EOF.
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		fail("stdout pipe: " + err.Error())
 		return
 	}
-	stderr, err := cmd.StderrPipe()
+	defer stdoutR.Close()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		stdoutW.Close()
 		fail("stderr pipe: " + err.Error())
 		return
 	}
+	defer stderrR.Close()
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+
 	if err := cmd.Start(); err != nil {
+		stdoutW.Close()
+		stderrW.Close()
 		fail("starting agent: " + err.Error())
 		return
 	}
+	// The child holds its own copy now. Ours has to go, or the read end never
+	// reaches EOF because this process is still a writer.
+	stdoutW.Close()
+	stderrW.Close()
 	guard.AfterStart(cmd)
 
 	// Safety net: a headless worker can hang forever (e.g. blocked on a
@@ -792,16 +821,20 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go t.pump(stdout, false, sink, &wg)
-	go t.pump(stderr, true, sink, &wg)
+	go t.pump(stdoutR, false, sink, &wg)
+	go t.pump(stderrR, true, sink, &wg)
 
 	// Order matters. Waiting on the pumps first looks natural but hangs forever
 	// whenever the agent leaves a background process holding the inherited
 	// stdout handle: the pipe never reaches EOF, so the pumps never return, and
-	// cmd.Wait — the only thing that honours WaitDelay and force-closes the
-	// pipes — is never reached. Calling Wait first lets WaitDelay do its job,
-	// after which the pumps see EOF. The grace period below is a second
-	// backstop so a stuck reader can never strand the turn.
+	// cmd.Wait — the only thing that honours WaitDelay and kills the tree — is
+	// never reached. Calling Wait first lets WaitDelay do its job.
+	//
+	// Because the pipes are ours, Wait does not close them, so the pumps go on
+	// draining what is already buffered and stop at a genuine EOF rather than
+	// losing the tail. The grace below is what keeps that from becoming a hang:
+	// when it expires the deferred Close on the read ends unblocks any pump
+	// still waiting on a handle somebody else is holding open.
 	pumpsDone := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -1066,8 +1099,22 @@ func (m *Manager) Cancel(id string) (Snapshot, error) {
 	}
 	t.mu.Lock()
 	if !t.running {
+		orphaned := t.status == StatusOrphaned
 		s := t.snapshot()
+		store := t.store
 		t.mu.Unlock()
+
+		// An orphan is running under another server instance, so this process
+		// has no handle on its worker and cannot stop it directly. Returning the
+		// snapshot as though the cancel had happened is the one answer that must
+		// not be given: a caller reads success and believes the task is stopping
+		// while it carries on spending.
+		if orphaned && store != nil {
+			if err := store.RequestCancel(t.ID); err != nil {
+				return s, fmt.Errorf("this task belongs to another server instance and the request to stop it could not be left for that instance: %w", err)
+			}
+			return s, nil
+		}
 		return s, nil
 	}
 	t.canceledRequested = true
@@ -1090,4 +1137,53 @@ func (m *Manager) Cancel(id string) (Snapshot, error) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return t.Snapshot(), nil
+}
+
+// cancelPollInterval is how often a running turn checks whether another server
+// instance has asked it to stop. A second is slower than a local cancel and far
+// faster than a person notices, and the check is a single stat.
+const cancelPollInterval = time.Second
+
+// watchCancelRequest stops the turn when another instance leaves a request for
+// it. It exits with the turn, so a finished task leaves nothing polling.
+func watchCancelRequest(ctx context.Context, t *Task, cancel context.CancelFunc) {
+	t.mu.Lock()
+	store := t.store
+	t.mu.Unlock()
+	if store == nil {
+		return
+	}
+
+	// Deliberately no "clear anything stale first" step here, though it looks
+	// like an obvious precaution and was one until it caused a failure.
+	//
+	// A request can be written the moment a task becomes visible, which is
+	// before this goroutine is scheduled — the caller doing the writing is not
+	// waiting on any I/O, and the turn's goroutine is. Clearing on entry
+	// therefore erases legitimate requests that arrive in that window, and does
+	// so more often the more loaded the machine is. It went unnoticed locally
+	// and failed on the first CI run.
+	//
+	// What it was guarding against does not really occur: task ids carry a
+	// random suffix and are not reused, and Forget removes the request along
+	// with the record when a task is evicted.
+	ticker := time.NewTicker(cancelPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !store.CancelRequested(t.ID) {
+				continue
+			}
+			_ = store.ClearCancel(t.ID)
+			t.mu.Lock()
+			t.canceledRequested = true
+			t.mu.Unlock()
+			t.audit.Log("cancel", map[string]any{"task_id": t.ID, "source": "another server instance"})
+			cancel()
+			return
+		}
+	}
 }

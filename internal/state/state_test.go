@@ -230,3 +230,59 @@ func TestPathTraversalIsRejected(t *testing.T) {
 		t.Errorf("unsafe ids created files: %s", strings.Join(names, ", "))
 	}
 }
+
+// The cancel request is a file named from a task id that arrives over the wire,
+// so the same guard that protects the record and the transcript has to cover it.
+// Without that, an id of "../../server" would put an attacker-chosen path under
+// this process's control.
+func TestCancelRequestsRefuseUnusableIDs(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	for _, id := range []string{"", "../escape", `..\escape`, "a/b", ".hidden"} {
+		if err := s.RequestCancel(id); err == nil {
+			t.Errorf("RequestCancel(%q) was accepted; it must be refused", id)
+		}
+		if s.CancelRequested(id) {
+			t.Errorf("CancelRequested(%q) reported true for an id that cannot be stored", id)
+		}
+		if err := s.ClearCancel(id); err == nil {
+			t.Errorf("ClearCancel(%q) was accepted; it must be refused", id)
+		}
+	}
+}
+
+// The three calls have to agree with each other, or a request would be written
+// where nothing looks for it.
+func TestCancelRequestRoundTrips(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	const id = "task-1-abcd"
+	if s.CancelRequested(id) {
+		t.Fatal("a fresh store reported a request nobody made")
+	}
+	if err := s.RequestCancel(id); err != nil {
+		t.Fatalf("RequestCancel: %v", err)
+	}
+	if !s.CancelRequested(id) {
+		t.Error("the request was written but is not visible")
+	}
+	if err := s.ClearCancel(id); err != nil {
+		t.Fatalf("ClearCancel: %v", err)
+	}
+	if s.CancelRequested(id) {
+		t.Error("the request survived being cleared")
+	}
+	// Clearing what is not there is how the owner starts every turn, so it must
+	// not be an error.
+	if err := s.ClearCancel(id); err != nil {
+		t.Errorf("clearing an absent request: %v", err)
+	}
+}
