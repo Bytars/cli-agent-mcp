@@ -102,7 +102,8 @@ $suite = @(
 
     @{ Name = 'real';       Needs = 'agent'; Script = { Invoke-Scenario -Scenario '' -UseAgent $Agent } },
     @{ Name = 'permission'; Needs = 'agent'; Script = { Invoke-Scenario -Scenario 'permission' -UseAgent $Agent -Vars @{ CLI_AGENT_MCP_WATCH_WINDOW_SECONDS = '10'; CLI_AGENT_MCP_PERMISSION_MODE = 'default' } } },
-    @{ Name = 'abandon';    Needs = 'agent'; Script = { Invoke-Scenario -Scenario 'abandon'    -UseAgent $Agent -Vars @{ CLI_AGENT_MCP_WATCH_WINDOW_SECONDS = '10' } } }
+    @{ Name = 'abandon';    Needs = 'agent'; Script = { Invoke-Scenario -Scenario 'abandon'    -UseAgent $Agent -Vars @{ CLI_AGENT_MCP_WATCH_WINDOW_SECONDS = '10' } } },
+    @{ Name = 'worktree';   Needs = 'agent'; Script = { Invoke-Scenario -Scenario 'worktree'   -UseAgent $Agent -Vars @{ CLI_AGENT_MCP_WATCH_WINDOW_SECONDS = '10' } } }
 )
 
 function Invoke-Scenario {

@@ -93,6 +93,12 @@ type Config struct {
 	// MaxTasks caps the number of tasks retained in memory.
 	MaxTasks int
 
+	// WorktreeDir is where isolated task checkouts are created. Empty puts them
+	// alongside the task records, under StateDir — anywhere but inside the
+	// repository, which would make them show up as untracked clutter in the very
+	// diff they exist to produce.
+	WorktreeDir string
+
 	// MaxCostUSD bounds what one task may spend, in US dollars. Zero disables it.
 	//
 	// It is enforced in two places because neither alone is enough. Claude Code
@@ -303,6 +309,7 @@ func Load() Config {
 		PermissionTimeout:  time.Duration(getPositiveInt("CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS", 600)) * time.Second,
 		AuditLog:           getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
 		StateDir:           getenv("CLI_AGENT_MCP_STATE_DIR", ""),
+		WorktreeDir:        getenv("CLI_AGENT_MCP_WORKTREE_DIR", ""),
 		WatchWindow:        watchWindow,
 		TaskTimeout:        taskTimeout,
 		Compact:            getbool("CLI_AGENT_MCP_COMPACT", true),

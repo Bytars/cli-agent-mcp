@@ -249,6 +249,7 @@ type startInput struct {
 	Model        string   `json:"model,omitempty" jsonschema:"Optional model override passed to the agent."`
 	AllowedTools []string `json:"allowed_tools,omitempty" jsonschema:"Tools to pre-approve for this run so the headless worker doesn't stall waiting for approval it can't get (Claude Code --allowedTools). Patterns supported, e.g. [\"Bash(git *)\",\"Edit\",\"PowerShell\"]. This only pre-approves; the server's deny policy still applies."`
 	ExtraArgs    []string `json:"extra_args,omitempty" jsonschema:"Extra CLI flags appended verbatim to this run (disabled by default on the server)."`
+	Isolate      bool     `json:"isolate,omitempty" jsonschema:"Run this task in a git worktree of its own, on its own branch, instead of directly in cwd. Use it when other work is happening in that directory, or when running several agents at once — two workers in one checkout overwrite each other's edits. Note a worktree is a fresh checkout, so untracked files (node_modules, .env, build caches) are NOT there; a task that needs them should run in place. Review the result with agent_task_diff."`
 }
 
 type idInput struct {
@@ -513,6 +514,7 @@ func truncate(s string, n int) string {
 
 func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config, desk *permissionDesk, grantStore *grants.Store) {
 	registerPermissionTools(srv, mgr, grantStore)
+	registerWorktreeTools(srv, mgr)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_run_task",
@@ -529,7 +531,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err != nil {
 			return errResult(emsg), task.Snapshot{}, nil
 		}
-		t, finished, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+		ws, wsErr, err := resolveWorkspace(ctx, cfg, cwd, in.Isolate)
+		if err != nil {
+			return errResult(wsErr), task.Snapshot{}, nil
+		}
+		t, finished, err := mgr.RunTaskStreaming(ctx, a, ws, agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
@@ -540,9 +546,9 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		}
 		snap := t.Snapshot()
 		if !finished {
-			return textResult(stillRunningText(snap, cfg.WatchWindow)), snap, nil
+			return textResult(stillRunningText(snap, cfg.WatchWindow) + workspaceNote(snap)), snap, nil
 		}
-		return textResult(finishText(snap)), snap, nil
+		return textResult(finishText(snap) + workspaceNote(snap)), snap, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -569,7 +575,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			msg := fmt.Sprintf("agent %q cannot guarantee plan-only execution, so refusing to run: it would carry the task out instead of planning it", a.Name())
 			return errResult(msg), task.Snapshot{}, nil
 		}
-		t, finished, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+		t, finished, err := mgr.RunTaskStreaming(ctx, a, task.At(cwd), agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
@@ -624,7 +630,11 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err != nil {
 			return errResult(emsg), task.Snapshot{}, nil
 		}
-		t, err := mgr.StartTask(a, cwd, agent.RunSpec{
+		ws, wsErr, err := resolveWorkspace(ctx, cfg, cwd, in.Isolate)
+		if err != nil {
+			return errResult(wsErr), task.Snapshot{}, nil
+		}
+		t, err := mgr.StartTask(a, ws, agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
@@ -992,6 +1002,7 @@ Configuration (environment variables):
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
   CLI_AGENT_MCP_MAX_CONCURRENT     Max workers running at once, 0 = no cap (default: 3)
   CLI_AGENT_MCP_MAX_COST_USD       Dollars one task may spend, 0 = no cap  (default: 0)
+  CLI_AGENT_MCP_WORKTREE_DIR       Where isolated task checkouts go (default: under the state dir)
   CLI_AGENT_MCP_ASK_PERMISSION     Let a worker ask before using a tool it was
                                    not pre-approved for            (default: true)
   CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS  How long it waits for that answer

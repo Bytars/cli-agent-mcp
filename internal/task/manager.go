@@ -27,6 +27,7 @@ import (
 
 	"github.com/Bytars/cli-agent-mcp/internal/agent"
 	"github.com/Bytars/cli-agent-mcp/internal/audit"
+	"github.com/Bytars/cli-agent-mcp/internal/gitx"
 	"github.com/Bytars/cli-agent-mcp/internal/grants"
 	"github.com/Bytars/cli-agent-mcp/internal/state"
 )
@@ -100,6 +101,16 @@ type Task struct {
 
 	usage     agent.Usage // accumulated over every turn of this task
 	modelUsed string      // the model the agent said it was running
+
+	// baseCommit is where the repository stood when this task started. It is
+	// captured up front because it cannot be recovered afterwards: once the
+	// worker commits its own work, a diff against HEAD shows nothing and reads
+	// as "the agent changed no files", which is the opposite of the truth.
+	baseCommit string
+
+	// workspace is where the worker runs — the caller's directory, or a git
+	// worktree cut for this task alone.
+	workspace Workspace
 }
 
 // Snapshot is an immutable view of a Task for serialization.
@@ -132,6 +143,17 @@ type Snapshot struct {
 	// Usage accumulates every turn's accounting. Nil when the agent reported
 	// none, so a caller can tell "free" from "not measured".
 	Usage *agent.Usage `json:"usage,omitempty"`
+
+	// BaseCommit is where the repository stood when the task started, so its
+	// changes can still be reviewed after the worker has committed them.
+	BaseCommit string `json:"base_commit,omitempty"`
+
+	// Worktree, Repo and Branch are set only when the task ran isolated in a
+	// checkout of its own. They are what tells a reader that the work is not in
+	// the directory they asked about, and where it is instead.
+	Worktree string `json:"worktree,omitempty"`
+	Repo     string `json:"repo,omitempty"`
+	Branch   string `json:"branch,omitempty"`
 }
 
 func (t *Task) snapshot() Snapshot {
@@ -155,6 +177,12 @@ func (t *Task) snapshot() Snapshot {
 	}
 	s.Pending = t.pending
 	s.ModelUsed = t.modelUsed
+	s.BaseCommit = t.baseCommit
+	if t.workspace.Isolated() {
+		s.Worktree = t.workspace.Path
+		s.Repo = t.workspace.Repo
+		s.Branch = t.workspace.Branch
+	}
 	if !t.usage.Empty() {
 		u := t.usage
 		s.Usage = &u
@@ -367,6 +395,26 @@ func (m *Manager) Running() int {
 	return n
 }
 
+// baseCommit records the starting point of a task's repository, or "" when the
+// directory is not a repository at all — which is not an error, only a
+// directory whose changes cannot be summarized later.
+func baseCommit(cwd string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	head, err := gitx.Head(ctx, cwd)
+	if err != nil {
+		return ""
+	}
+	return head
+}
+
+// BaseCommit reports where the repository stood when this task started.
+func (t *Task) BaseCommit() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.baseCommit
+}
+
 func newID(n uint64) string {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
@@ -417,10 +465,10 @@ func pathWithin(path, root string) bool {
 }
 
 // StartTask creates a task and launches its first turn asynchronously.
-func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec, opts Options) (*Task, error) {
-	t := m.newTask(a, cwd, spec)
+func (m *Manager) StartTask(a agent.Adapter, ws Workspace, spec agent.RunSpec, opts Options) (*Task, error) {
+	t := m.newTask(a, ws, spec)
 	t.approver = opts.Approver
-	spec.Cwd = cwd
+	spec.Cwd = ws.Path
 
 	if err := m.admit(t); err != nil {
 		return nil, err
@@ -437,10 +485,10 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec, opt
 // runDetached and reports whether it finished; either way the turn keeps
 // running. Used by the streaming "run" tools so the MCP client sees live
 // progress.
-func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd string, spec agent.RunSpec, opts Options) (t *Task, finished bool, err error) {
-	t = m.newTask(a, cwd, spec)
+func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, ws Workspace, spec agent.RunSpec, opts Options) (t *Task, finished bool, err error) {
+	t = m.newTask(a, ws, spec)
 	t.approver = opts.Approver
-	spec.Cwd = cwd
+	spec.Cwd = ws.Path
 
 	if err := m.admit(t); err != nil {
 		return nil, false, err
@@ -468,11 +516,11 @@ func (m *Manager) FollowupStreaming(ctx context.Context, id, prompt string, allo
 
 // newTask builds a task record. Every entry point starts from here, so the
 // fields a task is born with are defined once rather than per caller.
-func (m *Manager) newTask(a agent.Adapter, cwd string, spec agent.RunSpec) *Task {
+func (m *Manager) newTask(a agent.Adapter, ws Workspace, spec agent.RunSpec) *Task {
 	return &Task{
 		ID:        newID(m.counter.Add(1)),
 		AgentName: a.Name(),
-		Cwd:       cwd,
+		Cwd:       ws.Path,
 		Model:     spec.Model,
 		adapter:   a,
 		audit:     m.audit,
@@ -480,6 +528,10 @@ func (m *Manager) newTask(a agent.Adapter, cwd string, spec agent.RunSpec) *Task
 		status:    StatusRunning,
 		running:   true,
 		startedAt: time.Now(),
+		// Read now, not later: once the worker commits its own work a diff
+		// against HEAD shows nothing, which reads as "it changed no files".
+		baseCommit: baseCommit(ws.Path),
+		workspace:  ws,
 	}
 }
 
