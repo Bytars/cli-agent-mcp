@@ -514,6 +514,15 @@ func TestElRechazoNombraAlLanzadorYLaSalida(t *testing.T) {
 	if stderr == "" {
 		t.Fatal("stderr vacío")
 	}
+	// The log has to carry the way out too, not only the message for the model.
+	// In this state the user's client is broken, so the model's relay may never
+	// reach them — the log is the one channel they certainly have, and it is
+	// where this gets diagnosed. An escape only in the message they cannot read
+	// repeats the mistake this whole change exists to fix.
+	if !strings.Contains(stderr, "pair --unpair") {
+		t.Errorf("the log names no way out, so a user whose client is dead cannot rescue themselves "+
+			"from what they can actually read:\n%s", stderr)
+	}
 	if !strings.Contains(client, launcher) {
 		t.Errorf("el mensaje al cliente no nombra al lanzador (%s).\n"+
 			"Es el dato que dice en la configuración de QUÉ programa tiene que estar el token,\n"+
@@ -548,5 +557,39 @@ func TestExplainAlwaysSaysWhatToDo(t *testing.T) {
 	}
 	if stderr, client := Explain(Result{Status: Unpaired}); stderr != "" || client != "" {
 		t.Error("an unpaired server produced a rejection message")
+	}
+}
+
+// The launcher reaches the log only because Verify writes it into Detail, and
+// Explain then passes Detail through. That coupling is invisible from either
+// side on its own, so it is worth one test that walks the whole path: a change
+// to how Verify words its detail would otherwise drop the launcher from the log
+// with every unit test still green.
+//
+// It matters because the log is what a locked-out user reads, and the launcher
+// is the fact that says whose configuration the token has to live in.
+func TestTheLogNamesTheLauncherEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Mint(dir, "claude-desktop", false); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	const launcher = `C:\Tools\some-client.exe`
+	r, err := Verify(dir, "", launcher)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != NoToken {
+		t.Fatalf("status = %v, want NoToken — this test needs the rejected path", r.Status)
+	}
+
+	stderr, client := Explain(r)
+	for _, want := range []string{launcher, "pair --unpair"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the log is missing %q, which is what the user has to act on:\n%s", want, stderr)
+		}
+		if !strings.Contains(client, want) {
+			t.Errorf("the message for the model is missing %q:\n%s", want, client)
+		}
 	}
 }

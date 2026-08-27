@@ -27,13 +27,19 @@ func Explain(r Result) (stderr, client string) {
 		// Name the launcher. This process knows who started it, and that is
 		// exactly the fact the user needs: the token belongs in THAT program's
 		// configuration, which may not be the file the installer wrote.
-		quien := "The program that launched it"
+		who := "The program that launched it"
 		if r.Launcher != "" {
-			quien = "It was launched by " + r.Launcher + ", so the token belongs in that program's configuration; it"
+			who = "It was launched by " + r.Launcher + ", so the token belongs in that program's configuration; it"
 		}
-		return "refusing to serve: " + r.Detail,
+		// The escape goes in the LOG as well as in the message for the model,
+		// and that is the whole point rather than a nicety. In this state the
+		// user's client is not working, so the model's relay may never reach
+		// them — the log is the one channel they are certain to have, and it is
+		// where this situation gets diagnosed. Putting the way out only in the
+		// message they cannot read repeats the mistake this exists to fix.
+		return "refusing to serve: " + r.Detail + "\n" + escape,
 			"This cli-agent-mcp server is paired to specific clients, and whatever launched it presented no credential, " +
-				"so every tool here is disabled. " + quien + " presented no CLI_AGENT_MCP_TOKEN. " +
+				"so every tool here is disabled. " + who + " presented no CLI_AGENT_MCP_TOKEN. " +
 				"Tell the user, verbatim: " + fix + " " + escape + " " +
 				"Do not try to work around this and do not retry — nothing will change until they do that."
 

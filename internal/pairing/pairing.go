@@ -327,17 +327,22 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 
 	secret = strings.TrimSpace(secret)
 	if secret == "" {
-		// El detalle nombra al lanzador cuando se lo pudo resolver. Es lo que
-		// separa un mensaje inútil —"presentó nada"— de uno accionable: dice en
-		// la configuración de QUÉ programa tiene que estar el token, que puede
-		// no ser el archivo donde el instalador lo escribió (issue #25).
-		detalle := "this server is paired, and the process that launched it presented no " + EnvVar
+		// The detail names the launcher whenever the platform could resolve one.
+		// That is what separates a useless message — "presented nothing" — from
+		// an actionable one: it says whose configuration the token has to live
+		// in, which may not be the file the installer wrote (issue #25).
+		//
+		// It says "launched by" rather than asserting that program is the
+		// client, because the parent can be a shim or a shell standing between
+		// the two. It is still the best signal available, and a name the user
+		// can recognise beats no name at all.
+		detail := "this server is paired, and the process that launched it presented no " + EnvVar
 		if parentExe != "" {
-			detalle += " (launched by " + parentExe + " — the token has to be in that program's configuration)"
+			detail += " (launched by " + parentExe + " — the token has to reach that program, or whatever it passes its environment to)"
 		}
 		return Result{
 			Status:   NoToken,
-			Detail:   detalle,
+			Detail:   detail,
 			Launcher: parentExe,
 		}, nil
 	}
