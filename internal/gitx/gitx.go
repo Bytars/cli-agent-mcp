@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Bytars/cli-agent-mcp/internal/winspawn"
 )
 
 // commandTimeout bounds any single git invocation. A repository on a stalled
@@ -42,7 +44,12 @@ func run(ctx context.Context, dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "git", args...)
+	// winspawn.Harden, o cada llamada a git le parpadea una consola al usuario:
+	// este servidor lo lanza una aplicación gráfica sin consola propia, así que
+	// git —que es una app de consola— se abre la suya. `run` es el único punto
+	// por donde pasan TODAS las invocaciones de git de este paquete, así que
+	// envolverlo acá las cubre a todas (issue #18).
+	cmd := winspawn.Harden(exec.CommandContext(ctx, "git", args...))
 	cmd.Dir = dir
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out

@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/Bytars/cli-agent-mcp/internal/winspawn"
 )
 
 // Cancelling a task must stop everything the worker spawned, not just the
@@ -113,7 +115,10 @@ func newProcGuard(cmd *exec.Cmd) *procGuard {
 		if cmd.Process == nil {
 			return nil
 		}
-		return exec.Command(taskkillPath(), "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+		// winspawn.Harden: taskkill es una app de consola, y este camino corre
+		// justo cuando el usuario cancela — el peor momento para parpadearle una
+		// ventana encima (issue #18).
+		return winspawn.Harden(exec.Command(taskkillPath(), "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid))).Run()
 	}
 	return g
 }

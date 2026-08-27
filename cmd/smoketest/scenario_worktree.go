@@ -33,6 +33,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bytars/cli-agent-mcp/internal/winspawn"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -368,7 +369,9 @@ func worktreeLists(rep worktreeReport, name string) bool {
 // gitOut runs git in dir and returns its combined output, which is what makes a
 // failure readable — git says why on stderr.
 func gitOut(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	// winspawn.Harden: este escenario hace decenas de llamadas a git, y sin esto
+	// son decenas de parpadeos (issue #18). Es el mismo defecto que gitx.run.
+	cmd := winspawn.Harden(exec.Command("git", args...))
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	return strings.TrimRight(string(out), "\r\n"), err

@@ -57,7 +57,10 @@ func (a *MockAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, err
 	if strings.HasPrefix(spec.Prompt, "failtool") {
 		args = append(args, "--fail-tool")
 	}
-	return exec.CommandContext(ctx, a.selfExe, args...), nil
+	// hardenSpawn aunque esto sea el mock: es un proceso real que se lanza en la
+	// máquina del usuario cuando corren los tests, y sin esto parpadea una
+	// consola por cada caso (issue #18).
+	return hardenSpawn(exec.CommandContext(ctx, a.selfExe, args...)), nil
 }
 
 func (a *MockAdapter) ParseLine(line string) Event { return parseClaudeStreamLine(line) }

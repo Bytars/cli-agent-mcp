@@ -6,7 +6,8 @@ package agent
 
 import (
 	"os/exec"
-	"syscall"
+
+	"github.com/Bytars/cli-agent-mcp/internal/winspawn"
 )
 
 // systemRoot returns the Windows directory, defaulting to the conventional path
@@ -18,24 +19,11 @@ func systemRoot() string {
 	return `C:\Windows`
 }
 
-// hardenSpawn applies the Windows-specific spawn settings this server always
-// wants: no console window, and a new process group so the child can be
-// signalled as a unit.
+// hardenSpawn delega en internal/winspawn.
 //
-// CREATE_NO_WINDOW matters more than it looks. This server is normally launched
-// by a GUI application that has no console of its own; without it, every child
-// either flashes a console window at the user or inherits a console handle that
-// may not exist.
-func hardenSpawn(cmd *exec.Cmd) *exec.Cmd {
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.HideWindow = true
-	cmd.SysProcAttr.CreationFlags |= createNoWindow | createNewProcessGroup
-	return cmd
-}
-
-const (
-	createNewProcessGroup = 0x00000200
-	createNoWindow        = 0x08000000
-)
+// La lógica vivía acá y era privada, así que `internal/gitx` e `internal/task`
+// no podían usarla y lanzaban `git` y `taskkill` sin ella (issue #18). Se movió
+// a un paquete hoja para que haya un solo lugar donde se decide cómo se lanza
+// un proceso en Windows. El envoltorio se conserva para no tocar los cinco
+// sitios de llamada de este paquete.
+func hardenSpawn(cmd *exec.Cmd) *exec.Cmd { return winspawn.Harden(cmd) }
