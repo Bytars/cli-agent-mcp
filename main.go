@@ -49,6 +49,33 @@ var instanceWarning string
 // version is overridden at release time via -ldflags "-X main.version=<tag>".
 var version = "dev"
 
+// startTaskMessage is what agent_start_task tells the caller.
+//
+// It is a function rather than a line inside the handler so a test can read it
+// without standing up a server — and because its exact wording is the fix for
+// issue #23, not incidental prose.
+//
+// WHY IT IS PHRASED AS A FACT AND NOT AN OFFER
+// The old text named agent_task_board too, and it did not work: measured over a
+// real session, agent_start_task was called dozens of times and the board not
+// once, while the user was saying the tasks ran without him knowing anything.
+// The reason is the shape. "Call agent_task_board ... or agent_watch to block
+// until it finishes" is a choice between equals, and the one choosing is the
+// orchestrator, which picks what serves its own next step — agent_watch returns
+// the answer it needs, while the board serves the person, who does not get a
+// vote. Stating what the user currently sees is harder to read past than an
+// option, and the two calls are no longer presented as interchangeable.
+func startTaskMessage(id, agentName, cwd string) string {
+	return fmt.Sprintf(
+		"Started task %s on agent %q in %s.\n\n"+
+			"THE USER CANNOT SEE THIS TASK. It runs in the background and no progress reaches "+
+			"them until you show it: notifications exist only while a call is in flight, and "+
+			"agent_watch streams to YOU, not to them.\n"+
+			"Call agent_task_board now — it opens a live panel that refreshes on its own and can "+
+			"cancel the task. Outside this conversation they can also run `cli-agent-mcp logs --all`.",
+		id, agentName, cwd)
+}
+
 func main() {
 	// Hidden subcommand used by the built-in mock agent to exercise the full
 	// pipeline without Claude Code or Cursor installed.
@@ -181,22 +208,31 @@ func main() {
 		mgr.SetStore(store)
 		store.Prune(cfg.MaxTasks)
 
-		if prev, err := store.Acquire(); err != nil {
+		prev, err := store.Acquire()
+		if err != nil {
 			log.Printf("warning: could not take the instance lock: %v", err)
 		} else if prev != nil {
 			instanceWarning = fmt.Sprintf(
 				"another cli-agent-mcp server (pid %d, started %s) is still running and owns tasks this instance did not start. "+
-					"Their output and status stay readable here, and agent_cancel_task reaches them by leaving the request for that instance. "+
-					"Tasks it started appear here as %q once they are restored from disk. "+
+					"Those tasks are NOT listed here and cannot be watched or cancelled from this session: they belong to that "+
+					"one. To follow them, use that client's own session, or read them from outside with `cli-agent-mcp logs --all`. "+
 					"If that process is no longer wanted, stop it — but note that doing so kills any worker still running under it.",
-				prev.PID, prev.Started.Format(time.RFC3339), task.StatusOrphaned)
+				prev.PID, prev.Started.Format(time.RFC3339))
 			log.Printf("warning: %s", instanceWarning)
 		}
 
-		if n := mgr.Restore(reg); n > 0 {
+		// prev carries the isolation decision into Restore, which declines to
+		// adopt another live session's tasks (issue #21). The reasoning lives
+		// there, next to the mechanism.
+		if n := mgr.Restore(reg, prev); n > 0 {
 			log.Printf("restored %d task(s) from %s", n, store.Dir())
 		}
-		log.Printf("task state: %s", store.Dir())
+		if prev != nil {
+			log.Printf("task state: %s (isolated: %d task record(s) belong to pid %d and stay with it)",
+				store.Dir(), store.CountTasks(), prev.PID)
+		} else {
+			log.Printf("task state: %s", store.Dir())
+		}
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "--list-agents" {
@@ -725,8 +761,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
-		msg := fmt.Sprintf("Started task %s on agent %q in %s. Call agent_task_board to show the user a live panel of it, or agent_watch to block until it finishes.", snap.ID, snap.Agent, snap.Cwd)
-		return textResult(msg), snap, nil
+		return textResult(startTaskMessage(snap.ID, snap.Agent, snap.Cwd)), snap, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

@@ -45,7 +45,10 @@ func TestRestoreSurfacesPreviousInstanceTasksAsOrphaned(t *testing.T) {
 	// A fresh process over the same directory.
 	second := NewManager(10)
 	second.SetStore(store)
-	if n := second.Restore(agent.NewRegistry(agent.NewMockAdapter())); n != 1 {
+	// nil: no hay otra instancia viva. Ése es el caso del reinicio, que es el
+	// que este test siempre probó — con un dueño vivo no se adopta nada, y eso
+	// lo cubre TestUnaSesionNoAdoptaLasTareasDeOtraViva.
+	if n := second.Restore(agent.NewRegistry(agent.NewMockAdapter()), nil); n != 1 {
 		t.Fatalf("restored %d tasks, want 1", n)
 	}
 
@@ -124,7 +127,7 @@ func TestOrphanPicksUpProgressFromTheOwningProcess(t *testing.T) {
 	// This process picks it up as an orphan.
 	mine := NewManager(10)
 	mine.SetStore(store)
-	mine.Restore(agent.NewRegistry(agent.NewMockAdapter()))
+	mine.Restore(agent.NewRegistry(agent.NewMockAdapter()), nil)
 	got, ok := mine.Get("task-9-cafe")
 	if !ok {
 		t.Fatal("the other process's task was not restored")
@@ -178,7 +181,7 @@ func TestRestoreKeepsSettledOutcomes(t *testing.T) {
 
 	next := NewManager(10)
 	next.SetStore(store)
-	next.Restore(agent.NewRegistry(agent.NewMockAdapter()))
+	next.Restore(agent.NewRegistry(agent.NewMockAdapter()), nil)
 
 	got, ok := next.Get("task-2-beef")
 	if !ok {

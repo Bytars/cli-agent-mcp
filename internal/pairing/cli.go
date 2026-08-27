@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Bytars/cli-agent-mcp/internal/config"
 )
 
 // DefaultLabel is the client most installs pair first.
@@ -19,7 +21,7 @@ const DefaultLabel = "claude-desktop"
 func Run(args []string, resolveStateDir func(string) string) int {
 	fs := flag.NewFlagSet("pair", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	stateDir := fs.String("state-dir", "", "State directory holding the pairing record.")
+	stateDir := fs.String("state-dir", "", "State directory holding the pairing record (default: CLI_AGENT_MCP_STATE_DIR, else the per-user one).")
 	label := fs.String("label", DefaultLabel, "Name for the token, so it can be revoked on its own.")
 	install := fs.Bool("install", false, "Write the token straight into the client's config file.")
 	configPath := fs.String("config", "", "Config file for --install (default: the client's usual location).")
@@ -53,7 +55,28 @@ Examples:
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	dir := resolveStateDir(*stateDir)
+	// Resolve exactly the way the server does, and for the reason internal/inspect
+	// already had to learn: the server takes its state directory from
+	// CLI_AGENT_MCP_STATE_DIR (config.go), so a `pair` that consulted only its
+	// own flag wrote the record into the per-user default while the server read
+	// somewhere else entirely.
+	//
+	// Nothing failed when that happened. `pair` printed `paired "cowork"` and a
+	// token snippet, and the server went on serving every launcher — the operator
+	// believed the hole was closed and it was wide open. A silent no-op that
+	// fails toward insecure is worse than an error, which is why the resolved
+	// path is now printed by every operation below rather than assumed.
+	dir := *stateDir
+	fromEnv := false
+	if strings.TrimSpace(dir) == "" {
+		if env := strings.TrimSpace(config.Load().StateDir); env != "" {
+			dir, fromEnv = env, true
+		}
+	}
+	dir = resolveStateDir(dir)
+	if fromEnv {
+		fmt.Printf("using %s (from CLI_AGENT_MCP_STATE_DIR)\n\n", dir)
+	}
 
 	switch {
 	case *status:
@@ -187,11 +210,20 @@ func runMint(dir, label string, noBind, install bool, configPath string) int {
 		printSnippet(exe, secret, label)
 	}
 
+	// Always name the record. Pairing only takes effect for a server reading
+	// this same directory, and when the two disagree nothing signals it: the
+	// server just keeps serving. Printing the path is what lets someone compare
+	// it against the "task state:" line the server logs at startup.
+	fmt.Printf("\nrecord: %s\n", Path(dir))
+
 	if !wasPaired {
 		fmt.Print(`
 Enforcement is now on: a launcher that cannot present a token gets a server that
 refuses every tool call. Keep this terminal's output out of anything shared — the
 secret is shown once and only its hash is stored.
+
+Enforcement applies to a server reading THAT record. If you start one with a
+different CLI_AGENT_MCP_STATE_DIR, it reads a different record and stays open.
 `)
 	}
 	if !noBind {

@@ -157,6 +157,21 @@ func (s *Store) SaveTask(id string, v any) error {
 // LoadTasks returns every stored record, oldest file first. Records that fail
 // to parse are skipped rather than failing the whole load: one corrupt file
 // must not cost the operator the rest of their history.
+// CountTasks reports how many task records are on disk, without reading them.
+//
+// It exists for the one line that has to say what is NOT being loaded: when
+// another server instance is live, this one leaves its records alone (issue
+// #21), and "isolated: 4 task record(s) belong to pid 1234" is the difference
+// between a startup log that explains an empty listing and one that lets the
+// user think their tasks vanished.
+func (s *Store) CountTasks() int {
+	paths, err := filepath.Glob(filepath.Join(s.dir, tasksSubdir, "*.json"))
+	if err != nil {
+		return 0
+	}
+	return len(paths)
+}
+
 func (s *Store) LoadTasks() ([]json.RawMessage, error) {
 	paths, err := filepath.Glob(filepath.Join(s.dir, tasksSubdir, "*.json"))
 	if err != nil {
