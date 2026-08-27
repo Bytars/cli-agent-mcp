@@ -31,12 +31,11 @@ func Explain(r Result) (stderr, client string) {
 		if r.Launcher != "" {
 			who = "It was launched by " + r.Launcher + ", so the token belongs in that program's configuration; it"
 		}
-		// The escape goes in the LOG as well as in the message for the model,
-		// and that is the whole point rather than a nicety. In this state the
-		// user's client is not working, so the model's relay may never reach
-		// them — the log is the one channel they are certain to have, and it is
-		// where this situation gets diagnosed. Putting the way out only in the
-		// message they cannot read repeats the mistake this exists to fix.
+		// The escape goes in the log too, not only in the message for the model.
+		// In this state the user's client is broken, so the model's relay may
+		// never reach them; the log is the one channel they certainly have, and
+		// where this gets diagnosed. A way out only in the message they cannot
+		// read repeats the mistake this exists to fix.
 		return "refusing to serve: " + r.Detail + "\n" + escape,
 			"This cli-agent-mcp server is paired to specific clients, and whatever launched it presented no credential, " +
 				"so every tool here is disabled. " + who + " presented no CLI_AGENT_MCP_TOKEN. " +
@@ -51,9 +50,9 @@ func Explain(r Result) (stderr, client string) {
 				"Do not retry — the answer will be the same."
 
 	case Armed:
-		// Not a refusal, so it does not tell the model to stop. It tells the
-		// user what is true — the door is not shut yet — and how to shut it,
-		// because a trial nobody notices is just a weaker default.
+		// Not a refusal, so it does not tell the model to stop. It says what is
+		// true — the door is not shut yet — and how to shut it. A trial nobody
+		// notices is just a weaker default.
 		return "PAIRING NOT YET IN EFFECT: " + r.Detail + ".\n" +
 				"Restart the client that should be driving this server; the first launch that presents the " +
 				"token turns enforcement on for good. Until then any local process can still use this server. " +

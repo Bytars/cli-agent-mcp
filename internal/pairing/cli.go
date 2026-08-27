@@ -51,7 +51,8 @@ Options:
 Examples:
   cli-agent-mcp pair --install              Pair Claude Desktop and edit its config.
   cli-agent-mcp pair --label cowork         Issue a second token, printed for pasting.
-  cli-agent-mcp pair --status               Show what is currently paired.
+  cli-agent-mcp pair --status               Show what is paired, and whether it is enforcing yet.
+  cli-agent-mcp pair --enforce-now          Stop waiting for the token to arrive; enforce now.
   cli-agent-mcp pair --revoke cowork        Take one client's access away.
 `)
 	}
@@ -117,10 +118,9 @@ agent that inherits your environment. Run `)
 		return 0
 	}
 
-	// "Paired" and "enforcing" are two different things, and the whole point of
-	// the trial is lost if this line reports the first as though it were the
-	// second. Someone checking whether they are protected has to be able to see
-	// that they are not yet.
+	// "Paired" and "enforcing" are different things. Reporting the first as the
+	// second is how someone checking whether they are protected concludes they
+	// are, when they are not yet.
 	if f.Enforcing() {
 		when := "set to enforce immediately (--enforce-now)"
 		if f.Confirmed() {
@@ -274,10 +274,9 @@ token where that launcher will actually read it.
 	fmt.Printf("\nrecord: %s\n", Path(dir))
 
 	if !wasPaired {
-		// This used to say "enforcement is now on", which stopped being true
-		// when enforcement started waiting for the token to arrive — and a
-		// closing line that overstates what just happened is the whole subject
-		// of issue #25. What is true now is that the door is armed and not shut.
+		// This used to say "enforcement is now on", which stopped being true once
+		// enforcement started waiting for the token. A closing line that
+		// overstates what just happened is the whole subject of issue #25.
 		fmt.Print(`
 Enforcement is ARMED, not yet on. This server keeps serving until a launcher
 presents this token once; that first successful start turns enforcement on for
@@ -387,12 +386,11 @@ func Labels(f *File) string {
 
 // runEnforceNow closes the door without waiting for the token to arrive.
 //
-// The default holds enforcement back until a launcher has presented a valid
-// token once, so that pairing against a config the client does not read cannot
-// cost someone their client. That safety net has a price — a window in which
-// any local process is still served — and this is for whoever refuses to pay
-// it: a scripted install that already knows the token reaches the server, or an
-// operator whose threat model has no room for the window.
+// The default waits, so pairing against a config the client does not read
+// cannot cost someone their client. That safety net costs a window in which any
+// local process is still served, and this is for whoever will not pay it: a
+// scripted install that knows the token arrives, or a threat model with no room
+// for the window.
 func runEnforceNow(dir string) int {
 	f, paired, err := Load(dir)
 	if err != nil {

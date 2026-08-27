@@ -10,14 +10,13 @@ import (
 	"testing"
 )
 
-// confirm walks a record through the one launch that turns pairing on: a
-// launcher presents a valid token, and from then on enforcement is permanent.
+// confirm walks a record through the launch that turns pairing on: a launcher
+// presents a valid token, and enforcement is permanent from then on.
 //
-// Tests about refusing anything need it, because a freshly minted record does
-// not refuse — it serves, loudly, until a token has been seen to arrive. That
-// is deliberate (see Status Armed) and it means "paired" and "enforcing" are
-// two different states that these tests have to step through rather than
-// assume.
+// Tests about refusing anything need it. A freshly minted record does not
+// refuse — it serves until a token is seen to arrive (see Status Armed) — so
+// "paired" and "enforcing" are two states these tests have to step through
+// rather than assume.
 func confirm(t *testing.T, dir, secret, launcher string) {
 	t.Helper()
 	r, err := Verify(dir, secret, launcher)

@@ -99,26 +99,22 @@ type File struct {
 	Version int     `json:"version"`
 	Tokens  []Token `json:"tokens"`
 
-	// EnforceNow skips the trial described on Armed: the record locks from the
-	// moment it is written, with no window in which an unauthenticated launcher
-	// is served. It exists because "wait until the token has arrived once" is
-	// the right default and not the right answer for everyone — a scripted
-	// install knows the token reaches the server, and an operator may simply
-	// refuse the window.
+	// EnforceNow skips the trial described on Armed: no window, locked from the
+	// moment the record is written. Waiting for the token is the right default,
+	// not the right answer for everyone — a scripted install already knows the
+	// token arrives, and some operators simply will not have the window.
 	EnforceNow bool `json:"enforce_now,omitempty"`
 
-	// ConfirmedAt is when a launcher first presented a valid token. It is the
-	// evidence enforcement waits for, and it is recorded on the RECORD rather
-	// than derived from the tokens on purpose.
+	// ConfirmedAt is when a launcher first presented a valid token — the
+	// evidence enforcement waits for.
 	//
-	// Deriving it from Token.LastUsed reads as the obvious shortcut and is
-	// wrong: rotating a token on a working install would produce a record whose
-	// only token had never been used, drop it back into its trial, and reopen a
-	// door that had been shut for months. "This installation has proved pairing
-	// works" is a property of the installation, and rotating a credential is not
-	// evidence against it.
+	// It lives on the record rather than being derived from Token.LastUsed, and
+	// the difference matters: rotating a token would leave a record whose only
+	// token had never been used, drop it back into its trial, and silently
+	// reopen a door shut months ago. Rotating a credential is not evidence that
+	// pairing stopped working.
 	//
-	// Only --unpair clears it, by removing the record altogether.
+	// Only --unpair clears it, by removing the record.
 	ConfirmedAt time.Time `json:"confirmed_at,omitempty"`
 }
 
@@ -157,25 +153,22 @@ const (
 	// this one is not the launcher the token is bound to.
 	ForeignParent
 
-	// Armed means a pairing record exists but no token has ever been presented
-	// successfully, so this launch is served rather than refused.
+	// Armed means the record exists but no token has ever worked here, so this
+	// launch is served instead of refused.
 	//
-	// Turning on authentication is the one change that can cost you the ability
-	// to undo it: if the token never reaches the server, the client stops
-	// working, and the way to fix that is a terminal command the person does
-	// not know. Every serious system solves this the same way — password auth
-	// stays until you have proved key auth in a second session, a router
-	// reloads unless you confirm — and the shape is always the same: the risky
-	// change is provisional until it is seen to work.
+	// Turning on authentication can cost you the ability to undo it: if the
+	// token never reaches the server, the client stops working and the fix is a
+	// terminal command nobody knows. SSH keeps password auth until you prove
+	// the key in a second session; a router reverts unless you confirm. Same
+	// shape: the risky change stays provisional until it is seen to work.
 	//
-	// So enforcement waits for evidence. The first launch that presents a valid
-	// token confirms the pairing, and from then on it is permanent. Until then
-	// the server keeps serving and says loudly what state it is in.
+	// So enforcement waits for evidence. The first launch presenting a valid
+	// token confirms the pairing, permanently. Until then the server serves and
+	// says so loudly.
 	//
-	// The cost is real and stated rather than hidden: during that window any
-	// launcher still gets in. It is bounded by the user's next client restart —
-	// which is exactly when, today, they would instead be locked out — and
-	// --enforce-now skips it for anyone who wants none.
+	// The price, stated rather than hidden: in that window any launcher gets in.
+	// It closes at the user's next client restart — which is exactly when they
+	// would otherwise be locked out — and --enforce-now skips it entirely.
 	Armed
 )
 
@@ -383,9 +376,9 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 		}, nil
 	}
 
-	// armed builds the verdict for a record that has never yet seen a working
-	// token. It is the difference between "you configured pairing" and "pairing
-	// works", and only the second is worth locking the door on.
+	// armed is the verdict for a record that has never seen a working token.
+	// "You configured pairing" and "pairing works" are different things, and
+	// only the second is worth locking the door on.
 	armed := func(why string) Result {
 		return Result{
 			Status:   Armed,
@@ -463,18 +456,16 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 
 	now := time.Now().UTC()
 	tok.LastUsed = now
-	// This launch is the evidence the trial was waiting for: a token reached the
-	// server, so pairing demonstrably works and the door can close for good.
+	// The evidence the trial waits for: a token reached the server, so pairing
+	// works and the door can close for good.
 	if f.ConfirmedAt.IsZero() {
 		f.ConfirmedAt = now
 	}
-	// A failed write costs the last-used timestamp and, on a first launch, the
-	// binding and this confirmation — worth a warning to the caller, never worth
-	// refusing to serve a client that just proved it holds a valid token.
-	//
-	// Losing the confirmation is the mildest of the three: the record simply
-	// stays in its trial for one more launch, which errs towards the user
-	// keeping a working client.
+	// A failed write costs the timestamp, the binding on a first launch, and
+	// this confirmation — worth warning about, never worth refusing a client
+	// that just proved it holds a valid token. Losing the confirmation is the
+	// mildest of the three: the record stays in its trial one launch longer,
+	// which errs towards the user keeping a working client.
 	if err := Save(stateDir, f); err != nil {
 		return res, err
 	}
