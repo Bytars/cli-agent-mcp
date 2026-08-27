@@ -44,7 +44,11 @@ func TestASecondInstanceCanStopTheFirstsTask(t *testing.T) {
 	// The second instance comes up against the same directory and restores it.
 	other := NewManager(10)
 	other.SetStore(store)
-	if n := other.Restore(agent.NewRegistry(agent.NewMockAdapter())); n != 1 {
+	// nil: este test monta a propósito el caso en que la otra instancia NO está
+	// viva, para poder ejercitar el mecanismo de cancelación cruzada a nivel
+	// Manager. Con un dueño vivo, Restore no adoptaría nada (issue #21) y no
+	// habría tarea sobre la cual probar nada.
+	if n := other.Restore(agent.NewRegistry(agent.NewMockAdapter()), nil); n != 1 {
 		t.Fatalf("the second instance restored %d task(s), want 1", n)
 	}
 	seen, ok := other.Get(tk.ID)

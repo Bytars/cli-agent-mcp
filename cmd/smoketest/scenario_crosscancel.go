@@ -39,10 +39,11 @@ func init() {
 		// — and does not depend on what the worker is or what it does. The mock
 		// is simply the cheapest worker to keep busy for twenty seconds.
 		Needs: "",
-		What: "agent_cancel_task on a task owned by ANOTHER cli-agent-mcp process actually stops it.\n" +
-			"The unit test proves this with two managers in one process. This proves it across two OS\n" +
-			"processes, which is the situation that actually occurs: a client starts a second server\n" +
-			"alongside the first, and from there the first instance's tasks are visible but untouchable.\n" +
+		What: "a second cli-agent-mcp process CANNOT see or touch the first one's tasks (issue #21).\n" +
+			"Two windows of the same client are two sessions, and one has no business reaching into the\n" +
+			"other. This runs the situation that actually occurs — a client starts a second server\n" +
+			"alongside the first, sharing a state directory — and proves the isolation holds AND that\n" +
+			"the first instance's worker survives the attempt.\n" +
 			"Requires CLI_AGENT_MCP_STATE_DIR to be set, so both instances share a state directory.",
 		Run: runCrossCancel,
 	})
@@ -59,14 +60,25 @@ const (
 	xcancelActWindow = 15 * time.Second
 )
 
-// runCrossCancel proves that a cancel asked for in one process stops a worker
-// owned by another.
+// runCrossCancel proves one session cannot reach into another's tasks.
 //
-// Before this, the second instance answered the request with the task snapshot,
-// which reads as success — so the caller believed the task was stopping while
-// the worker carried on spending. It could not do better: it holds no handle on
-// a process it did not spawn, and killing by the recorded pid is not safe when
-// pids are recycled. Leaving the request where the owner will find it is.
+// # This scenario used to assert the opposite, and that is the point
+//
+// It was written to prove that a cancel asked for in one process stopped a
+// worker owned by another — a real fix for a real problem, because the second
+// instance used to answer with the task snapshot, which reads as success while
+// the worker carried on spending.
+//
+// What went unexamined was whether the second instance should have been holding
+// the first one's tasks at all. Two windows of the same client are two
+// sessions; the cross-instance machinery made them one shared pool, and a
+// window that had started nothing could cancel work another window was in the
+// middle of. Issue #21 settles that: sessions are separate.
+//
+// The old mechanism is still in internal/task — a cancel request left as a file
+// for the owning instance — and is now unreachable from the server, because no
+// instance adopts another's records while it is alive. It is left where it is
+// rather than torn out in the same change that alters the policy.
 func runCrossCancel(ctx context.Context, e *env) {
 	stateDir := xcancelStateDir()
 	fmt.Printf("  shared state directory: %s\n", stateDir)
@@ -114,7 +126,13 @@ func runCrossCancel(ctx context.Context, e *env) {
 		}
 	}()
 
-	// 3. Instance B can see the task, and is honest that it is not its own.
+	// 3. Instance B must not see the task at all. This is the assertion the
+	//    scenario exists for now: A's tasks belong to A's session.
+	//
+	//    The record IS on disk and B could read it — it shares the directory.
+	//    What changed is that B declines to adopt records while another server
+	//    is alive (main.go, issue #21). A listing that included them let one
+	//    window cancel a worker another window had started.
 	seen, err := second.CallTool(ctx, &mcp.CallToolParams{
 		Name:      "agent_task_status",
 		Arguments: map[string]any{"task_id": id},
@@ -122,18 +140,16 @@ func runCrossCancel(ctx context.Context, e *env) {
 	if err != nil {
 		log.Fatalf("agent_task_status on the second instance: %v", err)
 	}
-	if seen.IsError {
-		log.Fatalf("FAIL: the second instance cannot see task %s at all, so there is nothing for it to cancel. "+
-			"Both instances must be reading %s:\n%s", id, stateDir, indent(textContent(seen)))
+	if !seen.IsError {
+		log.Fatalf("FAIL: the second instance can see task %s, which belongs to another session.\n"+
+			"It reported status=%q. Isolation is not holding — B adopted A's records from %s:\n%s",
+			id, jsonField(seen, "status"), stateDir, indent(textContent(seen)))
 	}
-	if s := jsonField(seen, "status"); s != "orphaned" {
-		log.Fatalf("FAIL: the second instance reports %s as %q, want \"orphaned\" — it does not own this worker "+
-			"and must not present it as something it can watch:\n%s", id, s, indent(textContent(seen)))
-	}
-	fmt.Printf("  instance B sees %s as orphaned\n", id)
+	fmt.Printf("  instance B cannot see %s — correct, it belongs to A\n", id)
 
-	// 4. Ask instance B to stop it. Not callTool: the answer is the assertion,
-	//    and a tool error here would be swallowed as a fatal with no context.
+	// 4. And it cannot cancel what it cannot see. Asking must fail, not succeed
+	//    quietly: a cancel that reports success while the worker runs on is the
+	//    worst of the three possible outcomes.
 	asked := time.Now()
 	cancelRes, err := second.CallTool(ctx, &mcp.CallToolParams{
 		Name:      "agent_cancel_task",
@@ -142,45 +158,56 @@ func runCrossCancel(ctx context.Context, e *env) {
 	if err != nil {
 		log.Fatalf("agent_cancel_task on the second instance: %v", err)
 	}
-	if cancelRes.IsError {
-		log.Fatalf("FAIL: the second instance refused to cancel %s outright:\n%s", id, indent(textContent(cancelRes)))
+	if !cancelRes.IsError {
+		log.Fatalf("FAIL: the second instance accepted a cancel for %s, a task from another session:\n%s",
+			id, indent(textContent(cancelRes)))
 	}
-	said := textContent(cancelRes)
-	// Fragments, not the whole sentence: the wording will be rewritten, but a
-	// reply that stops mentioning the other instance or the request left for it
-	// has stopped telling the caller what actually happened.
-	for _, want := range []string{"another cli-agent-mcp instance", "left for it"} {
-		if !strings.Contains(said, want) {
-			log.Fatalf("FAIL: the reply does not say the request was left for the owning instance (no %q), "+
-				"so a caller cannot tell this from a cancel that already took effect:\n%s",
-				want, indent(said))
-		}
-	}
-	// The old answer, and the one that must never come back: the bare snapshot,
-	// which reads as though the cancel had happened.
-	if strings.Contains(said, "status=orphaned") {
-		log.Fatalf("FAIL: the reply is the plain snapshot line, which reads as success while the worker carries on:\n%s",
-			indent(said))
-	}
-	fmt.Printf("  instance B answered: %s\n", firstLine(said))
+	fmt.Printf("  instance B refused to cancel it: %s\n", firstLine(textContent(cancelRes)))
 
-	// 5. The proof. Instance A owns the worker and nothing has touched its
-	//    process; if the task stops, it is because A picked the request up.
-	status := xcancelAwaitStopped(ctx, e, id, asked)
-
-	// 6. The request must not outlive its use. Left lying there it would stop
-	//    the next task to carry this id, instantly and for no visible reason.
-	//    Read as a plain file rather than through internal/state: this scenario
-	//    is an outside observer of the server, and importing the package that
-	//    writes the file would let a rename break both halves in step.
+	// 5. No cancel request may be left behind either. Refusing at the API while
+	//    still dropping the file would be isolation in name only: the owning
+	//    instance would find it and kill the worker a second later.
 	pending := xcancelTaskFile(stateDir, id, ".cancel")
 	if _, err := os.Stat(pending); err == nil {
-		log.Fatalf("FAIL: %s survived being acted on; the next task with this id would be killed the moment it started", pending)
+		log.Fatalf("FAIL: instance B refused the cancel but still wrote %s. The owning instance will act on it, "+
+			"so the refusal was cosmetic and A's worker dies anyway.", pending)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		log.Fatalf("FAIL: stat %s: %v", pending, err)
 	}
 
-	fmt.Printf("CROSSCANCEL DONE (a cancel asked for in one process stopped a worker owned by another; status=%s)\n", status)
+	// 6. THE OTHER HALF, and the one that makes this more than a permission
+	//    check: A's worker has to still be running. Isolation that stopped the
+	//    task would satisfy every assertion above and be a worse bug than the
+	//    one being fixed.
+	xcancelAwaitStillRunning(ctx, e, id, asked)
+
+	fmt.Println("CROSSCANCEL DONE (a second process could not see, cancel, or disturb another session's task)")
+}
+
+// xcancelAwaitStillRunning proves the task survived B's attempt.
+//
+// It waits before looking. A cancel that leaked through the old path took about
+// a second to land — the owning instance polls — so reading the status
+// immediately would find it "running" whether isolation held or not, and the
+// scenario would pass while being broken. The wait is what gives a leak time to
+// show up.
+func xcancelAwaitStillRunning(ctx context.Context, e *env, id string, asked time.Time) {
+	const grace = 4 * time.Second
+	select {
+	case <-time.After(grace):
+	case <-ctx.Done():
+		log.Fatalf("FAIL: scenario context ended while waiting to confirm %s survived: %v", id, ctx.Err())
+	}
+
+	st := callTool(ctx, e.Session, "agent_task_status", map[string]any{"task_id": id})
+	got := jsonField(st, "status")
+	if got != "running" {
+		log.Fatalf("FAIL: %s is %q, %v after the second instance was told to cancel it.\n"+
+			"The refusal was not enough — something still reached A's worker, which is the exact\n"+
+			"cross-session interference issue #21 exists to remove:\n%s",
+			id, got, time.Since(asked).Round(time.Millisecond), indent(textContent(st)))
+	}
+	fmt.Printf("  instance A's worker is still running %v later\n", time.Since(asked).Round(time.Millisecond))
 }
 
 // xcancelStateDir reads the directory both instances must share, and refuses to

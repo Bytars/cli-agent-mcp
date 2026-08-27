@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -32,6 +33,7 @@ import (
 	"github.com/Bytars/cli-agent-mcp/internal/config"
 	"github.com/Bytars/cli-agent-mcp/internal/grants"
 	"github.com/Bytars/cli-agent-mcp/internal/inspect"
+	"github.com/Bytars/cli-agent-mcp/internal/pairing"
 	"github.com/Bytars/cli-agent-mcp/internal/state"
 	"github.com/Bytars/cli-agent-mcp/internal/task"
 	"github.com/Bytars/cli-agent-mcp/internal/ui"
@@ -46,6 +48,33 @@ var instanceWarning string
 
 // version is overridden at release time via -ldflags "-X main.version=<tag>".
 var version = "dev"
+
+// startTaskMessage is what agent_start_task tells the caller.
+//
+// It is a function rather than a line inside the handler so a test can read it
+// without standing up a server — and because its exact wording is the fix for
+// issue #23, not incidental prose.
+//
+// WHY IT IS PHRASED AS A FACT AND NOT AN OFFER
+// The old text named agent_task_board too, and it did not work: measured over a
+// real session, agent_start_task was called dozens of times and the board not
+// once, while the user was saying the tasks ran without him knowing anything.
+// The reason is the shape. "Call agent_task_board ... or agent_watch to block
+// until it finishes" is a choice between equals, and the one choosing is the
+// orchestrator, which picks what serves its own next step — agent_watch returns
+// the answer it needs, while the board serves the person, who does not get a
+// vote. Stating what the user currently sees is harder to read past than an
+// option, and the two calls are no longer presented as interchangeable.
+func startTaskMessage(id, agentName, cwd string) string {
+	return fmt.Sprintf(
+		"Started task %s on agent %q in %s.\n\n"+
+			"THE USER CANNOT SEE THIS TASK. It runs in the background and no progress reaches "+
+			"them until you show it: notifications exist only while a call is in flight, and "+
+			"agent_watch streams to YOU, not to them.\n"+
+			"Call agent_task_board now — it opens a live panel that refreshes on its own and can "+
+			"cancel the task. Outside this conversation they can also run `cli-agent-mcp logs --all`.",
+		id, agentName, cwd)
+}
 
 func main() {
 	// Hidden subcommand used by the built-in mock agent to exercise the full
@@ -71,6 +100,13 @@ func main() {
 			log.SetPrefix("cli-agent-mcp: ")
 			log.SetFlags(0)
 			os.Exit(inspect.Run(os.Args[1:]))
+		case "pair":
+			// Issues the credential that authorizes a client to drive this
+			// server. A human runs this at a terminal, so it talks on stdout.
+			log.SetOutput(os.Stderr)
+			log.SetPrefix("cli-agent-mcp: ")
+			log.SetFlags(0)
+			os.Exit(pairing.Run(os.Args[2:], state.ResolveDir))
 		case "--list-agents":
 			// Handled further down, once the registry exists.
 		default:
@@ -92,6 +128,29 @@ func main() {
 	log.SetFlags(0)
 
 	cfg := config.Load()
+
+	// Authorization is settled before anything with a side effect happens.
+	// An unauthorized launcher must not reach the instance lock: writing that
+	// file would let any local process disturb the legitimate server's view of
+	// the tasks it owns, which is a denial of service that needs no token at all.
+	//
+	// Resolved once, and every later user of a state path takes this one. Empty
+	// means "the per-user default", and passing cfg.StateDir straight through
+	// left grants with no directory at all and the approval config on a relative
+	// path the agent resolved against its own workspace — ResolveDir also makes
+	// it absolute, which is what closes that.
+	stateDir := state.ResolveDir(cfg.StateDir)
+	launcher := pairing.ParentExe()
+	gate, err := pairing.Verify(stateDir, cfg.Token, launcher)
+	if err != nil {
+		// Verify still returns a usable verdict on a write failure; the record
+		// simply did not get its timestamp or first-use binding updated.
+		log.Printf("warning: pairing record: %v", err)
+	}
+	log.Printf("%s", pairing.StartupLine(stateDir, gate))
+	if stderrMsg, _ := pairing.Explain(gate); stderrMsg != "" {
+		log.Print(stderrMsg)
+	}
 
 	reg := agent.NewRegistry(
 		agent.NewClaudeAdapter(cfg.ClaudeBin, cfg.PermissionMode, cfg.AllowedTools, cfg.DisallowedTools, cfg.AppendSystemPrompt, cfg.ClaudeExtraArgs),
@@ -120,33 +179,60 @@ func main() {
 		log.Printf("task timeout: %s", cfg.TaskTimeout)
 	}
 
+	if !gate.Allowed() {
+		// A rejected launch is the one event in this log that means something
+		// tried to use the server and could not. Record who it was: it is the
+		// only trace that a local process attempted it.
+		auditLog.Log("pairing_rejected", map[string]any{
+			"status": pairing.StatusName(gate.Status),
+			"label":  gate.Label,
+			"parent": launcher,
+			"detail": gate.Detail,
+		})
+	}
+
 	// The task registry has to outlive the process. Clients do start a second
 	// server instance — sometimes alongside the first rather than in place of
 	// it — and an instance that came up with an empty map used to report that
 	// emptiness as fact while the other one's workers kept running.
-	if store, err := state.Open(cfg.StateDir); err != nil {
+	//
+	// An unauthorized instance stays out of all of it. It will run no tasks, so
+	// it has nothing to persist, and taking the lock would only make the real
+	// server report a phantom rival it cannot see.
+	if !gate.Allowed() {
+		log.Printf("task state: not touched while locked")
+	} else if store, err := state.Open(stateDir); err != nil {
 		log.Printf("warning: task state is not being saved: %v", err)
 	} else {
 		defer store.Close()
 		mgr.SetStore(store)
 		store.Prune(cfg.MaxTasks)
 
-		if prev, err := store.Acquire(); err != nil {
+		prev, err := store.Acquire()
+		if err != nil {
 			log.Printf("warning: could not take the instance lock: %v", err)
 		} else if prev != nil {
 			instanceWarning = fmt.Sprintf(
 				"another cli-agent-mcp server (pid %d, started %s) is still running and owns tasks this instance did not start. "+
-					"Their output and status stay readable here, and agent_cancel_task reaches them by leaving the request for that instance. "+
-					"Tasks it started appear here as %q once they are restored from disk. "+
+					"Those tasks are NOT listed here and cannot be watched or cancelled from this session: they belong to that "+
+					"one. To follow them, use that client's own session, or read them from outside with `cli-agent-mcp logs --all`. "+
 					"If that process is no longer wanted, stop it — but note that doing so kills any worker still running under it.",
-				prev.PID, prev.Started.Format(time.RFC3339), task.StatusOrphaned)
+				prev.PID, prev.Started.Format(time.RFC3339))
 			log.Printf("warning: %s", instanceWarning)
 		}
 
-		if n := mgr.Restore(reg); n > 0 {
+		// prev carries the isolation decision into Restore, which declines to
+		// adopt another live session's tasks (issue #21). The reasoning lives
+		// there, next to the mechanism.
+		if n := mgr.Restore(reg, prev); n > 0 {
 			log.Printf("restored %d task(s) from %s", n, store.Dir())
 		}
-		log.Printf("task state: %s", store.Dir())
+		if prev != nil {
+			log.Printf("task state: %s (isolated: %d task record(s) belong to pid %d and stay with it)",
+				store.Dir(), store.CountTasks(), prev.PID)
+		} else {
+			log.Printf("task state: %s", store.Dir())
+		}
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "--list-agents" {
@@ -159,15 +245,6 @@ func main() {
 			fmt.Printf("%-8s %-12s %s\n", a.Name(), status, detail)
 		}
 		return
-	}
-
-	// Resolved once, because empty means "the per-user default" and both stores
-	// below need a real path. Passing cfg.StateDir straight through left grants
-	// with no directory at all, and the approval config on a relative path the
-	// agent resolved against its own workspace.
-	stateDir := cfg.StateDir
-	if stateDir == "" {
-		stateDir = state.DefaultDir()
 	}
 
 	// Interactive approval. It only does anything for a client that can put a
@@ -201,15 +278,29 @@ func main() {
 	caps := &mcp.ServerCapabilities{Logging: &mcp.LoggingCapabilities{}}
 	caps.AddExtension(ui.ExtensionName, ui.Capability())
 
+	serverInstructions := instructions
+	if _, clientMsg := pairing.Explain(gate); clientMsg != "" {
+		serverInstructions = clientMsg
+	}
+
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "cli-agent-mcp",
 		Version: version,
 	}, &mcp.ServerOptions{
-		Instructions: instructions,
+		Instructions: serverInstructions,
 		Capabilities: caps,
 	})
 
 	registerTools(srv, reg, mgr, cfg, desk, grantStore)
+
+	// The tools stay registered when locked, and the middleware answers for
+	// them. Serving an empty tool list instead would tell the model nothing —
+	// it would simply conclude the server has no capabilities and move on,
+	// leaving the user to guess why the thing they configured does nothing.
+	if !gate.Allowed() {
+		_, clientMsg := pairing.Explain(gate)
+		srv.AddReceivingMiddleware(lockdown(clientMsg))
+	}
 
 	log.Printf("starting (default agent=%s, max_tasks=%d)", cfg.DefaultAgent, cfg.MaxTasks)
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
@@ -354,6 +445,32 @@ func errResult(msg string) *mcp.CallToolResult {
 
 // ptr returns a pointer to v, for the SDK's optional *bool annotation fields.
 func ptr[T any](v T) *T { return &v }
+
+// lockdown turns an unauthorized server into one that answers every request
+// with the same explanation instead of doing any work.
+//
+// It sits in front of the dispatcher rather than inside each handler so that a
+// tool added later cannot forget to check. initialize, tools/list and ping are
+// deliberately left alone: the client has to complete a handshake and read the
+// tool list before it can call anything, and that is the path by which the
+// explanation reaches the model at all.
+func lockdown(msg string) mcp.Middleware {
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			switch method {
+			case "tools/call":
+				// A tool-level error, not a protocol one: this is a refusal the
+				// model is meant to read and relay, not a transport fault.
+				return errResult(msg), nil
+			case "resources/read":
+				// The task board reads its data through here, and rendering it
+				// empty would look like "no tasks" rather than "not authorized".
+				return nil, errors.New(msg)
+			}
+			return next(ctx, method, req)
+		}
+	}
+}
 
 // readOnlyTool / mutatingTool are the annotation hints shared by the tools of
 // each kind. Read-only tools only inspect this server's own task state;
@@ -644,8 +761,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
-		msg := fmt.Sprintf("Started task %s on agent %q in %s. Call agent_task_board to show the user a live panel of it, or agent_watch to block until it finishes.", snap.ID, snap.Agent, snap.Cwd)
-		return textResult(msg), snap, nil
+		return textResult(startTaskMessage(snap.ID, snap.Agent, snap.Cwd)), snap, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -976,6 +1092,10 @@ background worker, with live progress streaming.
 
 Usage:
   cli-agent-mcp                 Run the MCP server over stdio (how an MCP client launches it).
+  cli-agent-mcp pair            Authorize an MCP client to drive this server. Run it once
+                                per client; --install edits the client's config for you.
+                                Until you do, any local process can start this server and
+                                delegate work to an agent that inherits your environment.
   cli-agent-mcp tasks           List delegated tasks and their status, then exit.
   cli-agent-mcp logs [TASK]     Follow a task's output live in the terminal. Without
                                 TASK it shows a picker; --all follows every running
@@ -1023,6 +1143,10 @@ Configuration (environment variables):
   CLI_AGENT_MCP_COMPACT            Return a filtered, readable transcript from
                                    agent_get_output/agent_watch instead of raw
                                    JSONL.                               (default: true)
+  CLI_AGENT_MCP_TOKEN              The pairing credential the client presents at launch.
+                                   Set it with 'cli-agent-mcp pair', in the client's own
+                                   config — not by hand here. Once paired, a launcher
+                                   without it gets a server that refuses every tool call.
 
 Bounding what the worker may do:
   A headless run executes tool calls by default. To BLOCK dangerous ones use the

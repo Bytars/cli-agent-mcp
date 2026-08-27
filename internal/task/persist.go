@@ -37,8 +37,32 @@ func (t *Task) persist() {
 //
 // Restored tasks reattach to their adapter by name, so one that captured a
 // session id can still be resumed with a follow-up.
-func (m *Manager) Restore(reg *agent.Registry) int {
+// foreign is the previous owner Store.Acquire reported: another server process
+// that is still alive and running tasks of its own. It is passed in rather than
+// read here because Acquire has already overwritten the lock with this process's
+// pid by the time Restore runs — asking the store afterwards returns us.
+func (m *Manager) Restore(reg *agent.Registry, foreign *state.Owner) int {
 	if m.store == nil {
+		return 0
+	}
+
+	// Sessions do not share their agents (issue #21).
+	//
+	// Adopting every record is right after a restart — that is how a client
+	// closed and reopened keeps its history — and wrong while another server is
+	// still running. There it pulled a live session's tasks into this one, where
+	// they appeared as "orphaned" and could be cancelled from a window that had
+	// never started them. Two windows of the same client are two sessions.
+	//
+	// foreign is the right discriminator precisely because Acquire only reports
+	// it when the recorded pid is ALIVE: a crashed instance leaves a stale lock,
+	// foreign is nil, and the restart path is untouched.
+	//
+	// THE PRICE, STATED: records left by an instance that dies while this one
+	// runs are not adopted here. They wait for the next start that finds no live
+	// owner. Nothing is lost — the files stay, and `cli-agent-mcp logs --all`
+	// reads them from outside regardless.
+	if foreign != nil {
 		return 0
 	}
 	records, err := m.store.LoadTasks()
