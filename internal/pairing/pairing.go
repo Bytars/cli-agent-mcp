@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Package pairing decides who is allowed to drive this server.
+//
+// # What this is not
+//
+// The MCP transport here is stdio: the client launches the binary as a child
+// process and talks to it over an anonymous pipe pair. That channel is already
+// private — there is no port, no socket, and nothing on the wire for anyone to
+// read without the privileges to debug the process outright, at which point no
+// token would help either. So none of this encrypts or signs the conversation.
+// There is nothing there to protect.
+//
+// # What it is
+//
+// The gap that does exist is authorization to launch. Today any local process
+// can execute this binary, speak MCP down its stdio, and use the server as a
+// confused deputy: it spawns a headless coding agent that inherits this
+// machine's environment — SSH keys, VPN routes, an unlocked credential agent —
+// and by default may edit files. Nothing distinguishes the MCP client the user
+// configured from a rogue npm postinstall script.
+//
+// Pairing closes that. A secret is minted once, stored here as a hash, and
+// handed to the client through its own config; a launcher that cannot present
+// it gets a server that refuses to do anything.
+//
+// # The limit, stated plainly
+//
+// The secret lives in the client's config file and in this process's
+// environment, both readable by anything running as the same user. An attacker
+// who already has that read access takes the token and is indistinguishable
+// from the real client. Pairing raises the bar — it stops code that can execute
+// but not rummage through the user's profile — it is not a wall against a
+// same-user attacker. Parent binding (see parent.go) is the second layer that
+// narrows what a stolen token is worth.
+package pairing
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+)
+
+// FileName is the pairing record inside the state directory.
+const FileName = "pairing.json"
+
+// EnvVar carries the secret from the client's config into this process.
+const EnvVar = "CLI_AGENT_MCP_TOKEN"
+
+// tokenPrefix marks a secret as ours, so a value pasted into the wrong field is
+// recognisable on sight and a mistyped one fails with a useful message rather
+// than a bare mismatch.
+const tokenPrefix = "cam1_"
+
+// secretBytes is the entropy behind each token. 32 bytes from crypto/rand is
+// far beyond guessing, which is why the stored form is a plain SHA-256 and not
+// a password KDF: there is no low-entropy secret here for Argon2 to protect.
+const secretBytes = 32
+
+// fileVersion guards the on-disk format against a future change being read as
+// if it were this one.
+const fileVersion = 1
+
+// Token is one issued credential. Labels exist so the clients that drive this
+// server — Claude Desktop and Cowork are separate launchers, with separate
+// config files — hold separate secrets: either can be revoked without
+// disturbing the other, and the audit trail names which one was used.
+type Token struct {
+	Label    string    `json:"label"`
+	Hash     string    `json:"hash"` // hex SHA-256 of the secret
+	Created  time.Time `json:"created"`
+	LastUsed time.Time `json:"last_used,omitempty"`
+
+	// Parent is the launcher this token has been bound to, recorded on first
+	// successful use. Nil means "not bound yet"; NoBind means the operator
+	// turned binding off for this token.
+	Parent *Parent `json:"parent,omitempty"`
+	NoBind bool    `json:"no_bind,omitempty"`
+}
+
+// Parent is the fingerprint of the process that launched a paired server.
+type Parent struct {
+	Exe      string    `json:"exe"`
+	Recorded time.Time `json:"recorded"`
+}
+
+// File is the whole pairing record.
+type File struct {
+	Version int     `json:"version"`
+	Tokens  []Token `json:"tokens"`
+}
+
+// Status is the outcome of checking a launcher's credentials.
+type Status int
+
+const (
+	// Unpaired means no pairing record exists. The server runs as it always
+	// did — an upgrade must not brick a working install — and says so on
+	// stderr. Running `pair` once switches enforcement on permanently.
+	Unpaired Status = iota
+
+	// OK means the presented secret matched a live token.
+	OK
+
+	// NoToken means the server is paired but the launcher presented nothing.
+	NoToken
+
+	// BadToken means a secret was presented and matched nothing.
+	BadToken
+
+	// ForeignParent means the secret was valid but the process that launched
+	// this one is not the launcher the token is bound to.
+	ForeignParent
+)
+
+// Result reports the check and carries enough detail to tell the user what to
+// do about it, both on stderr and inside the client conversation.
+type Result struct {
+	Status Status
+	Label  string // the matched token, when there is one
+	Detail string
+}
+
+// Allowed reports whether the server should expose its real tools.
+func (r Result) Allowed() bool { return r.Status == OK || r.Status == Unpaired }
+
+// Path is where the pairing record lives for a given state directory.
+func Path(stateDir string) string { return filepath.Join(stateDir, FileName) }
+
+// Load reads the pairing record. A missing file is not an error: it is the
+// unpaired state, and the caller distinguishes it with the returned bool.
+func Load(stateDir string) (*File, bool, error) {
+	buf, err := os.ReadFile(Path(stateDir))
+	if errors.Is(err, os.ErrNotExist) {
+		return &File{Version: fileVersion}, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("read %s: %w", Path(stateDir), err)
+	}
+	var f File
+	if err := json.Unmarshal(buf, &f); err != nil {
+		return nil, true, fmt.Errorf("%s is corrupt: %w", Path(stateDir), err)
+	}
+	if f.Version != fileVersion {
+		return nil, true, fmt.Errorf("%s was written by a different version of cli-agent-mcp (format %d, this build understands %d); re-run `cli-agent-mcp pair`", Path(stateDir), f.Version, fileVersion)
+	}
+	return &f, true, nil
+}
+
+// Save writes the record with an owner-only mode, replacing any previous one.
+//
+// The 0600 is honoured on Unix. Windows ignores the mode bits entirely — Go
+// creates the file with the directory's inherited ACL — so on that platform the
+// protection is the state directory's own location under the user's roaming
+// profile, which is already user-scoped. Tightening the ACL further would mean
+// hand-rolling SetNamedSecurityInfo for a file whose contents are hashes, not
+// secrets; the secret itself is never written here.
+func Save(stateDir string, f *File) error {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fmt.Errorf("state dir %q: %w", stateDir, err)
+	}
+	f.Version = fileVersion
+	buf, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return err
+	}
+	buf = append(buf, '\n')
+
+	// Write-then-rename, so an interrupted save cannot leave a truncated record
+	// that locks the user out of their own server.
+	tmp := Path(stateDir) + ".tmp"
+	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, Path(stateDir)); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("replace %s: %w", Path(stateDir), err)
+	}
+	return nil
+}
+
+// hashSecret is the stored form of a token.
+func hashSecret(secret string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(secret)))
+	return hex.EncodeToString(sum[:])
+}
+
+// newSecret mints a fresh token.
+func newSecret() (string, error) {
+	buf := make([]byte, secretBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+	return tokenPrefix + base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// Mint issues a token under label, replacing any existing token with that
+// label. It returns the secret, which is the only time it exists in plaintext
+// here — nothing but the hash is ever written to disk.
+func Mint(stateDir, label string, noBind bool) (secret string, err error) {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return "", errors.New("a label is required, so you can tell your tokens apart and revoke one without the others")
+	}
+
+	f, _, err := Load(stateDir)
+	if err != nil {
+		return "", err
+	}
+	secret, err = newSecret()
+	if err != nil {
+		return "", err
+	}
+
+	tok := Token{
+		Label:   label,
+		Hash:    hashSecret(secret),
+		Created: time.Now().UTC(),
+		NoBind:  noBind,
+	}
+	replaced := false
+	for i := range f.Tokens {
+		if strings.EqualFold(f.Tokens[i].Label, label) {
+			f.Tokens[i] = tok
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		f.Tokens = append(f.Tokens, tok)
+	}
+	if err := Save(stateDir, f); err != nil {
+		return "", err
+	}
+	return secret, nil
+}
+
+// Revoke drops the token with the given label. It reports whether one matched.
+func Revoke(stateDir, label string) (bool, error) {
+	f, paired, err := Load(stateDir)
+	if err != nil || !paired {
+		return false, err
+	}
+	kept := f.Tokens[:0]
+	found := false
+	for _, t := range f.Tokens {
+		if strings.EqualFold(t.Label, label) {
+			found = true
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if !found {
+		return false, nil
+	}
+	f.Tokens = kept
+	return true, Save(stateDir, f)
+}
+
+// Unpair removes the whole record, returning the server to its open, unpaired
+// behaviour.
+func Unpair(stateDir string) error {
+	err := os.Remove(Path(stateDir))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// Unbind clears a token's recorded launcher, so the next successful use records
+// a new one. This is the way out of a legitimate change — the client was
+// reinstalled somewhere else, or is now started through a different wrapper —
+// without minting a new secret and editing the client's config again.
+func Unbind(stateDir, label string) (bool, error) {
+	f, paired, err := Load(stateDir)
+	if err != nil || !paired {
+		return false, err
+	}
+	for i := range f.Tokens {
+		if strings.EqualFold(f.Tokens[i].Label, label) {
+			f.Tokens[i].Parent = nil
+			return true, Save(stateDir, f)
+		}
+	}
+	return false, nil
+}
+
+// Verify checks a presented secret against the record and, on a match, enforces
+// (or on first use records) the launcher binding.
+//
+// parentExe is the executable of the process that launched this one, empty if
+// it could not be determined. An unknown parent never blocks a valid token:
+// this layer is here to narrow what a stolen secret is worth, and failing shut
+// on a platform where the lookup is unavailable would deny the legitimate user
+// their own server for no gain in safety.
+func Verify(stateDir, secret, parentExe string) (Result, error) {
+	f, paired, err := Load(stateDir)
+	if err != nil {
+		return Result{Status: BadToken, Detail: err.Error()}, err
+	}
+	if !paired {
+		return Result{Status: Unpaired}, nil
+	}
+	if len(f.Tokens) == 0 {
+		return Result{
+			Status: NoToken,
+			Detail: "the pairing record exists but holds no tokens, so nothing can authenticate; run `cli-agent-mcp pair` to issue one",
+		}, nil
+	}
+
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return Result{
+			Status: NoToken,
+			Detail: "this server is paired, and the process that launched it presented no " + EnvVar,
+		}, nil
+	}
+
+	// Compare against every token rather than stopping at the first match: the
+	// work is a handful of hashes and it keeps the timing independent of which
+	// token matched, or of whether one did.
+	want := []byte(hashSecret(secret))
+	match := -1
+	for i := range f.Tokens {
+		if subtle.ConstantTimeCompare(want, []byte(f.Tokens[i].Hash)) == 1 {
+			match = i
+		}
+	}
+	if match < 0 {
+		detail := "the presented " + EnvVar + " matches no issued token"
+		if !strings.HasPrefix(secret, tokenPrefix) {
+			detail += fmt.Sprintf("; it does not even look like one (tokens start with %q), so check the value was copied whole", tokenPrefix)
+		}
+		return Result{Status: BadToken, Detail: detail}, nil
+	}
+
+	tok := &f.Tokens[match]
+	res := Result{Status: OK, Label: tok.Label}
+
+	switch {
+	case tok.NoBind, parentExe == "":
+		// Binding disabled, or this platform cannot name the parent.
+	case tok.Parent == nil:
+		// Trust on first use: whoever launched the server the first time the
+		// token worked is what the token means from now on.
+		tok.Parent = &Parent{Exe: parentExe, Recorded: time.Now().UTC()}
+	case !sameExe(tok.Parent.Exe, parentExe):
+		return Result{
+			Status: ForeignParent,
+			Label:  tok.Label,
+			Detail: fmt.Sprintf(
+				"token %q is bound to %s but this server was launched by %s. "+
+					"If you moved or reinstalled that client, run `cli-agent-mcp pair --unbind %s` and start it again.",
+				tok.Label, tok.Parent.Exe, parentExe, tok.Label),
+		}, nil
+	}
+
+	tok.LastUsed = time.Now().UTC()
+	// A failed write costs the last-used timestamp and, on a first launch, the
+	// binding — worth a warning to the caller, never worth refusing to serve a
+	// client that just proved it holds a valid token.
+	if err := Save(stateDir, f); err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
+// sameExe compares two executable paths the way the host filesystem would.
+func sameExe(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}

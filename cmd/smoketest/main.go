@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,24 @@ func main() {
 	prompt := getenv("SMOKE_PROMPT", "say hello from the worker")
 	cwd := getenv("SMOKE_CWD", mustCwd())
 	doFollowup := os.Getenv("SMOKE_FOLLOWUP") != "0"
+	// Precedence, and the middle term is the one that matters: SMOKE_STATE_DIR,
+	// then CLI_AGENT_MCP_STATE_DIR, then a temp path of our own.
+	//
+	// Falling straight through to temp silently broke the `crosscancel`
+	// scenario, and only an end-to-end run could show it. That scenario needs
+	// BOTH servers reading one directory and takes it from
+	// CLI_AGENT_MCP_STATE_DIR — but the harness's own server is started here,
+	// before any scenario runs, so pinning temp meant instance A wrote its task
+	// somewhere instance B would never look. The failure surfaced as "the task
+	// record never appeared", which reads like a bug in isolation rather than in
+	// this line.
+	//
+	// An operator who exported CLI_AGENT_MCP_STATE_DIR asked for that directory
+	// on purpose; explicit wins, exactly as it does in `pair` (issue #22). The
+	// temp default still does its two jobs when nobody asked for anything: it
+	// keeps mock runs out of the real task history, and it is unpaired, so a
+	// paired machine still serves this harness.
+	stateDir := getenv("SMOKE_STATE_DIR", getenv("CLI_AGENT_MCP_STATE_DIR", filepath.Join(os.TempDir(), "cli-agent-mcp-smoketest")))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
@@ -47,6 +66,12 @@ func main() {
 		// Pin the gate closed so the extra_args assertion is hermetic regardless
 		// of what the developer happens to have exported.
 		"CLI_AGENT_MCP_ALLOW_EXTRA_ARGS=false",
+		// Its own state directory, for two reasons. The smoke test would
+		// otherwise write mock runs into the developer's real task history —
+		// and, on a machine where the server has been paired, it is exactly the
+		// unauthorized launcher that pairing exists to turn away. A fresh
+		// directory is unpaired, so the server serves it.
+		"CLI_AGENT_MCP_STATE_DIR="+stateDir,
 	)
 	cmd.Stderr = os.Stderr
 

@@ -1,0 +1,23 @@
+# Keeps the actions in .github/workflows/*.yml from drifting.
+#
+# The three of them sat a major version behind until a runtime deprecation
+# notice appeared at the end of an unrelated run, which is a poor way to find
+# out. Dependabot turns that into a pull request instead — and because ci.yml
+# runs on pull requests, every one of those is checked by gofmt, vet, build,
+# the unit tests and the end-to-end smoke test before it can be merged.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # One pull request per week rather than one per action. A week where three
+    # actions cut releases would otherwise mean three PRs running the full
+    # suite each, and reviewing them separately buys nothing: they are read
+    # together and merged together anyway.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: build
