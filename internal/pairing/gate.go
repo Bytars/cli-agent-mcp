@@ -50,6 +50,19 @@ func Explain(r Result) (stderr, client string) {
 				"the paired client started this server. Tell the user, verbatim: " + fix + " " +
 				"Do not retry — the answer will be the same."
 
+	case Armed:
+		// Not a refusal, so it does not tell the model to stop. It tells the
+		// user what is true — the door is not shut yet — and how to shut it,
+		// because a trial nobody notices is just a weaker default.
+		return "PAIRING NOT YET IN EFFECT: " + r.Detail + ".\n" +
+				"Restart the client that should be driving this server; the first launch that presents the " +
+				"token turns enforcement on for good. Until then any local process can still use this server. " +
+				"To skip the wait, run `cli-agent-mcp pair --enforce-now`.",
+			"This cli-agent-mcp server has been paired, but no launcher has presented the token yet, so it is " +
+				"still serving anyone — including this session. Tell the user plainly: pairing is configured and " +
+				"NOT yet in effect, and it starts working the first time the client they configured launches this " +
+				"server with the token. If that never happens, the token did not reach that client's configuration."
+
 	case ForeignParent:
 		return "refusing to serve: " + r.Detail,
 			"This cli-agent-mcp server holds a valid credential but was started by a program it is not bound to, " +
@@ -68,6 +81,8 @@ func StartupLine(stateDir string, r Result) string {
 	case Unpaired:
 		return "NOT PAIRED: any process on this machine can start this server and delegate work to an agent " +
 			"that inherits your environment. Run `cli-agent-mcp pair --install` to close that."
+	case Armed:
+		return "armed, NOT enforcing: paired, but no launcher has presented the token yet"
 	}
 	f, _, err := Load(stateDir)
 	if err != nil {
@@ -89,6 +104,8 @@ func StatusName(s Status) string {
 		return "bad_token"
 	case ForeignParent:
 		return "foreign_parent"
+	case Armed:
+		return "armed"
 	}
 	return "unknown"
 }

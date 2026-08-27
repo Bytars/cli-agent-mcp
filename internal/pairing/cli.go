@@ -32,6 +32,7 @@ func Run(args []string, resolveStateDir func(string) string) int {
 	revoke := fs.String("revoke", "", "Revoke the token with this label.")
 	unbind := fs.String("unbind", "", "Forget the launcher bound to this label, so the next start records a new one.")
 	unpair := fs.Bool("unpair", false, "Remove the whole pairing record and go back to running unpaired.")
+	enforceNow := fs.Bool("enforce-now", false, "Enforce immediately instead of waiting for the token to arrive once. Leaves no window, at the cost of the safety net.")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: cli-agent-mcp pair [options]
 
@@ -89,6 +90,8 @@ Examples:
 		return runRevoke(dir, *revoke)
 	case *unbind != "":
 		return runUnbind(dir, *unbind)
+	case *enforceNow:
+		return runEnforceNow(dir)
 	}
 	return runMint(dir, *label, *noBind, *install, *configPath)
 }
@@ -114,7 +117,30 @@ agent that inherits your environment. Run `)
 		return 0
 	}
 
-	fmt.Printf("status: paired (%d token(s))\n\n", len(f.Tokens))
+	// "Paired" and "enforcing" are two different things, and the whole point of
+	// the trial is lost if this line reports the first as though it were the
+	// second. Someone checking whether they are protected has to be able to see
+	// that they are not yet.
+	if f.Enforcing() {
+		when := "set to enforce immediately (--enforce-now)"
+		if f.Confirmed() {
+			when = "in effect since " + f.ConfirmedAt.Local().Format(time.RFC3339)
+		}
+		fmt.Printf("status: paired and ENFORCING, %s (%d token(s))\n\n", when, len(f.Tokens))
+	} else {
+		fmt.Printf("status: paired but NOT YET ENFORCING (%d token(s))\n\n", len(f.Tokens))
+		fmt.Print(`No launcher has presented a token here yet, so this server still serves anyone.
+That is deliberate: enforcement waits until the token is seen to arrive, so
+pairing against a config your client does not read cannot leave you without a
+working client.
+
+Restart the client that should be driving this server. If the status above does
+not change afterwards, the token never reached it — put the token where that
+program will actually read it, or run ` + "`cli-agent-mcp pair --enforce-now`" + ` to
+close the door regardless.
+
+`)
+	}
 	toks := append([]Token(nil), f.Tokens...)
 	sort.Slice(toks, func(i, j int) bool { return toks[i].Created.Before(toks[j].Created) })
 	for _, t := range toks {
@@ -248,10 +274,25 @@ token where that launcher will actually read it.
 	fmt.Printf("\nrecord: %s\n", Path(dir))
 
 	if !wasPaired {
+		// This used to say "enforcement is now on", which stopped being true
+		// when enforcement started waiting for the token to arrive — and a
+		// closing line that overstates what just happened is the whole subject
+		// of issue #25. What is true now is that the door is armed and not shut.
 		fmt.Print(`
-Enforcement is now on: a launcher that cannot present a token gets a server that
-refuses every tool call. Keep this terminal's output out of anything shared — the
-secret is shown once and only its hash is stored.
+Enforcement is ARMED, not yet on. This server keeps serving until a launcher
+presents this token once; that first successful start turns enforcement on for
+good. So if the token did not reach your client, you find out from a status line
+instead of from a client that stopped working.
+
+  Restart your client, then run ` + "`cli-agent-mcp pair --status`" + `.
+  It must say ENFORCING. If it still says NOT YET ENFORCING, the token never
+  reached the client, and it has to go where that program will actually read it.
+
+Until then any local process can still use this server. To close the door now
+and skip the check, run ` + "`cli-agent-mcp pair --enforce-now`" + `.
+
+Keep this terminal's output out of anything shared — the secret is shown once
+and only its hash is stored.
 
 Enforcement applies to a server reading THAT record. If you start one with a
 different CLI_AGENT_MCP_STATE_DIR, it reads a different record and stays open.
@@ -342,4 +383,36 @@ func Labels(f *File) string {
 		names = append(names, t.Label)
 	}
 	return strings.Join(names, ", ")
+}
+
+// runEnforceNow closes the door without waiting for the token to arrive.
+//
+// The default holds enforcement back until a launcher has presented a valid
+// token once, so that pairing against a config the client does not read cannot
+// cost someone their client. That safety net has a price — a window in which
+// any local process is still served — and this is for whoever refuses to pay
+// it: a scripted install that already knows the token reaches the server, or an
+// operator whose threat model has no room for the window.
+func runEnforceNow(dir string) int {
+	f, paired, err := Load(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	if !paired || len(f.Tokens) == 0 {
+		fmt.Fprintln(os.Stderr, "error: nothing is paired yet, so there is nothing to enforce. Run `cli-agent-mcp pair` first.")
+		return 1
+	}
+	if f.Enforcing() {
+		fmt.Println("already enforcing; nothing to do.")
+		return 0
+	}
+	f.EnforceNow = true
+	if err := Save(dir, f); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	fmt.Println("enforcing from now on: a launcher that cannot present a token gets a server that refuses every tool call.")
+	fmt.Println("\nIf your client stops working after this, the token is not reaching it. Run `cli-agent-mcp pair --unpair` to get it back.")
+	return 0
 }

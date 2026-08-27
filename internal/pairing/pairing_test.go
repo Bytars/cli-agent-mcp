@@ -10,6 +10,25 @@ import (
 	"testing"
 )
 
+// confirm walks a record through the one launch that turns pairing on: a
+// launcher presents a valid token, and from then on enforcement is permanent.
+//
+// Tests about refusing anything need it, because a freshly minted record does
+// not refuse — it serves, loudly, until a token has been seen to arrive. That
+// is deliberate (see Status Armed) and it means "paired" and "enforcing" are
+// two different states that these tests have to step through rather than
+// assume.
+func confirm(t *testing.T, dir, secret, launcher string) {
+	t.Helper()
+	r, err := Verify(dir, secret, launcher)
+	if err != nil {
+		t.Fatalf("confirming the pairing: %v", err)
+	}
+	if r.Status != OK {
+		t.Fatalf("confirming the pairing gave %v (%s), want OK", r.Status, r.Detail)
+	}
+}
+
 // An install that predates pairing must keep working. Bricking a working setup
 // on upgrade would be a worse outcome than the exposure this feature closes.
 func TestUnpairedServesAsBefore(t *testing.T) {
@@ -72,6 +91,7 @@ func TestPairedRejectsMissingAndWrongTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
+	confirm(t, dir, secret, "/opt/Claude/claude")
 
 	for _, tc := range []struct {
 		name   string
@@ -113,6 +133,7 @@ func TestRevokeIsPerLabel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint cowork: %v", err)
 	}
+	confirm(t, dir, desktop, "")
 
 	if ok, err := Revoke(dir, "cowork"); err != nil || !ok {
 		t.Fatalf("Revoke: ok=%v err=%v", ok, err)
@@ -134,6 +155,7 @@ func TestMintRotatesInPlace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
+	confirm(t, dir, old, "")
 	fresh, err := Mint(dir, "claude-desktop", false)
 	if err != nil {
 		t.Fatalf("re-Mint: %v", err)
@@ -570,11 +592,14 @@ func TestExplainAlwaysSaysWhatToDo(t *testing.T) {
 // is the fact that says whose configuration the token has to live in.
 func TestTheLogNamesTheLauncherEndToEnd(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := Mint(dir, "claude-desktop", false); err != nil {
+	secret, err := Mint(dir, "claude-desktop", false)
+	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
 
 	const launcher = `C:\Tools\some-client.exe`
+	confirm(t, dir, secret, launcher)
+
 	r, err := Verify(dir, "", launcher)
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
@@ -591,5 +616,112 @@ func TestTheLogNamesTheLauncherEndToEnd(t *testing.T) {
 		if !strings.Contains(client, want) {
 			t.Errorf("the message for the model is missing %q:\n%s", want, client)
 		}
+	}
+}
+
+// Pairing must not be able to cost someone their client. A record that has
+// never seen a working token serves instead of refusing, so a token written
+// into a config the client does not read leaves them with a client that still
+// works and a log that says why — rather than the failure #25 describes, where
+// the first sign of trouble is the MCP disappearing after a restart.
+func TestAFreshPairingDoesNotLockAnyoneOut(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Mint(dir, "claude-desktop", false); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	r, err := Verify(dir, "", "/opt/Claude/claude")
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != Armed {
+		t.Fatalf("status = %v, want Armed", r.Status)
+	}
+	if !r.Allowed() {
+		t.Fatal("a pairing nobody has confirmed locked the user out; that is exactly the failure this prevents")
+	}
+
+	stderr, client := Explain(r)
+	for name, msg := range map[string]string{"log": stderr, "model message": client} {
+		if !strings.Contains(msg, "NOT") {
+			t.Errorf("the %s does not make clear that pairing is not in effect yet:\n%s", name, msg)
+		}
+	}
+}
+
+// The trial closes on evidence, not on a timer: the first launch that presents
+// a valid token turns enforcement on, and it stays on.
+func TestTheFirstGoodTokenTurnsEnforcementOn(t *testing.T) {
+	dir := t.TempDir()
+	secret, err := Mint(dir, "claude-desktop", false)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	if r, _ := Verify(dir, "", "/opt/Claude/claude"); r.Status != Armed {
+		t.Fatalf("before any successful use: status = %v, want Armed", r.Status)
+	}
+	confirm(t, dir, secret, "/opt/Claude/claude")
+
+	r, err := Verify(dir, "", "/opt/Claude/claude")
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != NoToken {
+		t.Fatalf("after a successful use: status = %v, want NoToken — enforcement never engaged", r.Status)
+	}
+	if r.Allowed() {
+		t.Fatal("the server still serves an unauthenticated launcher after pairing was confirmed")
+	}
+}
+
+// Rotating a credential is not evidence that pairing stopped working. Deriving
+// confirmation from the tokens rather than the record would reopen a door that
+// had been shut for months, and it would do it silently — the operator rotates
+// a token, and the next unauthenticated launcher is served.
+func TestRotatingATokenDoesNotReopenTheDoor(t *testing.T) {
+	dir := t.TempDir()
+	first, err := Mint(dir, "claude-desktop", false)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	confirm(t, dir, first, "")
+
+	if _, err := Mint(dir, "claude-desktop", false); err != nil {
+		t.Fatalf("re-Mint: %v", err)
+	}
+
+	r, err := Verify(dir, "", "/opt/Claude/claude")
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status == Armed || r.Allowed() {
+		t.Fatalf("status = %v after rotation: rotating a token dropped a confirmed install back into its trial", r.Status)
+	}
+}
+
+// The window is a default, not a verdict. Whoever will not have it can close it
+// without waiting for anything.
+func TestEnforceNowSkipsTheTrial(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Mint(dir, "claude-desktop", false); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	f, _, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	f.EnforceNow = true
+	if err := Save(dir, f); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	r, err := Verify(dir, "", "/opt/Claude/claude")
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != NoToken || r.Allowed() {
+		t.Fatalf("status = %v with --enforce-now set, want a refusal", r.Status)
 	}
 }
