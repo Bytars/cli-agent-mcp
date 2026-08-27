@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -193,7 +194,7 @@ func runMint(dir, label string, noBind, install bool, configPath string) int {
 	}
 
 	if install {
-		path, err := InstallToken(configPath, exe, secret)
+		path, created, err := InstallToken(configPath, exe, secret)
 		if err != nil {
 			// The token is already minted and valid; the user just has to place
 			// it themselves. Falling back to printing beats leaving them with a
@@ -203,8 +204,37 @@ func runMint(dir, label string, noBind, install bool, configPath string) int {
 			printSnippet(exe, secret, label)
 			return 1
 		}
-		fmt.Printf("paired %q and updated %s\n", label, path)
-		fmt.Println("Restart the client so it picks up the new configuration.")
+		if created {
+			// A config that did not exist is a config the client was not using
+			// (issue #25). Saying "updated <path>" here is how a machine ended
+			// up with enforcement on and no way to present the token: the write
+			// succeeded, the message read as success, and the client — a
+			// connector defined outside the filesystem — never saw the file.
+			//
+			// The token is still valid, so the secret is printed too: on this
+			// path the user almost certainly has to place it somewhere else.
+			fmt.Printf("paired %q, and CREATED %s\n\n", label, path)
+			fmt.Print(`That file did not exist until now, which usually means your client was not
+reading it. If this server is launched by something that keeps its own
+configuration — an extension, or a connector defined in your account rather than
+on disk — the token below has to go THERE instead, or into the environment the
+launcher passes down.
+
+Before you rely on this, check it: restart the client and look at the server's
+first log line. It must say
+
+    paired: authorized as ` + strconv.Quote(label) + `
+
+If instead it says "refusing to serve", the token did not reach it. Run
+` + "`cli-agent-mcp pair --unpair`" + ` to get your client working again, then place the
+token where that launcher will actually read it.
+
+`)
+			printSnippet(exe, secret, label)
+		} else {
+			fmt.Printf("paired %q and updated %s\n", label, path)
+			fmt.Println("Restart the client so it picks up the new configuration.")
+		}
 	} else {
 		fmt.Printf("paired %q\n", label)
 		printSnippet(exe, secret, label)

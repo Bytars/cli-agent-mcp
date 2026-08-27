@@ -43,38 +43,55 @@ func ConfigPath() (string, error) {
 }
 
 // InstallToken adds or updates this server's entry in a client config, setting
-// the pairing token in its env block. It returns the file it wrote.
+// the pairing token in its env block. It returns the file it wrote and whether
+// that file had to be CREATED.
+//
+// # Why "created" is worth returning
+//
+// Writing the token is not the same as the client reading it, and this cannot
+// tell the difference — it edits a path, and whether the client actually loads
+// that path is beyond anything this process can see. The one signal available
+// is whether the file was already there: **a config that did not exist is a
+// config the client was not using**, and that is the case where pairing looks
+// like it worked and silently did not (issue #25).
+//
+// Measured on a real install: this created `claude_desktop_config.json` from
+// nothing, wrote a correct entry into it, and reported success — while the
+// server that actually runs is registered as a connector held outside the
+// filesystem entirely. There was no local file to edit, and the user found out
+// by losing their MCP on the next restart.
 //
 // The file is decoded into plain maps and re-encoded, never into a struct: a
 // client config holds entries for other servers and settings this build has
 // never heard of, and round-tripping through a typed shape would quietly drop
 // every one of them.
-func InstallToken(path, exe, secret string) (string, error) {
+func InstallToken(path, exe, secret string) (written string, created bool, err error) {
 	if path == "" {
 		p, err := ConfigPath()
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		path = p
 	}
 
 	root := map[string]any{}
-	buf, err := os.ReadFile(path)
+	buf, readErr := os.ReadFile(path)
 	switch {
-	case err == nil:
+	case readErr == nil:
 		if len(trimSpaceBytes(buf)) > 0 {
 			if err := json.Unmarshal(buf, &root); err != nil {
 				// Overwriting a config we failed to parse would destroy the
 				// user's other servers. Refuse and say which file to look at.
-				return "", fmt.Errorf("%s is not valid JSON (%w); fix or move it, then run pairing again", path, err)
+				return "", false, fmt.Errorf("%s is not valid JSON (%w); fix or move it, then run pairing again", path, err)
 			}
 		}
-	case errors.Is(err, os.ErrNotExist):
+	case errors.Is(readErr, os.ErrNotExist):
+		created = true
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return "", fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+			return "", false, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
 		}
 	default:
-		return "", fmt.Errorf("read %s: %w", path, err)
+		return "", false, fmt.Errorf("read %s: %w", path, readErr)
 	}
 
 	servers, _ := root["mcpServers"].(map[string]any)
@@ -102,7 +119,7 @@ func InstallToken(path, exe, secret string) (string, error) {
 
 	out, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	out = append(out, '\n')
 
@@ -111,19 +128,19 @@ func InstallToken(path, exe, secret string) (string, error) {
 	if len(buf) > 0 {
 		backup := fmt.Sprintf("%s.bak-%s", path, time.Now().UTC().Format("20060102T150405Z"))
 		if err := os.WriteFile(backup, buf, 0o600); err != nil {
-			return "", fmt.Errorf("back up %s: %w", path, err)
+			return "", false, fmt.Errorf("back up %s: %w", path, err)
 		}
 	}
 
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return "", fmt.Errorf("write %s: %w", tmp, err)
+		return "", false, fmt.Errorf("write %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
-		return "", fmt.Errorf("replace %s: %w", path, err)
+		return "", false, fmt.Errorf("replace %s: %w", path, err)
 	}
-	return path, nil
+	return path, created, nil
 }
 
 // trimSpaceBytes reports the content of buf ignoring surrounding whitespace, so

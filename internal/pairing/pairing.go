@@ -129,6 +129,13 @@ type Result struct {
 	Status Status
 	Label  string // the matched token, when there is one
 	Detail string
+
+	// Launcher is the executable that started this process, when the platform
+	// could answer. It is carried into the rejection because it is the single
+	// most useful fact for someone locked out: the token has to live in THAT
+	// program's configuration, and the installer may well have written it
+	// somewhere else entirely (issue #25).
+	Launcher string
 }
 
 // Allowed reports whether the server should expose its real tools.
@@ -320,9 +327,18 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 
 	secret = strings.TrimSpace(secret)
 	if secret == "" {
+		// El detalle nombra al lanzador cuando se lo pudo resolver. Es lo que
+		// separa un mensaje inútil —"presentó nada"— de uno accionable: dice en
+		// la configuración de QUÉ programa tiene que estar el token, que puede
+		// no ser el archivo donde el instalador lo escribió (issue #25).
+		detalle := "this server is paired, and the process that launched it presented no " + EnvVar
+		if parentExe != "" {
+			detalle += " (launched by " + parentExe + " — the token has to be in that program's configuration)"
+		}
 		return Result{
-			Status: NoToken,
-			Detail: "this server is paired, and the process that launched it presented no " + EnvVar,
+			Status:   NoToken,
+			Detail:   detalle,
+			Launcher: parentExe,
 		}, nil
 	}
 

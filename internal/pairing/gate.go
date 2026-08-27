@@ -15,11 +15,26 @@ import "fmt"
 func Explain(r Result) (stderr, client string) {
 	const fix = "Run `cli-agent-mcp pair --install` in a terminal, then restart the client."
 
+	// The way out when pairing was set up against the wrong place. It has to be
+	// offered here and not only in the docs: on this path the user has no
+	// working MCP, so the answer cannot be "go read something" (issue #25).
+	const escape = "If pairing was just set up and the client stopped working, the token is not reaching this " +
+		"server — run `cli-agent-mcp pair --unpair` to get the client running again, then put the token " +
+		"where the program that launches this server will actually read it."
+
 	switch r.Status {
 	case NoToken:
+		// Name the launcher. This process knows who started it, and that is
+		// exactly the fact the user needs: the token belongs in THAT program's
+		// configuration, which may not be the file the installer wrote.
+		quien := "The program that launched it"
+		if r.Launcher != "" {
+			quien = "It was launched by " + r.Launcher + ", so the token belongs in that program's configuration; it"
+		}
 		return "refusing to serve: " + r.Detail,
 			"This cli-agent-mcp server is paired to specific clients, and whatever launched it presented no credential, " +
-				"so every tool here is disabled. Tell the user, verbatim: " + fix + " " +
+				"so every tool here is disabled. " + quien + " presented no CLI_AGENT_MCP_TOKEN. " +
+				"Tell the user, verbatim: " + fix + " " + escape + " " +
 				"Do not try to work around this and do not retry — nothing will change until they do that."
 
 	case BadToken:

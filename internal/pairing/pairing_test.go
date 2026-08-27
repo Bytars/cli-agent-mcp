@@ -317,7 +317,7 @@ func TestInstallTokenPreservesOtherServers(t *testing.T) {
 		t.Fatalf("seed config: %v", err)
 	}
 
-	if _, err := InstallToken(path, "/usr/local/bin/cli-agent-mcp", "cam1_secret"); err != nil {
+	if _, _, err := InstallToken(path, "/usr/local/bin/cli-agent-mcp", "cam1_secret"); err != nil {
 		t.Fatalf("InstallToken: %v", err)
 	}
 
@@ -356,7 +356,7 @@ func TestInstallTokenKeepsAnExistingCommand(t *testing.T) {
 		t.Fatalf("seed config: %v", err)
 	}
 
-	if _, err := InstallToken(path, "/usr/local/bin/cli-agent-mcp", "cam1_new"); err != nil {
+	if _, _, err := InstallToken(path, "/usr/local/bin/cli-agent-mcp", "cam1_new"); err != nil {
 		t.Fatalf("InstallToken: %v", err)
 	}
 
@@ -388,7 +388,7 @@ func TestInstallTokenRefusesBrokenConfig(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	if _, err := InstallToken(path, "exe", "cam1_x"); err == nil {
+	if _, _, err := InstallToken(path, "exe", "cam1_x"); err == nil {
 		t.Fatal("overwrote a config that could not be parsed")
 	}
 	buf, _ := os.ReadFile(path)
@@ -399,7 +399,8 @@ func TestInstallTokenRefusesBrokenConfig(t *testing.T) {
 
 func TestInstallTokenCreatesAMissingConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "cfg.json")
-	if _, err := InstallToken(path, "exe", "cam1_x"); err != nil {
+	_, created, err := InstallToken(path, "exe", "cam1_x")
+	if err != nil {
 		t.Fatalf("InstallToken: %v", err)
 	}
 	var root map[string]any
@@ -409,6 +410,69 @@ func TestInstallTokenCreatesAMissingConfig(t *testing.T) {
 	}
 	if err := json.Unmarshal(buf, &root); err != nil {
 		t.Fatalf("wrote invalid JSON: %v", err)
+	}
+
+	// Y tiene que DECIR que lo creó (issue #25). Escribir bien un archivo que el
+	// cliente no lee es el modo de falla que dejó una máquina sin MCP: la
+	// escritura funcionó, el mensaje se leyó como éxito, y el enforcement quedó
+	// encendido sin nadie que pudiera presentar el token.
+	if !created {
+		t.Error("created = false sobre un archivo que no existía.\n" +
+			"Ese booleano es lo único que distingue «actualicé tu configuración» de\n" +
+			"«inventé una configuración que quizá nadie lea», y el segundo caso necesita\n" +
+			"una advertencia, no una felicitación.")
+	}
+}
+
+// TestInstallTokenNoMienteSobreUnConfigQueYaExistia es la otra mitad del control
+// de #25: si `created` fuera true siempre, la advertencia aparecería también en
+// el caso bueno y se volvería ruido que nadie lee.
+func TestInstallTokenNoMienteSobreUnConfigQueYaExistia(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.json")
+	if err := os.WriteFile(path, []byte(`{"mcpServers":{"otro":{"command":"x"}}}`), 0o600); err != nil {
+		t.Fatalf("preparar: %v", err)
+	}
+	_, created, err := InstallToken(path, "exe", "cam1_x")
+	if err != nil {
+		t.Fatalf("InstallToken: %v", err)
+	}
+	if created {
+		t.Error("created = true sobre un archivo que YA existía; la advertencia saldría cuando no corresponde")
+	}
+}
+
+// TestElRechazoNombraAlLanzadorYLaSalida fija la segunda mitad de #25.
+//
+// El mensaje viejo decía sólo «corré pair --install», que es exactamente lo que
+// el usuario acababa de hacer cuando se quedó sin MCP. Un remedio que es la
+// acción que falló no es un remedio.
+func TestElRechazoNombraAlLanzadorYLaSalida(t *testing.T) {
+	const launcher = `C:\Tools\algun-cliente.exe`
+	stderr, client := Explain(Result{
+		Status:   NoToken,
+		Label:    "claude-desktop",
+		Detail:   "this server is paired, and the process that launched it presented no " + EnvVar,
+		Launcher: launcher,
+	})
+	if stderr == "" {
+		t.Fatal("stderr vacío")
+	}
+	if !strings.Contains(client, launcher) {
+		t.Errorf("el mensaje al cliente no nombra al lanzador (%s).\n"+
+			"Es el dato que dice en la configuración de QUÉ programa tiene que estar el token,\n"+
+			"que puede no ser el archivo donde el instalador lo escribió.\n\n%s", launcher, client)
+	}
+	if !strings.Contains(client, "pair --unpair") {
+		t.Errorf("el mensaje al cliente no nombra la salida.\n"+
+			"En este estado el usuario NO TIENE MCP, así que la respuesta no puede ser\n"+
+			"«andá a leer algo»: hay que darle el comando que se lo devuelve.\n\n%s", client)
+	}
+
+	// Sin lanzador resuelto —hay plataformas donde no se puede— el mensaje tiene
+	// que seguir siendo útil en vez de quedar a medio armar.
+	_, sinLanzador := Explain(Result{Status: NoToken, Label: "x", Detail: "d"})
+	if !strings.Contains(sinLanzador, "pair --unpair") {
+		t.Errorf("sin lanzador resuelto el mensaje pierde la salida:\n%s", sinLanzador)
 	}
 }
 
