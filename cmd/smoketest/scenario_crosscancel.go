@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bytars/cli-agent-mcp/internal/winspawn"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -268,7 +269,9 @@ func xcancelAwaitRecord(ctx context.Context, stateDir, id string) {
 // same way main does for the first.
 func xcancelSpawn(ctx context.Context, e *env, stateDir string) *mcp.ClientSession {
 	exe := xcancelServerExe()
-	cmd := exec.Command(exe)
+	// winspawn.Harden, igual que en main: esta segunda instancia es un proceso
+	// más en la pantalla de quien corre el smoketest (issue #18).
+	cmd := winspawn.Harden(exec.Command(exe))
 	cmd.Env = append(os.Environ(),
 		"CLI_AGENT_MCP_DEFAULT_AGENT="+e.Agent,
 		// Set explicitly even though it is already in the environment: the whole

@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Bytars/cli-agent-mcp/internal/winspawn"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -55,7 +56,11 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	cmd := exec.Command(serverExe)
+	// winspawn.Harden: el smoketest corre en la máquina de quien desarrolla, y
+	// sin esto cada corrida le abre una consola encima (issue #18). No estorba a
+	// los pipes: stdin/stdout van por el transporte del cliente MCP y stderr está
+	// redirigido abajo.
+	cmd := winspawn.Harden(exec.Command(serverExe))
 	cmd.Env = append(os.Environ(),
 		"CLI_AGENT_MCP_DEFAULT_AGENT="+agentName,
 		// Pin the gate closed so the extra_args assertion is hermetic regardless
