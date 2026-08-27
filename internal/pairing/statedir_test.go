@@ -11,6 +11,40 @@ import (
 	"github.com/Bytars/cli-agent-mcp/internal/state"
 )
 
+// aislaElDirectorioPorUsuario redirige el default de state.DefaultDir a un
+// temporal, para que este test no pueda tocar el registro real de quien lo corre.
+//
+// NO ES PRECAUCIÓN TEÓRICA: PASÓ.
+// El control de este test se hace rompiendo la premisa a propósito — devolver a
+// `pair` la resolución vieja, la que ignora CLI_AGENT_MCP_STATE_DIR. Con la
+// premisa rota, `pair` hace exactamente lo que el defecto hacía: escribir en el
+// directorio por-usuario. Corriendo ese control se pareó la instalación real de
+// la máquina, con el token de prueba y todo, y el servidor de verdad habría
+// quedado negándose a servir al siguiente reinicio.
+//
+// Un test cuyo control daña la máquina de quien lo corre no es un test: es una
+// trampa. Con el default apuntando a un temporal, el control sigue produciendo
+// su rojo y ya no puede alcanzar nada real.
+//
+// DefaultDir sale de os.UserConfigDir, que en Windows lee APPDATA y en el resto
+// XDG_CONFIG_HOME (con HOME de reserva); se fijan los tres para que el
+// aislamiento no dependa de en qué sistema corra.
+func aislaElDirectorioPorUsuario(t *testing.T) {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("APPDATA", tmp)
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("HOME", tmp)
+
+	// Y se verifica, en vez de confiar: si una versión de Go resolviera el
+	// default por otra vía, el aislamiento sería falso y este test volvería a
+	// poder escribir donde no debe.
+	if got := state.DefaultDir(); !filepath.HasPrefix(got, tmp) {
+		t.Fatalf("el aislamiento no tomó: DefaultDir devuelve %s, fuera del temporal %s.\n"+
+			"Sin esto, el control de este test parea la instalación real de quien lo corre.", got, tmp)
+	}
+}
+
 // TestPairEscribeDondeElServidorLee fija el arreglo del issue #22.
 //
 // EL DEFECTO QUE ESTO IMPIDE QUE VUELVA
@@ -35,6 +69,7 @@ func TestPairEscribeDondeElServidorLee(t *testing.T) {
 	t.Run("sin flag, manda la variable de entorno", func(t *testing.T) {
 		dir := t.TempDir()
 		t.Setenv("CLI_AGENT_MCP_STATE_DIR", dir)
+		aislaElDirectorioPorUsuario(t)
 
 		if code := pairing.Run([]string{"--label", "prueba"}, state.ResolveDir); code != 0 {
 			t.Fatalf("pair devolvió %d, quería 0", code)
@@ -68,6 +103,7 @@ func TestPairEscribeDondeElServidorLee(t *testing.T) {
 		delDeLaVariable := t.TempDir()
 		delFlag := t.TempDir()
 		t.Setenv("CLI_AGENT_MCP_STATE_DIR", delDeLaVariable)
+		aislaElDirectorioPorUsuario(t)
 
 		if code := pairing.Run([]string{"--state-dir", delFlag, "--label", "prueba"}, state.ResolveDir); code != 0 {
 			t.Fatalf("pair devolvió %d, quería 0", code)
