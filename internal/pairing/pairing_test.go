@@ -441,6 +441,63 @@ func TestInstallTokenNoMienteSobreUnConfigQueYaExistia(t *testing.T) {
 	}
 }
 
+// TestElTokenDelEntornoSirve prueba el camino que queda cuando el cliente no
+// tiene archivo de configuración: presentar el secreto por el entorno.
+//
+// Es la vía que se ofrece en `printEnvFallback`, y ofrecer algo sin probar que
+// funciona es exactamente cómo se llega a un usuario sin MCP (issue #25). Acá se
+// prueba el mecanismo entero: se paira, se presenta el secreto tal cual lo
+// presentaría el entorno, y el veredicto tiene que ser OK.
+func TestElTokenDelEntornoSirve(t *testing.T) {
+	dir := t.TempDir()
+	secreto, err := Mint(dir, "cowork", false)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	// El lanzador es el mismo en los dos arranques, que es la situación real:
+	// una vez que el binding se registra, sólo ese programa sirve.
+	const lanzador = `C:\Tools\algun-cliente.exe`
+
+	r, err := Verify(dir, secreto, lanzador)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != OK {
+		t.Fatalf("con el secreto correcto el estado es %v (%s), quería OK.\n"+
+			"Si esto falla, la salida por variable de entorno que `pair` ofrece no sirve\n"+
+			"para nada y el usuario se queda sin cliente.", r.Status, r.Detail)
+	}
+	if r.Label != "cowork" {
+		t.Errorf("label = %q, quería \"cowork\"", r.Label)
+	}
+
+	// Y el control de la afirmación: sin el secreto, el mismo montaje rechaza.
+	// Sin esta mitad, un Verify que dijera OK siempre pasaría la prueba de
+	// arriba.
+	sin, err := Verify(dir, "", lanzador)
+	if err != nil {
+		t.Fatalf("Verify sin secreto: %v", err)
+	}
+	if sin.Status != NoToken {
+		t.Errorf("sin secreto el estado es %v, quería NoToken; el gate no está discriminando", sin.Status)
+	}
+
+	// Y desde OTRO lanzador, con el secreto correcto: tiene que rechazar. Es lo
+	// que hace que la variable de entorno siga valiendo algo pese a ser legible
+	// por cualquier proceso del usuario.
+	otro, err := Verify(dir, secreto, `C:\Windows\System32\cmd.exe`)
+	if err != nil {
+		t.Fatalf("Verify desde otro lanzador: %v", err)
+	}
+	if otro.Status != ForeignParent {
+		t.Errorf("desde otro lanzador el estado es %v, quería ForeignParent.\n"+
+			"Éste es el argumento por el que la variable de entorno es aceptable: aunque el\n"+
+			"secreto se lea, sigue atado al programa que lo usó primero. Si esto no se cumple,\n"+
+			"ofrecer el entorno es entregar el pairing entero.", otro.Status)
+	}
+}
+
 // TestElRechazoNombraAlLanzadorYLaSalida fija la segunda mitad de #25.
 //
 // El mensaje viejo decía sólo «corré pair --install», que es exactamente lo que

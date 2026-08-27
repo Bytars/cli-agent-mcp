@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -283,7 +284,52 @@ func printSnippet(exe, secret, label string) {
 		return
 	}
 	fmt.Printf("\nAdd this to the client's config (merging with what is already there):\n\n%s\n", buf)
+	printEnvFallback(secret)
 	fmt.Printf("\nShown once. If you lose it, run `cli-agent-mcp pair --label %s` again to issue a new one.\n", label)
+}
+
+// printEnvFallback offers the environment variable, with its price.
+//
+// # Why this is here and not only in the docs
+//
+// Some clients keep no configuration file at all — a connector defined in the
+// account rather than on disk is one, and it is what turned issue #25 into a
+// machine with no MCP. For those there is nothing to edit, and a snippet of
+// JSON is useless advice. The environment is the one channel that reaches any
+// launcher, so it belongs next to the snippet rather than in a document the
+// person reads after they are already locked out.
+//
+// # The price, stated rather than buried
+//
+// A user-level variable lives in the registry (or the shell profile) and any
+// process running as this user can read it. That is a real loss: pairing exists
+// partly to stop code that can execute but cannot rummage through the profile,
+// and this hands that code the secret.
+//
+// It is NOT the same as having no pairing. The token stays bound to the
+// launcher that first used it (parent.go), so a secret read out of the
+// environment still does not let another program drive this server. What the
+// variable gives away is the first layer; the second still stands.
+func printEnvFallback(secret string) {
+	fmt.Print(`
+If your client keeps no config file — a connector defined in your account, for
+instance — there is nothing to edit, and the environment is the only channel
+that reaches every launcher:
+`)
+	switch runtime.GOOS {
+	case "windows":
+		fmt.Printf("\n    setx %s \"%s\"\n", EnvVar, secret)
+		fmt.Println("\n(then sign out and back in, or restart the client, so it inherits the new value)")
+	default:
+		fmt.Printf("\n    export %s=%q      # add it to your shell profile to make it stick\n", EnvVar, secret)
+	}
+	fmt.Print(`
+Understand what that costs: a user-level variable is readable by every process
+running as you, which is one of the things pairing exists to prevent. The token
+stays bound to the launcher that first uses it, so a secret read out of the
+environment still will not let another program drive this server — but prefer
+the client's own config whenever the client has one.
+`)
 }
 
 // Labels names the issued tokens, for the server's startup line.
