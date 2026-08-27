@@ -86,7 +86,7 @@ jobs:
       # This is not code signing and does not affect SmartScreen — it is the
       # supply-chain answer, not the "unknown publisher" one.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/cli-agent-mcp_*
 
