@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,8 +28,10 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/Bytars/cli-agent-mcp/internal/agent"
+	"github.com/Bytars/cli-agent-mcp/internal/approval"
 	"github.com/Bytars/cli-agent-mcp/internal/audit"
 	"github.com/Bytars/cli-agent-mcp/internal/config"
+	"github.com/Bytars/cli-agent-mcp/internal/grants"
 	"github.com/Bytars/cli-agent-mcp/internal/inspect"
 	"github.com/Bytars/cli-agent-mcp/internal/pairing"
 	"github.com/Bytars/cli-agent-mcp/internal/state"
@@ -134,6 +137,8 @@ func main() {
 	defer auditLog.Close()
 	mgr.SetAudit(auditLog)
 	mgr.SetTaskTimeout(cfg.TaskTimeout)
+	mgr.SetMaxConcurrent(cfg.MaxConcurrent)
+	mgr.SetMaxCostUSD(cfg.MaxCostUSD)
 	if auditLog.Enabled() {
 		log.Printf("audit log: %s", cfg.AuditLog)
 	}
@@ -174,7 +179,8 @@ func main() {
 			log.Printf("warning: could not take the instance lock: %v", err)
 		} else if prev != nil {
 			instanceWarning = fmt.Sprintf(
-				"another cli-agent-mcp server (pid %d, started %s) is still running and owns tasks this instance cannot watch or cancel. "+
+				"another cli-agent-mcp server (pid %d, started %s) is still running and owns tasks this instance did not start. "+
+					"Their output and status stay readable here, and agent_cancel_task reaches them by leaving the request for that instance. "+
 					"Tasks it started appear here as %q once they are restored from disk. "+
 					"If that process is no longer wanted, stop it — but note that doing so kills any worker still running under it.",
 				prev.PID, prev.Started.Format(time.RFC3339), task.StatusOrphaned)
@@ -199,6 +205,39 @@ func main() {
 		return
 	}
 
+	// Resolved once, because empty means "the per-user default" and both stores
+	// below need a real path. Passing cfg.StateDir straight through left grants
+	// with no directory at all, and the approval config on a relative path the
+	// agent resolved against its own workspace.
+	stateDir := cfg.StateDir
+	if stateDir == "" {
+		stateDir = state.DefaultDir()
+	}
+
+	// Interactive approval. It only does anything for a client that can put a
+	// question to its user, and it fails soft: if the endpoint cannot be brought
+	// up, tasks run exactly as they did before.
+	grantStore, err := grants.Open(stateDir)
+	if err != nil {
+		log.Printf("warning: remembered permissions are unavailable: %v", err)
+		grantStore = &grants.Store{}
+	}
+
+	desk := newPermissionDesk(cfg.PermissionTimeout)
+	desk.mgr = mgr
+	desk.grants = grantStore
+	mgr.SetGrants(grantStore)
+	if cfg.AskPermission {
+		broker, err := approval.Start(filepath.Join(stateDir, "approval"), desk.Decide)
+		if err != nil {
+			log.Printf("warning: interactive permission prompts are off: %v", err)
+		} else {
+			defer broker.Close()
+			desk.broker = broker
+			log.Printf("interactive approval: %s", broker.Addr())
+		}
+	}
+
 	// Advertise the MCP Apps extension so hosts that support interactive views
 	// know this server can render one, and fetch the board's ui:// resource.
 	// Setting Capabilities at all replaces the SDK's default, so logging has to
@@ -219,7 +258,7 @@ func main() {
 		Capabilities: caps,
 	})
 
-	registerTools(srv, reg, mgr, cfg)
+	registerTools(srv, reg, mgr, cfg, desk, grantStore)
 
 	// The tools stay registered when locked, and the middleware answers for
 	// them. Serving an empty tool list instead would tell the model nothing —
@@ -268,6 +307,7 @@ type startInput struct {
 	Model        string   `json:"model,omitempty" jsonschema:"Optional model override passed to the agent."`
 	AllowedTools []string `json:"allowed_tools,omitempty" jsonschema:"Tools to pre-approve for this run so the headless worker doesn't stall waiting for approval it can't get (Claude Code --allowedTools). Patterns supported, e.g. [\"Bash(git *)\",\"Edit\",\"PowerShell\"]. This only pre-approves; the server's deny policy still applies."`
 	ExtraArgs    []string `json:"extra_args,omitempty" jsonschema:"Extra CLI flags appended verbatim to this run (disabled by default on the server)."`
+	Isolate      bool     `json:"isolate,omitempty" jsonschema:"Run this task in a git worktree of its own, on its own branch, instead of directly in cwd. Use it when other work is happening in that directory, or when running several agents at once — two workers in one checkout overwrite each other's edits. Note a worktree is a fresh checkout, so untracked files (node_modules, .env, build caches) are NOT there; a task that needs them should run in place. Review the result with agent_task_diff."`
 }
 
 type idInput struct {
@@ -511,7 +551,20 @@ func finishText(snap task.Snapshot) string {
 	if snap.IsError || snap.Status == task.StatusFailed {
 		header = fmt.Sprintf("Task %s FAILED (status %q).", snap.ID, snap.Status)
 	}
-	return header + outcomeDetail(snap) + "\n\n" + body
+	return header + outcomeDetail(snap) + "\n\n" + body + usageLine(snap)
+}
+
+// stillRunningText is what a blocking "run" tool returns when the turn outlives
+// the window it was allowed to wait. It has to be unmistakable that nothing
+// went wrong and that the work is still under way, because the obvious reading
+// of a truncated result is that the task died.
+func stillRunningText(snap task.Snapshot, window time.Duration) string {
+	return fmt.Sprintf(
+		"Task %s is STILL RUNNING after %s. Nothing failed and the worker was not interrupted — "+
+			"this call simply returned before the client would have abandoned it.\n\n"+
+			"Follow it with agent_watch (task_id=%s) until running is false. "+
+			"The result will be there when it finishes.",
+		snap.ID, window.Round(time.Second), snap.ID)
 }
 
 // planText frames the outcome of a plan-only run, making it unmistakable that
@@ -525,8 +578,8 @@ func planText(snap task.Snapshot) string {
 		return fmt.Sprintf("Planning task %s FAILED (status %q).%s Nothing was executed.\n\n%s",
 			snap.ID, snap.Status, outcomeDetail(snap), body)
 	}
-	return fmt.Sprintf("Task %s planned (status %q) — NOTHING WAS EXECUTED.%s\n\n%s\n\nReview this with the user. To carry it out, call agent_run_followup with task_id=%s.",
-		snap.ID, snap.Status, outcomeDetail(snap), body, snap.ID)
+	return fmt.Sprintf("Task %s planned (status %q) — NOTHING WAS EXECUTED.%s\n\n%s\n\nReview this with the user. To carry it out, call agent_run_followup with task_id=%s.%s",
+		snap.ID, snap.Status, outcomeDetail(snap), body, snap.ID, usageLine(snap))
 }
 
 func firstLine(s string) string {
@@ -543,7 +596,10 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
-func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config) {
+func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg config.Config, desk *permissionDesk, grantStore *grants.Store) {
+	registerPermissionTools(srv, mgr, grantStore)
+	registerWorktreeTools(srv, mgr)
+
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_run_task",
 		Description: "Delegate a task to a local headless CLI agent (Claude Code or Cursor) and WAIT for it to finish, streaming live progress notifications as the agent works. This is the seamless, in-line mode — no polling — so it feels like you did the work yourself. Use agent_start_task instead only when you want fire-and-forget or several tasks running in parallel.",
@@ -559,17 +615,24 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err != nil {
 			return errResult(emsg), task.Snapshot{}, nil
 		}
-		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+		ws, wsErr, err := resolveWorkspace(ctx, cfg, cwd, in.Isolate)
+		if err != nil {
+			return errResult(wsErr), task.Snapshot{}, nil
+		}
+		t, finished, err := mgr.RunTaskStreaming(ctx, a, ws, agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
-		}, newProgressSink(ctx, req))
+		}, task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow, Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
-		return textResult(finishText(snap)), snap, nil
+		if !finished {
+			return textResult(stillRunningText(snap, cfg.WatchWindow) + workspaceNote(snap)), snap, nil
+		}
+		return textResult(finishText(snap) + workspaceNote(snap)), snap, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -596,17 +659,20 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 			msg := fmt.Sprintf("agent %q cannot guarantee plan-only execution, so refusing to run: it would carry the task out instead of planning it", a.Name())
 			return errResult(msg), task.Snapshot{}, nil
 		}
-		t, err := mgr.RunTaskStreaming(ctx, a, cwd, agent.RunSpec{
+		t, finished, err := mgr.RunTaskStreaming(ctx, a, task.At(cwd), agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
 			PlanOnly:     true,
-		}, newProgressSink(ctx, req))
+		}, task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow, Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
+		if !finished {
+			return textResult(stillRunningText(snap, cfg.WatchWindow)), snap, nil
+		}
 		return textResult(planText(snap)), snap, nil
 	})
 
@@ -621,11 +687,15 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
-		t, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs, newProgressSink(ctx, req))
+		t, finished, err := mgr.FollowupStreaming(ctx, in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs,
+			task.Options{Sink: newProgressSink(ctx, req), Window: cfg.WatchWindow, Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
 		snap := t.Snapshot()
+		if !finished {
+			return textResult(stillRunningText(snap, cfg.WatchWindow)), snap, nil
+		}
 		return textResult(finishText(snap)), snap, nil
 	})
 
@@ -644,12 +714,16 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err != nil {
 			return errResult(emsg), task.Snapshot{}, nil
 		}
-		t, err := mgr.StartTask(a, cwd, agent.RunSpec{
+		ws, wsErr, err := resolveWorkspace(ctx, cfg, cwd, in.Isolate)
+		if err != nil {
+			return errResult(wsErr), task.Snapshot{}, nil
+		}
+		t, err := mgr.StartTask(a, ws, agent.RunSpec{
 			Prompt:       in.Prompt,
 			Model:        in.Model,
 			AllowedTools: in.AllowedTools,
 			ExtraArgs:    in.ExtraArgs,
-		})
+		}, task.Options{Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
@@ -828,7 +902,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		if err := checkExtraArgs(cfg, in.ExtraArgs); err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
-		t, err := mgr.Followup(in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs)
+		t, err := mgr.Followup(in.TaskID, in.Prompt, in.AllowedTools, in.ExtraArgs, task.Options{Approver: desk.Approver(req.Session)})
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
 		}
@@ -849,6 +923,18 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		snap, err := mgr.Cancel(in.TaskID)
 		if err != nil {
 			return errResult(err.Error()), task.Snapshot{}, nil
+		}
+		// An orphan belongs to another server instance, which is the only
+		// process that can stop its worker. Saying "status=orphaned" and leaving
+		// it there reads as though nothing happened, when in fact the request
+		// has been left where that instance will pick it up.
+		if snap.Status == task.StatusOrphaned {
+			return textResult(fmt.Sprintf(
+				"Task %s belongs to another cli-agent-mcp instance, which is the only process that can stop its worker. "+
+					"The request has been left for it and is normally picked up within a second or two. "+
+					"Watch the task with agent_task_status: it will settle to %q once that instance acts on it. "+
+					"If it does not, that instance is no longer running, and the task is already over.",
+				snap.ID, task.StatusCanceled)), snap, nil
 		}
 		return textResult(fmt.Sprintf("Task %s: status=%s", snap.ID, snap.Status)), snap, nil
 	})
@@ -888,6 +974,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 		Annotations: readOnlyTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, agent.DiagnosticReport, error) {
 		rep := agent.Diagnose(ctx, reg)
+		rep.InteractivePermission, rep.PermissionDetail = desk.status(req.Session, cfg.AskPermission)
 		return textResult(rep.Text()), rep, nil
 	})
 
@@ -1001,6 +1088,13 @@ Configuration (environment variables):
   CLI_AGENT_MCP_DEFAULT_CWD        Default working directory
   CLI_AGENT_MCP_ALLOWED_CWDS       Restrict task cwd to these roots (';'-separated)
   CLI_AGENT_MCP_MAX_TASKS          Max retained tasks                   (default: 100)
+  CLI_AGENT_MCP_MAX_CONCURRENT     Max workers running at once, 0 = no cap (default: 3)
+  CLI_AGENT_MCP_MAX_COST_USD       Dollars one task may spend, 0 = no cap  (default: 0)
+  CLI_AGENT_MCP_WORKTREE_DIR       Where isolated task checkouts go (default: under the state dir)
+  CLI_AGENT_MCP_ASK_PERMISSION     Let a worker ask before using a tool it was
+                                   not pre-approved for            (default: true)
+  CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS  How long it waits for that answer
+                                                              (default: 600)
   CLI_AGENT_MCP_AUDIT_LOG          Path to a JSONL audit log of what the worker did
   CLI_AGENT_MCP_WATCH_WINDOW_SECONDS  How long one agent_watch call may block before
                                    returning a resumable partial. Keep it under the
@@ -1046,4 +1140,51 @@ Custom agent (drive any CLI without writing Go):
     CLI_AGENT_MCP_CUSTOM_BIN=aider
     CLI_AGENT_MCP_CUSTOM_ARGS=--no-pretty;--yes;--message;{{prompt}}
 `
+}
+
+// usageLine renders what the turn cost, or "" when the agent reported nothing.
+// Delegating hides what a person at a terminal would have watched accumulate,
+// and cost is the part that compounds quietly, so it is shown by default rather
+// than left for someone to go looking for.
+func usageLine(snap task.Snapshot) string {
+	u := snap.Usage
+	if u == nil {
+		return ""
+	}
+	var parts []string
+	if u.CostUSD > 0 {
+		parts = append(parts, fmt.Sprintf("$%.4f", u.CostUSD))
+	}
+	if in, out := u.InputTokens, u.OutputTokens; in > 0 || out > 0 {
+		parts = append(parts, fmt.Sprintf("%s in / %s out tokens", compactNum(in), compactNum(out)))
+	}
+	if cached := u.CacheReadTokens; cached > 0 {
+		parts = append(parts, compactNum(cached)+" cached")
+	}
+	if u.NumTurns > 0 {
+		parts = append(parts, fmt.Sprintf("%d agent turn(s)", u.NumTurns))
+	}
+	if u.DurationMS > 0 {
+		parts = append(parts, (time.Duration(u.DurationMS) * time.Millisecond).Round(time.Second).String())
+	}
+	if snap.ModelUsed != "" {
+		parts = append(parts, snap.ModelUsed)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "\n\n— " + strings.Join(parts, " · ")
+}
+
+// compactNum abbreviates token counts, which routinely run into the millions
+// and are unreadable written out in full.
+func compactNum(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }

@@ -95,6 +95,8 @@ newline-delimited output. That gives a clean programmatic contract:
 | `agent_cancel_task` | Terminate a running task. |
 | `agent_list_tasks` | List all tasks, newest first. |
 | `agent_list_agents` | Show which agents are available on this machine. |
+| **`agent_task_diff`** | Show what a task actually changed, against where the repository stood when it started. |
+| `agent_remove_worktree` | Delete an isolated task's checkout and branch, once you are done with it. |
 
 ## Seeing where tasks stand
 
@@ -112,6 +114,18 @@ it has already returned — one row per task with its status, elapsed time and
 live transcript, and a cancel button on anything still running. It polls every
 2s while something runs, backs off to 8s once everything has settled, and pauses
 while the panel is off-screen.
+
+Two things it surfaces that are otherwise easy to miss:
+
+**A task waiting for permission** is flagged in its row — nothing is progressing
+and only a person can change that, so it does not need opening to be noticed.
+Expanding shows the command at stake and three answers: allow it once, allow it
+from now on (which records the grant, so it is never asked again), or deny.
+Without this the request only reaches you through the orchestrating model.
+
+**What each task cost**, next to the task rather than behind a click, with the
+total across the board in the header. A task that reported no accounting shows
+no figure at all, which is different from one that reported zero.
 
 **Host support.** This needs a host implementing the MCP Apps extension (spec
 `2026-01-26`). The server advertises it during `initialize` under
@@ -454,6 +468,11 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_DEFAULT_CWD` | server's cwd | Working directory when a call omits `cwd`. **Set this.** |
 | `CLI_AGENT_MCP_ALLOWED_CWDS` | — | If set, every task `cwd` must live under one of these roots (`;`-separated). |
 | `CLI_AGENT_MCP_MAX_TASKS` | `100` | Max retained tasks in memory. |
+| `CLI_AGENT_MCP_MAX_CONCURRENT` | `3` | Max workers running at once; further tasks are refused until one finishes. `0` disables the cap. |
+| `CLI_AGENT_MCP_MAX_COST_USD` | `0` (off) | What one task may spend, in dollars. See [Cost](#cost). |
+| `CLI_AGENT_MCP_WORKTREE_DIR` | under the state dir | Where isolated task checkouts are created. Never inside the repository. |
+| `CLI_AGENT_MCP_ASK_PERMISSION` | `true` | Let a worker ask you before using a tool it was not pre-approved for, instead of stalling. |
+| `CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS` | `600` | How long a worker waits for that answer before giving up on it. |
 | `CLI_AGENT_MCP_AUDIT_LOG` | — | Path to a JSONL audit log of what the worker did. See [Audit log](#audit-log). |
 | `CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS` | `0` (off) | Kill a turn that runs longer than this — a safety net for a worker hung on a permission prompt. |
 | `CLI_AGENT_MCP_COMPACT` | `true` | `agent_get_output`/`agent_watch` return a filtered, readable transcript instead of raw JSONL (pass `raw: true` on a call to override). |
@@ -545,6 +564,104 @@ completion, you can't inject a prompt mid-turn; you steer *between* turns (cance
 and restart with a corrected prompt, or `agent_send_followup`). That mirrors how
 a human drives one of these agents by hand. For anything destructive, combine
 this with `agent_plan_task` so judgment happens *before* execution.
+
+## Running several agents at once — `isolate`
+
+Two workers in one checkout overwrite each other. They are editing the same
+files with no idea the other exists, and what you get back is a diff neither of
+them intended.
+
+Passing `isolate: true` to `agent_run_task` or `agent_start_task` gives that task
+a **git worktree of its own**, on a branch of its own, sharing the repository's
+history. Several agents can then work at the same time without touching each
+other's files.
+
+It is opt-in per call rather than a mode, because it is the right answer often
+but not always. **A worktree is a fresh checkout**, so anything the repository
+does not track — `node_modules`, a `.env`, a build cache — is not in it. A task
+that needs those should run in place.
+
+The cost of isolation is that the work is then **not** where you asked for it,
+which is invisible until someone looks in the original directory and finds
+nothing. So the result says so outright, and the task board marks the row
+`isolated`.
+
+```
+This task ran isolated in <path>, on branch <branch> (cut from <repo>).
+Its changes are NOT in the original working copy — review them with
+agent_task_diff, merge the branch when you want them, and call
+agent_remove_worktree to clean up.
+```
+
+`agent_task_diff` compares against **where the repository stood when the task
+started**, not against `HEAD`. That distinction matters: once a worker commits
+its own work, a diff against `HEAD` shows nothing, which reads as "the agent
+changed no files" — the opposite of the truth.
+
+`agent_remove_worktree` refuses while the checkout still holds uncommitted
+changes, unless forced. That work is the entire product of the task and exists
+nowhere else.
+
+## A second server instance
+
+MCP clients do start a second `cli-agent-mcp` alongside the first rather than in
+place of it. The second one takes the state directory's lock, notices the first
+is still alive, and says so at startup.
+
+A task the other instance started shows up here as `orphaned`. That is a
+statement about ownership, not about visibility: everything a task produces is
+on disk while it is producing it, so an orphan's transcript and status keep
+advancing and it settles into its real outcome when its worker finishes.
+
+What the second instance does **not** have is a handle on that worker, so it
+cannot stop the process itself. `agent_cancel_task` therefore leaves the request
+in the state directory, and the instance that owns the worker picks it up within
+about a second and cancels it properly.
+
+Killing the worker by pid from outside was the obvious alternative and is not
+safe: pids are recycled, briskly on Windows, so a stale record would eventually
+name a process that has nothing to do with this server. The cost of going the
+long way round is a second of delay; the cost of getting it wrong is killing
+something unrelated.
+
+## Cost
+
+Delegating hides what a person at a terminal would have watched accumulate, and
+cost is the part that compounds quietly. Every task now reports what it spent,
+appended to the result:
+
+```
+— $0.1041 · 2 in / 9 out tokens · 24.6k cached · 1 agent turn(s) · 3s · claude-opus-5
+```
+
+`CLI_AGENT_MCP_MAX_COST_USD` bounds what a single task may spend across all of
+its turns. It is enforced in two places, because neither alone is enough:
+
+- The figure is passed to Claude Code as `--max-budget-usd`, which **the agent
+  applies itself and can act on mid-turn**. That is the real protection —
+  nothing outside the agent can stop a runaway turn, because cost only reaches
+  this server on the terminal event, long after the spending happened.
+- The server also tracks what a task has spent across every turn and passes the
+  **remaining** budget, not the configured total. Without that, a task driven
+  through ten follow-ups would be handed the whole allowance ten times over
+  while each individual run stayed inside the limit.
+
+Two limits of this are worth stating plainly.
+
+**The first turn can overshoot.** A turn's cost is only known once it ends, so a
+single expensive turn exceeds the budget and is caught afterwards. Measured
+here: a `--max-budget-usd 0.01` run stopped after spending `$0.089`. The setting
+bounds a *session*, not one request.
+
+**A stopped run says so.** Claude Code reports a budget stop as `is_error` with
+an empty result and exits `0`, which on its own reads as an unexplained failure.
+The reason is lifted out and reported instead:
+
+```
+Planning task task-1-12ed1ace FAILED (status "failed"). Nothing was executed.
+
+Reached maximum budget ($0.01)
+```
 
 ## Audit log
 
@@ -787,10 +904,47 @@ go build -o cli-agent-mcp .
 go run ./cmd/smoketest ./cli-agent-mcp
 ```
 
-The smoke test is env-driven, so you can point it at a real agent:
+### The real-agent gate
+
+Everything above is what CI runs, and there is a category of bug it cannot see.
+The mock agent never reads `--mcp-config`, never asks for permission and never
+spends a token, so anything that breaks only when a real worker runs stays green
+all the way to a release. That is not hypothetical: a relative `--mcp-config`
+path once made every `agent_run_task` fail while the suite reported PASSED.
+
+`scripts/e2e.ps1` is the gate for that category. It drives a real Claude Code
+through the same MCP surface an orchestrating client uses:
+
+```powershell
+./scripts/e2e.ps1                      # the whole matrix
+./scripts/e2e.ps1 -Only permission     # one scenario
+```
+
+It reports three outcomes, not two. **SKIPPED** — the agent is not on `PATH` —
+exits 2 and is not a pass, because skipping the real-agent runs is exactly the
+hole the script exists to close. Transcripts land under `.e2e/<timestamp>/`,
+including the server's stderr, since `interactive approval: http://...` is how
+you tell an enabled approval endpoint from one that quietly failed to start.
+
+| `SMOKE_ONLY` | proves |
+| --- | --- |
+| *(unset)* | the whole tool surface end to end |
+| `permission` | a blocked worker parks, is answered, and its work lands on disk |
+| `abandon` | a turn outlives the MCP call that asked for it |
+| `concurrency` | the live-worker cap refuses work and reopens on cancel |
+| `crosscancel` | a cancel asked for in one server process stops a worker owned by another (needs `CLI_AGENT_MCP_STATE_DIR`) |
+| `worktree` | an isolated task edits its own checkout and leaves the original directory untouched |
+| `plan`, `watchstream`, `timeout`, `cancel` | one behaviour each, in isolation |
+
+Run it before opening a PR that changes how workers are launched, approved or
+accounted for. It needs a scratch git repository it may freely modify: the
+scenarios tell the agent to create and edit files in it.
+
+The smoke test is env-driven, so a single scenario can be pointed at any agent
+without the script:
 
 ```bash
-SMOKE_AGENT=claude SMOKE_PROMPT="say hi" SMOKE_FOLLOWUP=0 \
+SMOKE_AGENT=claude SMOKE_CWD=/path/to/scratch/repo SMOKE_ONLY=permission \
   go run ./cmd/smoketest ./cli-agent-mcp
 ```
 
@@ -801,7 +955,10 @@ launcher that [pairing](#pair-the-client--do-this-once) turns away, and a fresh
 state directory is unpaired, so the server serves it. Point `SMOKE_STATE_DIR` at
 a paired directory to exercise the refusal instead.
 
-CI ([`ci.yml`](.github/workflows/ci.yml)) runs all of the above on every push and PR.
+CI ([`ci.yml`](.github/workflows/ci.yml)) runs the build, vet, unit tests and the
+mock smoke test on Linux and Windows for every push and PR. It does **not** run
+the real-agent gate — the runners have no Claude Code install and no API key —
+which is why `scripts/e2e.ps1` is run locally instead.
 
 ## Releases
 
@@ -859,7 +1016,14 @@ internal/inspect/           read-only viewers, out of process
   web.go                    `ui`: local HTTP server + JSON API
   guard.go                  session token, Host and Origin checks for that server
   live.html                 the web viewer, self-contained
-cmd/smoketest/              end-to-end test via the MCP client
+cmd/smoketest/              end-to-end tests via a real MCP client
+  main.go                   the full tool surface, plus the isolated branches
+  scenario.go               the SMOKE_ONLY registry
+  scenario_permission.go    a blocked worker parks, is answered, does the work
+  scenario_abandon.go       a turn outlives the call that asked for it
+  scenario_concurrency.go   the live-worker cap holds and reopens
+  scenario_crosscancel.go   two server processes, one state directory
+scripts/e2e.ps1             the real-agent gate CI cannot run
 ```
 
 ## Contributing

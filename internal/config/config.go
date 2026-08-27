@@ -93,6 +93,29 @@ type Config struct {
 	// MaxTasks caps the number of tasks retained in memory.
 	MaxTasks int
 
+	// WorktreeDir is where isolated task checkouts are created. Empty puts them
+	// alongside the task records, under StateDir — anywhere but inside the
+	// repository, which would make them show up as untracked clutter in the very
+	// diff they exist to produce.
+	WorktreeDir string
+
+	// MaxCostUSD bounds what one task may spend, in US dollars. Zero disables it.
+	//
+	// It is enforced in two places because neither alone is enough. Claude Code
+	// is given the figure as --max-budget-usd, which it applies itself and can
+	// act on mid-turn — that is the real protection. But that flag is per
+	// invocation, so a task driven through ten follow-ups would get the whole
+	// budget ten times over; the server therefore also tracks what a task has
+	// spent across all its turns and refuses to start another once it is over.
+	MaxCostUSD float64
+
+	// MaxConcurrent caps how many workers may run at the same time. It is a
+	// different limit from MaxTasks, which only bounds retained records: a
+	// headless coding agent is a heavyweight process, so an orchestrator that
+	// fans out ten tasks can exhaust the machine while every other limit still
+	// looks satisfied. Zero means no limit.
+	MaxConcurrent int
+
 	// AuditLog is a file path for a JSONL audit trail of everything the worker
 	// was asked to do. Empty disables it.
 	AuditLog string
@@ -112,6 +135,21 @@ type Config struct {
 	// safety net against a worker that hangs — e.g. blocked on a permission
 	// prompt with no human to approve it. Zero means no timeout.
 	TaskTimeout time.Duration
+
+	// AskPermission lets a worker put a permission request to the person who
+	// delegated the task, instead of stalling on a prompt nobody can answer.
+	//
+	// It is on by default and reaches every client. One that declared the
+	// elicitation capability is asked directly; for the rest the request is
+	// parked on the task and released by agent_answer_permission. Turning it
+	// off restores the older behaviour, where a tool that is neither
+	// pre-approved nor denied stalls until the task timeout.
+	AskPermission bool
+
+	// PermissionTimeout bounds how long a worker waits for that answer. It has
+	// to be generous — there is a human at the other end who may be looking at
+	// something else — but finite, or an unattended run waits forever.
+	PermissionTimeout time.Duration
 
 	// Compact controls whether agent_get_output / agent_watch return a filtered,
 	// human-readable transcript by default (dropping the noisy init/config dump)
@@ -152,6 +190,43 @@ func getbool(key string, def bool) bool {
 		warnInvalid(key, raw, "is not a recognized boolean (1/true/yes/on, 0/false/no/off)", def)
 		return def
 	}
+}
+
+// getPositiveInt reads an integer env value that must be greater than zero,
+// falling back to def and reporting anything unusable rather than silently
+// accepting it.
+func getPositiveInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	switch n, err := strconv.Atoi(v); {
+	case err != nil:
+		warnInvalid(key, v, "is not an integer", def)
+	case n <= 0:
+		warnInvalid(key, v, "must be greater than 0", def)
+	default:
+		return n
+	}
+	return def
+}
+
+// getPositiveFloat reads a decimal env value that must be greater than zero,
+// falling back to def and reporting anything unusable rather than accepting it.
+func getPositiveFloat(key string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	switch n, err := strconv.ParseFloat(v, 64); {
+	case err != nil:
+		warnInvalid(key, v, "is not a number", def)
+	case n <= 0:
+		warnInvalid(key, v, "must be greater than 0", def)
+	default:
+		return n
+	}
+	return def
 }
 
 // splitArgs splits a whitespace/semicolon-separated env value into args. It is
@@ -238,8 +313,13 @@ func Load() Config {
 		DefaultCwd:         getenv("CLI_AGENT_MCP_DEFAULT_CWD", ""),
 		AllowedCwds:        allowed,
 		MaxTasks:           maxTasks,
+		MaxConcurrent:      getPositiveInt("CLI_AGENT_MCP_MAX_CONCURRENT", 3),
+		MaxCostUSD:         getPositiveFloat("CLI_AGENT_MCP_MAX_COST_USD", 0),
+		AskPermission:      getbool("CLI_AGENT_MCP_ASK_PERMISSION", true),
+		PermissionTimeout:  time.Duration(getPositiveInt("CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS", 600)) * time.Second,
 		AuditLog:           getenv("CLI_AGENT_MCP_AUDIT_LOG", ""),
 		StateDir:           getenv("CLI_AGENT_MCP_STATE_DIR", ""),
+		WorktreeDir:        getenv("CLI_AGENT_MCP_WORKTREE_DIR", ""),
 		WatchWindow:        watchWindow,
 		TaskTimeout:        taskTimeout,
 		Compact:            getbool("CLI_AGENT_MCP_COMPACT", true),

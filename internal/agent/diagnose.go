@@ -57,6 +57,13 @@ type DiagnosticReport struct {
 	Notes         []string      `json:"notes,omitempty"`
 	SpawnWorks    bool          `json:"spawn_works"`
 	SilentFailure bool          `json:"silent_failure_detected"`
+
+	// InteractivePermission says whether a worker can put a permission request
+	// to the person driving this client, and when it cannot, why. It belongs
+	// here because the symptom of it being off is a task that quietly does less
+	// than it was asked to, with nothing in the transcript pointing at the cause.
+	InteractivePermission bool   `json:"interactive_permission"`
+	PermissionDetail      string `json:"interactive_permission_detail,omitempty"`
 }
 
 // Diagnose runs the probes. It never mutates anything and never runs a
@@ -92,8 +99,11 @@ func Diagnose(ctx context.Context, reg *Registry) DiagnosticReport {
 			if b := binOf(a); b != "" {
 				if p, err := exec.LookPath(b); err == nil {
 					d.Launcher = p
-					if node, entry, ok := resolveScriptShim(p); ok {
-						d.RunsAs = node + " " + entry
+					if exe, prefix, ok := resolveScriptShim(p); ok {
+						d.RunsAs = strings.TrimSpace(exe + " " + strings.Join(prefix, " "))
+						d.ShimFixed = true
+					} else if native := nativeAlternative(b, p); native != "" {
+						d.RunsAs = native
 						d.ShimFixed = true
 					} else {
 						d.RunsAs = p
@@ -193,6 +203,17 @@ func buildNotes(r DiagnosticReport) []string {
 			"An absent ProgramData is the one that matters most: Microsoft's Windows OpenSSH "+
 			"resolves its system config from it before logging starts, so ssh.exe exits 255 "+
 			"writing nothing at all when it is missing.")
+	}
+	if r.InteractivePermission {
+		if r.PermissionDetail != "" {
+			n = append(n, "A worker can ask you for permission "+r.PermissionDetail+".")
+		} else {
+			n = append(n, "A worker can ask you for permission before using a tool it was not pre-approved for.")
+		}
+	} else if r.PermissionDetail != "" {
+		n = append(n, "A worker CANNOT ask for permission: "+r.PermissionDetail+
+			". A tool that is neither pre-approved nor denied will stall until the task timeout, "+
+			"so the task quietly does less than it was asked to.")
 	}
 	if r.SpawnWorks && !r.SilentFailure {
 		n = append(n, "Child process spawning works normally in this context.")

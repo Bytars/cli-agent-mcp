@@ -77,6 +77,37 @@ func main() {
 		fmt.Printf("  - %s\n", t.Name)
 	}
 
+	// Registered scenarios come first, so a name that exists is never shadowed
+	// by one of the branches below.
+	if only := os.Getenv("SMOKE_ONLY"); only != "" {
+		if s, ok := scenarios[only]; ok {
+			if s.Needs == "real" && agentName == "mock" {
+				log.Fatalf("SMOKE_ONLY=%s needs a real agent: it asserts behaviour the mock does not have. "+
+					"Re-run with SMOKE_AGENT=claude (and SMOKE_CWD pointing at a scratch repo).", only)
+			}
+			fmt.Printf("\n== %s ==\n%s\n\n", only, s.What)
+			s.Run(ctx, &env{
+				Session: session,
+				Agent:   agentName,
+				Cwd:     cwd,
+				Prompt:  prompt,
+				Progress: func() []string {
+					progressMu.Lock()
+					defer progressMu.Unlock()
+					return append([]string(nil), progressMsgs...)
+				},
+			})
+			fmt.Println("\nSMOKETEST PASSED")
+			return
+		}
+		switch only {
+		case "plan", "watchstream", "timeout", "cancel":
+			// handled by the branches below
+		default:
+			log.Fatalf("unknown SMOKE_ONLY=%q; known scenarios: %s, plan, watchstream, timeout, cancel", only, scenarioNames())
+		}
+	}
+
 	// SMOKE_ONLY=plan isolates a single plan-only call, so a caller can prove the
 	// agent executed nothing (e.g. by checking the filesystem afterward).
 	if os.Getenv("SMOKE_ONLY") == "plan" {
@@ -199,6 +230,17 @@ func main() {
 	nProgress := len(progressMsgs)
 	progressMu.Unlock()
 	fmt.Printf("  run_task returned status=%s (received %d progress notifications)\n", runStatus, nProgress)
+	// The outcome, not merely that something was streamed. A failing run still
+	// emits progress — its error lines are progress — so asserting only on the
+	// notification count reports PASSED for a task that never ran. That is how a
+	// broken --mcp-config path reached main: the mock agent never reads the flag,
+	// and against a real agent this step failed while the suite said it passed.
+	if runStatus != "done" {
+		log.Fatalf("FAIL: expected run_task status done, got %q:\n%s", runStatus, indent(textContent(runRes)))
+	}
+	if strings.TrimSpace(jsonField(runRes, "result")) == "" {
+		log.Fatalf("FAIL: run_task reported done but produced no result:\n%s", indent(textContent(runRes)))
+	}
 	if nProgress < 1 {
 		log.Fatal("FAIL: expected at least one progress notification during agent_run_task")
 	}

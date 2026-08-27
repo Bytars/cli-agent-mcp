@@ -89,7 +89,7 @@ func TestRestoreSurfacesPreviousInstanceTasksAsOrphaned(t *testing.T) {
 	// Resuming would put a second worker on a session the old instance may still
 	// be driving, so it must be refused with an explanation rather than silently
 	// attempted.
-	_, err = second.Followup("task-1-abcd", "keep going", nil, nil)
+	_, err = second.Followup("task-1-abcd", "keep going", nil, nil, Options{})
 	if err == nil {
 		t.Fatal("a follow-up on an orphaned task was accepted")
 	}

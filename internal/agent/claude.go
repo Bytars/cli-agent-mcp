@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -81,6 +82,21 @@ func (a *ClaudeAdapter) Command(ctx context.Context, spec RunSpec) (*exec.Cmd, e
 	}
 	if a.AppendPrompt != "" {
 		args = append(args, "--append-system-prompt", a.AppendPrompt)
+	}
+	// Never on a plan-only run: nothing executes there, so there is nothing to
+	// approve, and offering an approval endpoint would only invite the agent to
+	// ask about work it is not going to do.
+	if !spec.PlanOnly && spec.MCPConfigPath != "" && spec.PermissionTool != "" {
+		args = append(args,
+			"--mcp-config", spec.MCPConfigPath,
+			"--permission-prompt-tool", spec.PermissionTool,
+		)
+	}
+	// Claude Code enforces this itself and can act on it mid-turn, which nothing
+	// outside the agent can do: cost only reaches us on the terminal event, long
+	// after a runaway turn has finished spending.
+	if spec.MaxCostUSD > 0 {
+		args = append(args, "--max-budget-usd", strconv.FormatFloat(spec.MaxCostUSD, 'f', -1, 64))
 	}
 	if spec.Model != "" {
 		args = append(args, "--model", spec.Model)

@@ -16,6 +16,48 @@ type claudeStreamEvent struct {
 	Result    string          `json:"result"`
 	IsError   bool            `json:"is_error"`
 	Message   json.RawMessage `json:"message"`
+
+	// Reported on the terminal "result" event. Claude Code has emitted these
+	// all along; they were simply being thrown away.
+	TotalCostUSD  float64      `json:"total_cost_usd"`
+	DurationMS    int64        `json:"duration_ms"`
+	DurationAPIMS int64        `json:"duration_api_ms"`
+	NumTurns      int          `json:"num_turns"`
+	Usage         *claudeUsage `json:"usage"`
+
+	// Reported on the "system"/"init" event that opens every run.
+	Model string `json:"model"`
+
+	// Present when the run stopped for a reason of its own rather than because
+	// the work finished — hitting --max-budget-usd, for one. The "result" field
+	// is empty in that case, so without these the task reports a bare failure
+	// and the reason is nowhere.
+	TerminalReason string   `json:"terminal_reason"`
+	Errors         []string `json:"errors"`
+}
+
+// terminalReason explains a run that ended without producing a result, in the
+// agent's own words where it gave any. A budget exhaustion reports
+// is_error=true with an empty result and exit code 0, so a caller with only
+// those to go on sees a task that failed for no stated reason.
+func terminalReason(se claudeStreamEvent) string {
+	if len(se.Errors) > 0 {
+		return strings.Join(se.Errors, "; ")
+	}
+	switch {
+	case se.TerminalReason != "":
+		return "the agent stopped: " + strings.ReplaceAll(se.TerminalReason, "_", " ")
+	case strings.HasPrefix(se.Subtype, "error_"):
+		return "the agent stopped: " + strings.ReplaceAll(strings.TrimPrefix(se.Subtype, "error_"), "_", " ")
+	}
+	return ""
+}
+
+type claudeUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
 type claudeMessage struct {
@@ -59,11 +101,33 @@ func parseClaudeStreamLine(line string) Event {
 		ev.SessionID = se.SessionID
 	}
 
+	if se.Model != "" {
+		ev.Model = se.Model
+	}
+
 	switch se.Type {
 	case "result":
 		ev.Final = true
 		ev.FinalError = se.IsError
 		ev.FinalText = se.Result
+		if ev.FinalText == "" {
+			ev.FinalText = terminalReason(se)
+		}
+		u := Usage{
+			CostUSD:       se.TotalCostUSD,
+			DurationMS:    se.DurationMS,
+			APIDurationMS: se.DurationAPIMS,
+			NumTurns:      se.NumTurns,
+		}
+		if se.Usage != nil {
+			u.InputTokens = se.Usage.InputTokens
+			u.OutputTokens = se.Usage.OutputTokens
+			u.CacheReadTokens = se.Usage.CacheReadInputTokens
+			u.CacheWriteTokens = se.Usage.CacheCreationInputTokens
+		}
+		if !u.Empty() {
+			ev.Usage = &u
+		}
 	case "assistant":
 		if len(se.Message) > 0 {
 			var m claudeMessage

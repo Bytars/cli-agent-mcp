@@ -11,7 +11,26 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Windows is not an afterthought here, it is where the hard problems live:
+    # resolving npm script shims to what they actually run, containing a process
+    # tree with a Job Object, and restoring the environment variables a packaged
+    # host fails to pass on. Every one of those has already been a real bug.
+    # Testing only on Linux means the tests covering them are skipped — green
+    # because they never ran.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    defaults:
+      run:
+        # The steps below are shell scripts. GitHub's Windows runners default to
+        # PowerShell, which does not speak this dialect; asking for bash keeps
+        # one definition of each step across both platforms.
+        shell: bash
+
     steps:
       - uses: actions/checkout@v7
 
@@ -19,6 +38,27 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      # setup-go v6 changed how the toolchain is resolved, and go.mod is the
+      # only thing that should decide it. Asserting beats reading a log line:
+      # picking up a different Go would otherwise show as puzzling failures
+      # somewhere further down, or as no failure at all until it mattered.
+      #
+      # Only major.minor is compared. A patch difference is the installer doing
+      # its job; a minor difference means the file was not honoured.
+      - name: Toolchain matches go.mod
+        run: |
+          want="$(awk '/^go /{print $2; exit}' go.mod)"
+          got="$(go env GOVERSION)"
+          # cut rather than ${x%.*}: go.mod may carry a patch or not, and the
+          # suffix trick turns a bare "1.26" into "1".
+          wanted="$(printf '%s' "$want" | cut -d. -f1,2)"
+          active="$(printf '%s' "${got#go}" | cut -d. -f1,2)"
+          if [ "$wanted" != "$active" ]; then
+            echo "go.mod asks for $want but the toolchain is $got"
+            exit 1
+          fi
+          echo "go.mod wants $want, toolchain is $got"
 
       - name: Format check
         run: |
@@ -40,5 +80,9 @@ jobs:
 
       - name: Smoke test (mock agent, end-to-end over MCP stdio)
         run: |
-          go build -o cli-agent-mcp .
-          go run ./cmd/smoketest ./cli-agent-mcp
+          # Windows will not execute an extensionless file, and Go's launcher
+          # resolution will not find one either.
+          exe=""
+          if [ "$RUNNER_OS" = "Windows" ]; then exe=".exe"; fi
+          go build -o "cli-agent-mcp$exe" .
+          go run ./cmd/smoketest "./cli-agent-mcp$exe"

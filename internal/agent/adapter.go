@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -32,6 +33,55 @@ type RunSpec struct {
 	ExtraArgs    []string // extra flags appended verbatim
 	AllowedTools []string // per-run tools to pre-approve (merged with server policy)
 	PlanOnly     bool     // propose a plan without executing anything
+
+	// MaxCostUSD, when > 0, is what this ONE turn may spend. The manager passes
+	// the budget the task has left rather than the configured total, so a task
+	// driven through several turns cannot be handed the whole allowance again on
+	// each of them.
+	MaxCostUSD float64
+
+	// MCPConfigPath and PermissionTool wire the agent to an approval endpoint,
+	// so a tool call it would otherwise stall on becomes a question asked of
+	// the human upstream. Both are set together or not at all.
+	MCPConfigPath  string
+	PermissionTool string
+}
+
+// Usage is the accounting an agent reports for the work it did: what it cost,
+// how long it spent, and how many tokens it moved.
+//
+// It is worth extracting rather than discarding. Delegating to a headless
+// worker hides exactly the things a person watching a terminal would have seen,
+// and cost is the one that compounds silently — a task that quietly burned two
+// dollars looks identical to one that burned two cents until the bill arrives.
+type Usage struct {
+	CostUSD          float64 `json:"cost_usd,omitempty"`
+	DurationMS       int64   `json:"duration_ms,omitempty"`
+	APIDurationMS    int64   `json:"api_duration_ms,omitempty"`
+	NumTurns         int     `json:"num_turns,omitempty"`
+	InputTokens      int     `json:"input_tokens,omitempty"`
+	OutputTokens     int     `json:"output_tokens,omitempty"`
+	CacheReadTokens  int     `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int     `json:"cache_write_tokens,omitempty"`
+}
+
+// Empty reports whether the agent told us nothing worth showing.
+func (u Usage) Empty() bool { return u == Usage{} }
+
+// Add accumulates another turn's accounting into u. Counters sum; NumTurns is a
+// running total the agent already reports for the session, so the later value
+// replaces rather than adds to the earlier one.
+func (u *Usage) Add(v Usage) {
+	u.CostUSD += v.CostUSD
+	u.DurationMS += v.DurationMS
+	u.APIDurationMS += v.APIDurationMS
+	u.InputTokens += v.InputTokens
+	u.OutputTokens += v.OutputTokens
+	u.CacheReadTokens += v.CacheReadTokens
+	u.CacheWriteTokens += v.CacheWriteTokens
+	if v.NumTurns > u.NumTurns {
+		u.NumTurns = v.NumTurns
+	}
 }
 
 // Event is the adapter's interpretation of a single line of agent stdout.
@@ -48,6 +98,13 @@ type Event struct {
 
 	IsToolResult    bool // this line is a tool's result coming back
 	ToolResultError bool // for a tool result: whether the tool reported failure
+
+	// Model is the model the agent reported it is actually using, which is the
+	// only way to learn it when no override was requested.
+	Model string
+
+	// Usage is non-nil on a line that carried accounting.
+	Usage *Usage
 }
 
 // Adapter knows how to launch and interpret one specific CLI agent.
@@ -153,7 +210,8 @@ func (r *Registry) All() []Adapter {
 // buildCommand creates an *exec.Cmd for bin+args, resolving Windows script
 // wrappers so adapters can treat every launcher uniformly.
 //
-//   - npm-style shim : resolved to `node.exe entry.js ...` and run directly.
+//   - script shim    : resolved to whatever it would have run (`node.exe
+//     entry.js ...`, or a bundled `.exe`) and run directly.
 //   - .exe / no ext  : executed directly (Go quotes args correctly).
 //   - .ps1 / .cmd    : last resort, via an interpreter anchored to System32, and
 //     only when no argument contains a character that a second parser could
@@ -168,11 +226,19 @@ func buildCommand(ctx context.Context, bin string, args []string) (*exec.Cmd, er
 		resolved = p
 	}
 
-	// Preferred path: if this is an npm-style script shim, run what it would
-	// have run. One process, argv passed verbatim, no shell parser involved.
-	if node, entry, ok := resolveScriptShim(resolved); ok {
-		full := append([]string{entry}, args...)
-		return hardenSpawn(exec.CommandContext(ctx, node, full...)), nil
+	// Preferred path: if this is a script shim, run what it would have run. One
+	// process, argv passed verbatim, no shell parser involved.
+	if exe, prefix, ok := resolveScriptShim(resolved); ok {
+		full := append(append([]string(nil), prefix...), args...)
+		return hardenSpawn(exec.CommandContext(ctx, exe, full...)), nil
+	}
+
+	// Second chance before the interpreter: PATH order decides which of several
+	// installs LookPath returns, and it can hand back a shim while a native
+	// executable for the same command sits further down. Running that directly
+	// is strictly better than shelling out to a wrapper we could not read.
+	if native := nativeAlternative(bin, resolved); native != "" {
+		return hardenSpawn(exec.CommandContext(ctx, native, args...)), nil
 	}
 
 	switch strings.ToLower(filepath.Ext(resolved)) {
@@ -191,6 +257,44 @@ func buildCommand(ctx context.Context, bin string, args []string) (*exec.Cmd, er
 	default:
 		return hardenSpawn(exec.CommandContext(ctx, resolved, args...)), nil
 	}
+}
+
+// nativeExts are the extensions of things Windows can execute without an
+// interpreter, in the order we would rather have them.
+var nativeExts = []string{".exe", ".com"}
+
+// nativeAlternative looks for a real executable that answers to the same command
+// as a script shim we could not read. It returns "" unless resolved really is a
+// shim and a native sibling exists, so on every other platform and every other
+// launcher it is a no-op.
+//
+// It searches the shim's own directory first — an install that ships both keeps
+// them together — then the PATH, which is where a second, independent install of
+// the same agent turns up.
+func nativeAlternative(bin, resolved string) string {
+	switch strings.ToLower(filepath.Ext(resolved)) {
+	case ".cmd", ".bat", ".ps1":
+	default:
+		return ""
+	}
+
+	stem := strings.TrimSuffix(filepath.Base(resolved), filepath.Ext(resolved))
+	dirs := []string{filepath.Dir(resolved)}
+	dirs = append(dirs, filepath.SplitList(os.Getenv("PATH"))...)
+
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		for _, ext := range nativeExts {
+			cand := filepath.Join(dir, stem+ext)
+			if fileExists(cand) {
+				log.Printf("cli-agent-mcp: %q resolved to the script shim %s, which could not be read; using %s instead", bin, resolved, cand)
+				return cand
+			}
+		}
+	}
+	return ""
 }
 
 // shellMetaChars are the characters we cannot round-trip safely through a

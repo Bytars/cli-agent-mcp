@@ -27,6 +27,8 @@ import (
 
 	"github.com/Bytars/cli-agent-mcp/internal/agent"
 	"github.com/Bytars/cli-agent-mcp/internal/audit"
+	"github.com/Bytars/cli-agent-mcp/internal/gitx"
+	"github.com/Bytars/cli-agent-mcp/internal/grants"
 	"github.com/Bytars/cli-agent-mcp/internal/state"
 )
 
@@ -87,6 +89,28 @@ type Task struct {
 
 	// lastRefresh throttles re-reading an orphan's files; see refreshOrphan.
 	lastRefresh time.Time
+
+	// pending is the permission request this task is currently blocked on, if
+	// any. It is what turns "the task is running but nothing is happening" into
+	// something a person can act on.
+	pending *PermissionRequest
+
+	// approver, when set, lets each turn hand the worker a way to ask a human
+	// before it gives up on a tool it is not allowed to use.
+	approver Approver
+
+	usage     agent.Usage // accumulated over every turn of this task
+	modelUsed string      // the model the agent said it was running
+
+	// baseCommit is where the repository stood when this task started. It is
+	// captured up front because it cannot be recovered afterwards: once the
+	// worker commits its own work, a diff against HEAD shows nothing and reads
+	// as "the agent changed no files", which is the opposite of the truth.
+	baseCommit string
+
+	// workspace is where the worker runs — the caller's directory, or a git
+	// worktree cut for this task alone.
+	workspace Workspace
 }
 
 // Snapshot is an immutable view of a Task for serialization.
@@ -106,6 +130,30 @@ type Snapshot struct {
 	TotalLines int      `json:"total_output_lines"`
 	Turns      int      `json:"turns"`
 	Prompts    []string `json:"prompts,omitempty"`
+
+	// Pending is set while the worker is blocked waiting for someone to allow a
+	// tool call. A task in that state is running and getting nowhere, which is
+	// indistinguishable from a slow one unless it is said outright.
+	Pending *PermissionRequest `json:"pending_permission,omitempty"`
+
+	// ModelUsed is what the agent reported it actually ran, which is the only
+	// way to know when the caller requested no particular model.
+	ModelUsed string `json:"model_used,omitempty"`
+
+	// Usage accumulates every turn's accounting. Nil when the agent reported
+	// none, so a caller can tell "free" from "not measured".
+	Usage *agent.Usage `json:"usage,omitempty"`
+
+	// BaseCommit is where the repository stood when the task started, so its
+	// changes can still be reviewed after the worker has committed them.
+	BaseCommit string `json:"base_commit,omitempty"`
+
+	// Worktree, Repo and Branch are set only when the task ran isolated in a
+	// checkout of its own. They are what tells a reader that the work is not in
+	// the directory they asked about, and where it is instead.
+	Worktree string `json:"worktree,omitempty"`
+	Repo     string `json:"repo,omitempty"`
+	Branch   string `json:"branch,omitempty"`
 }
 
 func (t *Task) snapshot() Snapshot {
@@ -126,6 +174,18 @@ func (t *Task) snapshot() Snapshot {
 	}
 	if !t.endedAt.IsZero() {
 		s.EndedAt = t.endedAt.Format(time.RFC3339)
+	}
+	s.Pending = t.pending
+	s.ModelUsed = t.modelUsed
+	s.BaseCommit = t.baseCommit
+	if t.workspace.Isolated() {
+		s.Worktree = t.workspace.Path
+		s.Repo = t.workspace.Repo
+		s.Branch = t.workspace.Branch
+	}
+	if !t.usage.Empty() {
+		u := t.usage
+		s.Usage = &u
 	}
 	for _, tr := range t.turns {
 		s.Prompts = append(s.Prompts, tr.Prompt)
@@ -227,6 +287,29 @@ func (t *Task) joinRange(from, to int, compact bool) string {
 // task safely.
 type EventSink func(ev agent.Event)
 
+// Options are the per-call knobs shared by every way of starting a turn.
+type Options struct {
+	// Sink receives each event as it arrives, for callers streaming progress.
+	Sink EventSink
+
+	// Window bounds how long a blocking call waits before handing back a task
+	// id. Zero means wait until the turn ends or the caller goes away.
+	Window time.Duration
+
+	// Approver, when set, lets the worker ask for permission during the run.
+	Approver Approver
+}
+
+// Approver supplies the wiring that lets a worker ask a human for permission
+// mid-run, rather than stalling on a prompt nobody is there to answer.
+type Approver interface {
+	// Grant issues per-run approval for a task. ok is false when the run should
+	// proceed without it — because the orchestrating client cannot ask, or
+	// because the operator turned it off. release must be called when the turn
+	// ends, and revokes the grant.
+	Grant(taskID string) (configPath, toolName string, release func(), ok bool)
+}
+
 // Manager owns all tasks.
 type Manager struct {
 	mu       sync.Mutex
@@ -237,6 +320,19 @@ type Manager struct {
 	audit    *audit.Logger
 	store    *state.Store
 	timeout  time.Duration
+
+	// maxConcurrent caps live workers. Zero means no limit.
+	maxConcurrent int
+
+	// maxCostUSD bounds what one task may spend across all its turns. Zero
+	// means no limit.
+	maxCostUSD float64
+
+	// desk holds the permission requests workers are currently blocked on.
+	desk *permissionDesk
+
+	// grants are the permissions the user granted permanently.
+	grants *grants.Store
 }
 
 // NewManager builds a task manager retaining up to maxTasks tasks.
@@ -244,7 +340,7 @@ func NewManager(maxTasks int) *Manager {
 	if maxTasks <= 0 {
 		maxTasks = 100
 	}
-	return &Manager{tasks: make(map[string]*Task), maxTasks: maxTasks}
+	return &Manager{tasks: make(map[string]*Task), maxTasks: maxTasks, desk: newDesk()}
 }
 
 // SetAudit attaches an audit logger; nil or a disabled logger is fine.
@@ -252,6 +348,72 @@ func (m *Manager) SetAudit(a *audit.Logger) { m.audit = a }
 
 // SetTaskTimeout sets a per-turn timeout; zero disables it.
 func (m *Manager) SetTaskTimeout(d time.Duration) { m.timeout = d }
+
+// SetMaxConcurrent caps how many workers may run at once; zero disables it.
+func (m *Manager) SetMaxConcurrent(n int) { m.maxConcurrent = n }
+
+// SetGrants attaches the store of permissions the user has granted permanently.
+func (m *Manager) SetGrants(g *grants.Store) { m.grants = g }
+
+// SetMaxCostUSD bounds what a single task may spend; zero disables it.
+func (m *Manager) SetMaxCostUSD(v float64) { m.maxCostUSD = v }
+
+// budgetFor returns what this turn may spend and whether it may run at all.
+//
+// The figure is what the task has LEFT, not the configured total, because the
+// agent applies it per invocation: handing a task its full allowance on every
+// follow-up would mean ten turns cost ten budgets. Once nothing is left the
+// turn is refused outright rather than started with an allowance of zero, which
+// the agent would read as "no limit".
+func (m *Manager) budgetFor(t *Task) (remaining float64, ok bool) {
+	if m.maxCostUSD <= 0 {
+		return 0, true
+	}
+	t.mu.Lock()
+	spent := t.usage.CostUSD
+	t.mu.Unlock()
+
+	if left := m.maxCostUSD - spent; left > 0 {
+		return left, true
+	}
+	return 0, false
+}
+
+// Running reports how many workers are alive right now.
+func (m *Manager) Running() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, id := range m.order {
+		tk := m.tasks[id]
+		tk.mu.Lock()
+		if tk.running {
+			n++
+		}
+		tk.mu.Unlock()
+	}
+	return n
+}
+
+// baseCommit records the starting point of a task's repository, or "" when the
+// directory is not a repository at all — which is not an error, only a
+// directory whose changes cannot be summarized later.
+func baseCommit(cwd string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	head, err := gitx.Head(ctx, cwd)
+	if err != nil {
+		return ""
+	}
+	return head
+}
+
+// BaseCommit reports where the repository stood when this task started.
+func (t *Task) BaseCommit() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.baseCommit
+}
 
 func newID(n uint64) string {
 	var b [4]byte
@@ -303,26 +465,14 @@ func pathWithin(path, root string) bool {
 }
 
 // StartTask creates a task and launches its first turn asynchronously.
-func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*Task, error) {
-	t := &Task{
-		ID:        newID(m.counter.Add(1)),
-		AgentName: a.Name(),
-		Cwd:       cwd,
-		Model:     spec.Model,
-		adapter:   a,
-		audit:     m.audit,
-		store:     m.store,
-		status:    StatusRunning,
-		running:   true,
-		startedAt: time.Now(),
-	}
-	spec.Cwd = cwd
+func (m *Manager) StartTask(a agent.Adapter, ws Workspace, spec agent.RunSpec, opts Options) (*Task, error) {
+	t := m.newTask(a, ws, spec)
+	t.approver = opts.Approver
+	spec.Cwd = ws.Path
 
-	m.mu.Lock()
-	m.tasks[t.ID] = t
-	m.order = append(m.order, t.ID)
-	m.evictLocked()
-	m.mu.Unlock()
+	if err := m.admit(t); err != nil {
+		return nil, err
+	}
 
 	t.persist()
 
@@ -330,15 +480,47 @@ func (m *Manager) StartTask(a agent.Adapter, cwd string, spec agent.RunSpec) (*T
 	return t, nil
 }
 
-// RunTaskStreaming creates a task and runs its first turn synchronously,
-// forwarding each event to sink as it arrives. It blocks until the turn
-// finishes (or ctx is canceled, which terminates the agent) and returns the
-// task. Used by the streaming "run" tools so the MCP client sees live progress.
-func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd string, spec agent.RunSpec, sink EventSink) (*Task, error) {
-	t := &Task{
+// RunTaskStreaming creates a task and runs its first turn, forwarding each
+// event to opts.Sink as it arrives. It waits for the turn under the rules in
+// runDetached and reports whether it finished; either way the turn keeps
+// running. Used by the streaming "run" tools so the MCP client sees live
+// progress.
+func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, ws Workspace, spec agent.RunSpec, opts Options) (t *Task, finished bool, err error) {
+	t = m.newTask(a, ws, spec)
+	t.approver = opts.Approver
+	spec.Cwd = ws.Path
+
+	if err := m.admit(t); err != nil {
+		return nil, false, err
+	}
+
+	t.persist()
+
+	return t, m.runDetached(ctx, t, spec, opts), nil
+}
+
+// FollowupStreaming resumes a finished task's session with a new prompt,
+// waiting on it under the same rules as RunTaskStreaming.
+func (m *Manager) FollowupStreaming(ctx context.Context, id, prompt string, allowedTools, extraArgs []string, opts Options) (*Task, bool, error) {
+	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
+	if err != nil {
+		return nil, false, err
+	}
+	if opts.Approver != nil {
+		t.mu.Lock()
+		t.approver = opts.Approver
+		t.mu.Unlock()
+	}
+	return t, m.runDetached(ctx, t, spec, opts), nil
+}
+
+// newTask builds a task record. Every entry point starts from here, so the
+// fields a task is born with are defined once rather than per caller.
+func (m *Manager) newTask(a agent.Adapter, ws Workspace, spec agent.RunSpec) *Task {
+	return &Task{
 		ID:        newID(m.counter.Add(1)),
 		AgentName: a.Name(),
-		Cwd:       cwd,
+		Cwd:       ws.Path,
 		Model:     spec.Model,
 		adapter:   a,
 		audit:     m.audit,
@@ -346,30 +528,87 @@ func (m *Manager) RunTaskStreaming(ctx context.Context, a agent.Adapter, cwd str
 		status:    StatusRunning,
 		running:   true,
 		startedAt: time.Now(),
+		// Read now, not later: once the worker commits its own work a diff
+		// against HEAD shows nothing, which reads as "it changed no files".
+		baseCommit: baseCommit(ws.Path),
+		workspace:  ws,
 	}
-	spec.Cwd = cwd
+}
 
+// runDetached starts a turn on a context of its own and waits for it, reporting
+// whether it finished within the window. The turn keeps running either way.
+//
+// The turn deliberately does not inherit ctx. ctx belongs to the MCP call that
+// asked for the work, and that call has a much shorter life than the work does:
+// a client that gives up waiting, or a user who closes the panel, cancels it.
+// Running the turn under it meant the worker was killed mid-edit whenever the
+// caller stopped listening — the task was lost for the sole reason that nobody
+// was watching it. ctx still bounds how long *this call* waits, which is all it
+// was ever able to speak for.
+func (m *Manager) runDetached(ctx context.Context, t *Task, spec agent.RunSpec, opts Options) (finished bool) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.runTurn(context.Background(), t, spec, opts.Sink)
+	}()
+
+	window := opts.Window
+	if window <= 0 {
+		select {
+		case <-done:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	timer := time.NewTimer(window)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// admit registers a task, refusing it when the machine is already running as
+// many workers as the operator allows.
+//
+// The cap is on live workers, not on retained records: a headless coding agent
+// is a heavyweight process, so an orchestrator fanning out ten tasks can take
+// the machine down while maxTasks and every per-task limit still look
+// perfectly satisfied.
+func (m *Manager) admit(t *Task) error {
+	if err := m.checkCapacity(); err != nil {
+		return err
+	}
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.tasks[t.ID] = t
 	m.order = append(m.order, t.ID)
 	m.evictLocked()
-	m.mu.Unlock()
-
-	t.persist()
-
-	m.runTurn(ctx, t, spec, sink)
-	return t, nil
+	return nil
 }
 
-// FollowupStreaming resumes a finished task's session with a new prompt, running
-// synchronously and forwarding events to sink.
-func (m *Manager) FollowupStreaming(ctx context.Context, id, prompt string, allowedTools, extraArgs []string, sink EventSink) (*Task, error) {
-	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
-	if err != nil {
-		return nil, err
+// checkCapacity refuses a new worker once the configured limit is reached.
+//
+// It must be called without any task lock held, since Running takes each task's
+// lock to read its state. Two callers can therefore race past a cap of N and
+// briefly reach N+1; that is deliberate, because making it exact would mean
+// holding the manager lock across task locks in both directions, which is how
+// this deadlocks.
+func (m *Manager) checkCapacity() error {
+	if m.maxConcurrent <= 0 {
+		return nil
 	}
-	m.runTurn(ctx, t, spec, sink)
-	return t, nil
+	if live := m.Running(); live >= m.maxConcurrent {
+		return fmt.Errorf("%d task(s) are already running, which is this server's limit "+
+			"(CLI_AGENT_MCP_MAX_CONCURRENT=%d). Wait for one to finish, or cancel one with agent_cancel_task",
+			live, m.maxConcurrent)
+	}
+	return nil
 }
 
 // evictLocked drops the oldest finished tasks beyond maxTasks. Caller holds mu.
@@ -448,10 +687,15 @@ func (m *Manager) prepareFollowup(id, prompt string, allowedTools, extraArgs []s
 }
 
 // Followup resumes a task's session with a new prompt, asynchronously.
-func (m *Manager) Followup(id, prompt string, allowedTools, extraArgs []string) (*Task, error) {
+func (m *Manager) Followup(id, prompt string, allowedTools, extraArgs []string, opts Options) (*Task, error) {
 	t, spec, err := m.prepareFollowup(id, prompt, allowedTools, extraArgs)
 	if err != nil {
 		return nil, err
+	}
+	if opts.Approver != nil {
+		t.mu.Lock()
+		t.approver = opts.Approver
+		t.mu.Unlock()
 	}
 	go m.runTurn(context.Background(), t, spec, nil)
 	return t, nil
@@ -499,11 +743,58 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		})
 	}
 
+	// Issue this turn's permission grant, if the orchestrator can answer for it.
+	// It is revoked the moment the turn ends: the URL it names can approve
+	// commands on this machine, so it must outlive nothing.
+	t.mu.Lock()
+	approver := t.approver
+	t.mu.Unlock()
+	if approver != nil {
+		if cfgPath, tool, release, ok := approver.Grant(t.ID); ok {
+			defer release()
+			spec.MCPConfigPath = cfgPath
+			spec.PermissionTool = tool
+		}
+	}
+
+	// Refusing here rather than at the tool boundary is deliberate: a follow-up
+	// is the path that spends a budget repeatedly, and it reaches runTurn from
+	// several entry points that would each have to remember the check.
+	if left, ok := m.budgetFor(t); !ok {
+		t.mu.Lock()
+		spent := t.usage.CostUSD
+		t.mu.Unlock()
+		fail(fmt.Sprintf("this task has spent $%.4f, which is at or past its budget of $%.2f "+
+			"(CLI_AGENT_MCP_MAX_COST_USD). Nothing was run. Start a new task, or raise the limit.",
+			spent, m.maxCostUSD))
+		return
+	} else if left > 0 {
+		spec.MaxCostUSD = left
+	}
+
+	// A permission the user granted permanently is handed to the agent as a
+	// pre-approved tool, so the worker never reaches the point of asking for it
+	// again. Answering the same question twice is the fastest way to train
+	// someone into approving everything without reading it.
+	//
+	// The desk applies the same grants a second time, for the requests that do
+	// reach it. That redundancy is deliberate: this path only saves a round trip
+	// to the approval endpoint, and a grant must still be honoured when a
+	// pattern fails to match the way the agent spells the command.
+	if m.grants != nil {
+		spec.AllowedTools = append(spec.AllowedTools, m.grants.Patterns()...)
+	}
+
 	cmd, err := t.adapter.Command(ctx, spec)
 	if err != nil {
 		fail("building command: " + err.Error())
 		return
 	}
+	// A cancel asked for by another instance arrives as a file rather than a
+	// call, because that instance has no handle on this worker. Watching for it
+	// here is what makes the request mean anything.
+	go watchCancelRequest(ctx, t, cancel)
+
 	cmd.Dir = spec.Cwd
 	// The child inherits our environment — that is the point: whatever the host
 	// can reach (VPN routes, an SSH agent, credentials) becomes available to the
@@ -527,20 +818,44 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 		"env_repaired": repaired,
 	})
 
-	stdout, err := cmd.StdoutPipe()
+	// The pipes are ours rather than cmd.StdoutPipe()'s, and that is the whole
+	// point. os/exec closes a StdoutPipe as soon as Wait sees the process exit,
+	// discarding whatever the reader had not consumed yet — its own
+	// documentation says calling Wait before the reads have finished is
+	// incorrect. This code has to call Wait first (see below), so with a
+	// StdoutPipe the tail of the output was being thrown away: on a loaded
+	// machine that meant losing the agent's terminal result event, and with it
+	// the task's answer and its accounting. It showed up as a run that reported
+	// done and produced nothing.
+	//
+	// A pipe we own is not closed by Wait, so the reader keeps draining what is
+	// buffered and stops at a real EOF.
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		fail("stdout pipe: " + err.Error())
 		return
 	}
-	stderr, err := cmd.StderrPipe()
+	defer stdoutR.Close()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		stdoutW.Close()
 		fail("stderr pipe: " + err.Error())
 		return
 	}
+	defer stderrR.Close()
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+
 	if err := cmd.Start(); err != nil {
+		stdoutW.Close()
+		stderrW.Close()
 		fail("starting agent: " + err.Error())
 		return
 	}
+	// The child holds its own copy now. Ours has to go, or the read end never
+	// reaches EOF because this process is still a writer.
+	stdoutW.Close()
+	stderrW.Close()
 	guard.AfterStart(cmd)
 
 	// Safety net: a headless worker can hang forever (e.g. blocked on a
@@ -558,16 +873,20 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go t.pump(stdout, false, sink, &wg)
-	go t.pump(stderr, true, sink, &wg)
+	go t.pump(stdoutR, false, sink, &wg)
+	go t.pump(stderrR, true, sink, &wg)
 
 	// Order matters. Waiting on the pumps first looks natural but hangs forever
 	// whenever the agent leaves a background process holding the inherited
 	// stdout handle: the pipe never reaches EOF, so the pumps never return, and
-	// cmd.Wait — the only thing that honours WaitDelay and force-closes the
-	// pipes — is never reached. Calling Wait first lets WaitDelay do its job,
-	// after which the pumps see EOF. The grace period below is a second
-	// backstop so a stuck reader can never strand the turn.
+	// cmd.Wait — the only thing that honours WaitDelay and kills the tree — is
+	// never reached. Calling Wait first lets WaitDelay do its job.
+	//
+	// Because the pipes are ours, Wait does not close them, so the pumps go on
+	// draining what is already buffered and stop at a genuine EOF rather than
+	// losing the tail. The grace below is what keeps that from becoming a hang:
+	// when it expires the deferred Close on the read ends unblocks any pump
+	// still waiting on a handle somebody else is holding open.
 	pumpsDone := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -761,6 +1080,12 @@ func (t *Task) pump(r io.Reader, isErr bool, sink EventSink, wg *sync.WaitGroup)
 				if ev.Text != "" {
 					t.lastText = ev.Text
 				}
+				if ev.Model != "" {
+					t.modelUsed = ev.Model
+				}
+				if ev.Usage != nil {
+					t.usage.Add(*ev.Usage)
+				}
 				if ev.Final {
 					t.isError = ev.FinalError
 					if ev.FinalText != "" {
@@ -826,8 +1151,22 @@ func (m *Manager) Cancel(id string) (Snapshot, error) {
 	}
 	t.mu.Lock()
 	if !t.running {
+		orphaned := t.status == StatusOrphaned
 		s := t.snapshot()
+		store := t.store
 		t.mu.Unlock()
+
+		// An orphan is running under another server instance, so this process
+		// has no handle on its worker and cannot stop it directly. Returning the
+		// snapshot as though the cancel had happened is the one answer that must
+		// not be given: a caller reads success and believes the task is stopping
+		// while it carries on spending.
+		if orphaned && store != nil {
+			if err := store.RequestCancel(t.ID); err != nil {
+				return s, fmt.Errorf("this task belongs to another server instance and the request to stop it could not be left for that instance: %w", err)
+			}
+			return s, nil
+		}
 		return s, nil
 	}
 	t.canceledRequested = true
@@ -850,4 +1189,53 @@ func (m *Manager) Cancel(id string) (Snapshot, error) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return t.Snapshot(), nil
+}
+
+// cancelPollInterval is how often a running turn checks whether another server
+// instance has asked it to stop. A second is slower than a local cancel and far
+// faster than a person notices, and the check is a single stat.
+const cancelPollInterval = time.Second
+
+// watchCancelRequest stops the turn when another instance leaves a request for
+// it. It exits with the turn, so a finished task leaves nothing polling.
+func watchCancelRequest(ctx context.Context, t *Task, cancel context.CancelFunc) {
+	t.mu.Lock()
+	store := t.store
+	t.mu.Unlock()
+	if store == nil {
+		return
+	}
+
+	// Deliberately no "clear anything stale first" step here, though it looks
+	// like an obvious precaution and was one until it caused a failure.
+	//
+	// A request can be written the moment a task becomes visible, which is
+	// before this goroutine is scheduled — the caller doing the writing is not
+	// waiting on any I/O, and the turn's goroutine is. Clearing on entry
+	// therefore erases legitimate requests that arrive in that window, and does
+	// so more often the more loaded the machine is. It went unnoticed locally
+	// and failed on the first CI run.
+	//
+	// What it was guarding against does not really occur: task ids carry a
+	// random suffix and are not reused, and Forget removes the request along
+	// with the record when a task is evicted.
+	ticker := time.NewTicker(cancelPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !store.CancelRequested(t.ID) {
+				continue
+			}
+			_ = store.ClearCancel(t.ID)
+			t.mu.Lock()
+			t.canceledRequested = true
+			t.mu.Unlock()
+			t.audit.Log("cancel", map[string]any{"task_id": t.ID, "source": "another server instance"})
+			cancel()
+			return
+		}
+	}
 }
