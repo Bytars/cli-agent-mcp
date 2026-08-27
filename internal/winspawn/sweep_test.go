@@ -4,6 +4,7 @@ package winspawn_test
 
 import (
 	"go/ast"
+	"go/build/constraint"
 	"go/parser"
 	"go/token"
 	"os"
@@ -11,6 +12,75 @@ import (
 	"strings"
 	"testing"
 )
+
+// corretEnWindows dice si un archivo llega a compilar en Windows.
+//
+// EL BARRIDO SÓLO TIENE SENTIDO SOBRE LO QUE CORRE EN WINDOWS, y no mirarlo
+// costó un rojo de CI: al mergear el pairing entró `internal/pairing/
+// parent_other.go`, que llama a `ps` para resolver el proceso padre en macOS
+// dentro de un `//go:build !windows`. Ese archivo NO EXISTE para el compilador
+// de Windows, y en las demás plataformas `Harden` es un no-op por definición
+// (`winspawn_other.go` devuelve el cmd sin tocar). Marcarlo pedía envolver algo
+// para que no pasara nada: puro ritual.
+//
+// Saltearlo no es una exención — es la definición del problema. Una consola que
+// parpadea es un fenómeno de Windows; un archivo que Windows nunca compila no
+// puede producirla.
+//
+// Se miran las dos formas en que Go decide esto: la directiva `//go:build` y el
+// sufijo del nombre (`foo_linux.go`). El sufijo `_other.go` no es un GOOS, así
+// que no filtra nada por sí solo — esos archivos dependen de su directiva.
+func correnEnWindows(ruta string, archivo *ast.File) bool {
+	// 1. El sufijo del nombre. Go trata `_<GOOS>.go` como restricción implícita.
+	base := strings.TrimSuffix(filepath.Base(ruta), ".go")
+	for goos := range otrosSistemas {
+		if strings.HasSuffix(base, "_"+goos) {
+			return false
+		}
+	}
+
+	// 2. La directiva //go:build, evaluada como si GOOS=windows. Sólo se responde
+	//    por los tags de sistema operativo: cualquier otro (una etiqueta propia,
+	//    una arquitectura) se da por cierto, para no excluir un archivo por una
+	//    condición que no tiene nada que ver con la plataforma.
+	for _, grupo := range archivo.Comments {
+		for _, c := range grupo.List {
+			if !constraint.IsGoBuild(c.Text) {
+				continue
+			}
+			expr, err := constraint.Parse(c.Text)
+			if err != nil {
+				// Una directiva que no parsea no autoriza a saltear el archivo:
+				// ante la duda se revisa, que es el lado seguro.
+				return true
+			}
+			return expr.Eval(esCiertoEnWindows)
+		}
+	}
+	return true
+}
+
+// otrosSistemas son los GOOS que no son Windows, más los meta-tags que Go
+// resuelve por sistema operativo.
+var otrosSistemas = map[string]bool{
+	"linux": true, "darwin": true, "freebsd": true, "openbsd": true,
+	"netbsd": true, "dragonfly": true, "solaris": true, "aix": true,
+	"android": true, "ios": true, "js": true, "plan9": true, "wasip1": true,
+	"illumos": true, "hurd": true, "unix": true, "posix": true,
+}
+
+// esCiertoEnWindows evalúa un tag de build como si GOOS fuera windows.
+//
+// Los GOOS ajenos dan falso, `windows` da verdadero, y **cualquier otro tag da
+// verdadero a propósito**: una etiqueta propia o una arquitectura no dice nada
+// sobre la plataforma, y darla por falsa excluiría del barrido archivos que sí
+// compilan en Windows. Ante la duda, se revisa.
+func esCiertoEnWindows(tag string) bool {
+	if tag == "windows" {
+		return true
+	}
+	return !otrosSistemas[tag]
+}
 
 // wrappers son los nombres que cuentan como envolver un lanzado.
 //
@@ -96,6 +166,7 @@ func TestTodoLanzadoPasaPorHarden(t *testing.T) {
 	// verificar— porque el AST de Go no da el padre de un nodo.
 	var (
 		revisados int
+		ajenos    int // archivos que Windows nunca compila; ver correnEnWindows
 		hallazgos []string
 	)
 
@@ -120,11 +191,17 @@ func TestTodoLanzadoPasaPorHarden(t *testing.T) {
 		}
 
 		fset := token.NewFileSet()
-		archivo, err := parser.ParseFile(fset, ruta, nil, 0)
+		// ParseComments y no 0: las directivas //go:build son comentarios, y sin
+		// ellas correnEnWindows no puede ver nada.
+		archivo, err := parser.ParseFile(fset, ruta, nil, parser.ParseComments)
 		if err != nil {
 			// Un archivo que no parsea no se puede afirmar nada sobre él, y
 			// callarse sería convertir un error en un verde.
 			t.Errorf("%s: no parsea, así que no se pudo revisar: %v", rel, err)
+			return nil
+		}
+		if !correnEnWindows(ruta, archivo) {
+			ajenos++
 			return nil
 		}
 		revisados++
@@ -185,7 +262,8 @@ func TestTodoLanzadoPasaPorHarden(t *testing.T) {
 				"deliberada, agregalo a `exenciones` en este archivo con la razón.\n\n  %s",
 			len(hallazgos), strings.Join(hallazgos, "\n  "))
 	}
-	t.Logf("revisados %d archivos .go, %d exención(es) declarada(s)", revisados, len(exenciones))
+	t.Logf("revisados %d archivos .go, %d salteado(s) por no compilar en Windows, %d exención(es) declarada(s)",
+		revisados, ajenos, len(exenciones))
 }
 
 // esEnvoltorio reconoce tanto `Harden(...)` como `winspawn.Harden(...)` y
