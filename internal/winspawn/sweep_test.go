@@ -28,6 +28,20 @@ var wrappers = map[string]bool{
 // Se listan por ruta exacta a propósito: una exención por patrón (por ejemplo
 // "todo lo que esté bajo internal/inspect") se llevaría puesto un archivo nuevo
 // que nadie revisó.
+//
+// OJO: ÉSTA NO ES LA ÚNICA EXENCIÓN. El walk de abajo saltea TODOS los
+// `_test.go`, que es una exención mucho más ancha y vive escondida en el
+// recorrido en vez de acá. Hoy cubre seis lanzados sueltos, enumerados:
+//
+//	internal/gitx/gitx_test.go:30,51,156
+//	internal/task/lifecycle_test.go:48
+//	internal/task/workspace_test.go:29,39
+//
+// El issue #18 la autoriza explícitamente, pero conviene decirla en voz alta por
+// dos razones: estaba sin declarar en el PR original —lo señaló una sesión de
+// verificación—, y es incoherente con haber envuelto `internal/agent/mock.go`
+// con el argumento de que un test lanza procesos reales en la máquina de quien
+// lo corre. `gitx_test.go` hace exactamente eso, en un test que tarda ~21s.
 var exenciones = map[string]string{
 	"internal/inspect/web.go": "abre el navegador del usuario; acá la ventana es el punto",
 }
@@ -49,6 +63,31 @@ var exenciones = map[string]string{
 // `exec.Command("git")` suelto en cualquier .go no exento y confirmar que este
 // test se pone rojo NOMBRANDO ese archivo y esa línea. Un barrido que no
 // encuentra nada y un barrido roto se ven exactamente igual desde afuera.
+//
+// LO QUE ESTE BARRIDO NO VE, medido por una sesión de verificación que fue a
+// buscarlo. Los cuatro compilan y pasan `go vet`, así que el verde es ceguera y
+// no un no-dato:
+//
+//  1. Un import con alias lo esquiva entero: la comparación es literal contra
+//     "exec", así que `execx "os/exec"` + `execx.Command(...)` pasa. Un
+//     `. "os/exec"` con `Command(...)` pelado tampoco es un SelectorExpr.
+//  2. Un `&exec.Cmd{Path: ...}` armado a mano no es una llamada a exec.Command
+//     y pasa. Lo mismo os.StartProcess y syscall.CreateProcess. Hoy no hay
+//     ninguno: barrido con `exec\.Cmd\{|&exec\.Cmd` y
+//     `os\.StartProcess|syscall\.(CreateProcess|StartProcess)`, cero fuera de
+//     los dos &syscall.SysProcAttr{} legítimos.
+//  3. La guarda de `revisados < 20` es más floja de lo que parece: de los 51
+//     archivos no-test, 40 están bajo internal/, así que un walk roto que sólo
+//     cubriera ese subárbol revisaría 39 y pasaría igual. Es la misma clase de
+//     defecto que tuvo el grep manual del issue, que se perdió cmd/.
+//  4. Envolver en dos pasos da un FALSO POSITIVO: el match es posicional, así
+//     que `c := exec.Command(...)` seguido de `winspawn.Harden(c)` se reporta
+//     como sin envolver. Fuerza el estilo anidado en una línea.
+//
+// Ninguno se tapa acá a propósito: taparlos pide un análisis de tipos, y el
+// costo no se justifica para un repo de este tamaño mientras estén escritos.
+// Que Harden HAGA algo lo cuida harden_windows_test.go, que es el agujero que sí
+// dejaba reintroducir el defecto entero en verde.
 func TestTodoLanzadoPasaPorHarden(t *testing.T) {
 	raiz := raizDelModulo(t)
 
