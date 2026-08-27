@@ -106,6 +106,12 @@ func main() {
 	// An unauthorized launcher must not reach the instance lock: writing that
 	// file would let any local process disturb the legitimate server's view of
 	// the tasks it owns, which is a denial of service that needs no token at all.
+	//
+	// Resolved once, and every later user of a state path takes this one. Empty
+	// means "the per-user default", and passing cfg.StateDir straight through
+	// left grants with no directory at all and the approval config on a relative
+	// path the agent resolved against its own workspace — ResolveDir also makes
+	// it absolute, which is what closes that.
 	stateDir := state.ResolveDir(cfg.StateDir)
 	launcher := pairing.ParentExe()
 	gate, err := pairing.Verify(stateDir, cfg.Token, launcher)
@@ -203,15 +209,6 @@ func main() {
 			fmt.Printf("%-8s %-12s %s\n", a.Name(), status, detail)
 		}
 		return
-	}
-
-	// Resolved once, because empty means "the per-user default" and both stores
-	// below need a real path. Passing cfg.StateDir straight through left grants
-	// with no directory at all, and the approval config on a relative path the
-	// agent resolved against its own workspace.
-	stateDir := cfg.StateDir
-	if stateDir == "" {
-		stateDir = state.DefaultDir()
 	}
 
 	// Interactive approval. It only does anything for a client that can put a
