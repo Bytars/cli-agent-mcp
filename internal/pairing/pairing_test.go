@@ -10,6 +10,24 @@ import (
 	"testing"
 )
 
+// confirm walks a record through the launch that turns pairing on: a launcher
+// presents a valid token, and enforcement is permanent from then on.
+//
+// Tests about refusing anything need it. A freshly minted record does not
+// refuse — it serves until a token is seen to arrive (see Status Armed) — so
+// "paired" and "enforcing" are two states these tests have to step through
+// rather than assume.
+func confirm(t *testing.T, dir, secret, launcher string) {
+	t.Helper()
+	r, err := Verify(dir, secret, launcher)
+	if err != nil {
+		t.Fatalf("confirming the pairing: %v", err)
+	}
+	if r.Status != OK {
+		t.Fatalf("confirming the pairing gave %v (%s), want OK", r.Status, r.Detail)
+	}
+}
+
 // An install that predates pairing must keep working. Bricking a working setup
 // on upgrade would be a worse outcome than the exposure this feature closes.
 func TestUnpairedServesAsBefore(t *testing.T) {
@@ -72,6 +90,7 @@ func TestPairedRejectsMissingAndWrongTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
+	confirm(t, dir, secret, "/opt/Claude/claude")
 
 	for _, tc := range []struct {
 		name   string
@@ -113,6 +132,7 @@ func TestRevokeIsPerLabel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint cowork: %v", err)
 	}
+	confirm(t, dir, desktop, "")
 
 	if ok, err := Revoke(dir, "cowork"); err != nil || !ok {
 		t.Fatalf("Revoke: ok=%v err=%v", ok, err)
@@ -134,6 +154,7 @@ func TestMintRotatesInPlace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
+	confirm(t, dir, old, "")
 	fresh, err := Mint(dir, "claude-desktop", false)
 	if err != nil {
 		t.Fatalf("re-Mint: %v", err)
@@ -317,7 +338,7 @@ func TestInstallTokenPreservesOtherServers(t *testing.T) {
 		t.Fatalf("seed config: %v", err)
 	}
 
-	if _, err := InstallToken(path, "/usr/local/bin/cli-agent-mcp", "cam1_secret"); err != nil {
+	if _, _, err := InstallToken(path, "/usr/local/bin/cli-agent-mcp", "cam1_secret"); err != nil {
 		t.Fatalf("InstallToken: %v", err)
 	}
 
@@ -356,7 +377,7 @@ func TestInstallTokenKeepsAnExistingCommand(t *testing.T) {
 		t.Fatalf("seed config: %v", err)
 	}
 
-	if _, err := InstallToken(path, "/usr/local/bin/cli-agent-mcp", "cam1_new"); err != nil {
+	if _, _, err := InstallToken(path, "/usr/local/bin/cli-agent-mcp", "cam1_new"); err != nil {
 		t.Fatalf("InstallToken: %v", err)
 	}
 
@@ -388,7 +409,7 @@ func TestInstallTokenRefusesBrokenConfig(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	if _, err := InstallToken(path, "exe", "cam1_x"); err == nil {
+	if _, _, err := InstallToken(path, "exe", "cam1_x"); err == nil {
 		t.Fatal("overwrote a config that could not be parsed")
 	}
 	buf, _ := os.ReadFile(path)
@@ -399,7 +420,8 @@ func TestInstallTokenRefusesBrokenConfig(t *testing.T) {
 
 func TestInstallTokenCreatesAMissingConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "cfg.json")
-	if _, err := InstallToken(path, "exe", "cam1_x"); err != nil {
+	_, created, err := InstallToken(path, "exe", "cam1_x")
+	if err != nil {
 		t.Fatalf("InstallToken: %v", err)
 	}
 	var root map[string]any
@@ -409,6 +431,135 @@ func TestInstallTokenCreatesAMissingConfig(t *testing.T) {
 	}
 	if err := json.Unmarshal(buf, &root); err != nil {
 		t.Fatalf("wrote invalid JSON: %v", err)
+	}
+
+	// Y tiene que DECIR que lo creó (issue #25). Escribir bien un archivo que el
+	// cliente no lee es el modo de falla que dejó una máquina sin MCP: la
+	// escritura funcionó, el mensaje se leyó como éxito, y el enforcement quedó
+	// encendido sin nadie que pudiera presentar el token.
+	if !created {
+		t.Error("created = false sobre un archivo que no existía.\n" +
+			"Ese booleano es lo único que distingue «actualicé tu configuración» de\n" +
+			"«inventé una configuración que quizá nadie lea», y el segundo caso necesita\n" +
+			"una advertencia, no una felicitación.")
+	}
+}
+
+// TestInstallTokenNoMienteSobreUnConfigQueYaExistia es la otra mitad del control
+// de #25: si `created` fuera true siempre, la advertencia aparecería también en
+// el caso bueno y se volvería ruido que nadie lee.
+func TestInstallTokenNoMienteSobreUnConfigQueYaExistia(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.json")
+	if err := os.WriteFile(path, []byte(`{"mcpServers":{"otro":{"command":"x"}}}`), 0o600); err != nil {
+		t.Fatalf("preparar: %v", err)
+	}
+	_, created, err := InstallToken(path, "exe", "cam1_x")
+	if err != nil {
+		t.Fatalf("InstallToken: %v", err)
+	}
+	if created {
+		t.Error("created = true sobre un archivo que YA existía; la advertencia saldría cuando no corresponde")
+	}
+}
+
+// TestElTokenDelEntornoSirve prueba el camino que queda cuando el cliente no
+// tiene archivo de configuración: presentar el secreto por el entorno.
+//
+// Es la vía que se ofrece en `printEnvFallback`, y ofrecer algo sin probar que
+// funciona es exactamente cómo se llega a un usuario sin MCP (issue #25). Acá se
+// prueba el mecanismo entero: se paira, se presenta el secreto tal cual lo
+// presentaría el entorno, y el veredicto tiene que ser OK.
+func TestElTokenDelEntornoSirve(t *testing.T) {
+	dir := t.TempDir()
+	secreto, err := Mint(dir, "cowork", false)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	// El lanzador es el mismo en los dos arranques, que es la situación real:
+	// una vez que el binding se registra, sólo ese programa sirve.
+	const lanzador = `C:\Tools\algun-cliente.exe`
+
+	r, err := Verify(dir, secreto, lanzador)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != OK {
+		t.Fatalf("con el secreto correcto el estado es %v (%s), quería OK.\n"+
+			"Si esto falla, la salida por variable de entorno que `pair` ofrece no sirve\n"+
+			"para nada y el usuario se queda sin cliente.", r.Status, r.Detail)
+	}
+	if r.Label != "cowork" {
+		t.Errorf("label = %q, quería \"cowork\"", r.Label)
+	}
+
+	// Y el control de la afirmación: sin el secreto, el mismo montaje rechaza.
+	// Sin esta mitad, un Verify que dijera OK siempre pasaría la prueba de
+	// arriba.
+	sin, err := Verify(dir, "", lanzador)
+	if err != nil {
+		t.Fatalf("Verify sin secreto: %v", err)
+	}
+	if sin.Status != NoToken {
+		t.Errorf("sin secreto el estado es %v, quería NoToken; el gate no está discriminando", sin.Status)
+	}
+
+	// Y desde OTRO lanzador, con el secreto correcto: tiene que rechazar. Es lo
+	// que hace que la variable de entorno siga valiendo algo pese a ser legible
+	// por cualquier proceso del usuario.
+	otro, err := Verify(dir, secreto, `C:\Windows\System32\cmd.exe`)
+	if err != nil {
+		t.Fatalf("Verify desde otro lanzador: %v", err)
+	}
+	if otro.Status != ForeignParent {
+		t.Errorf("desde otro lanzador el estado es %v, quería ForeignParent.\n"+
+			"Éste es el argumento por el que la variable de entorno es aceptable: aunque el\n"+
+			"secreto se lea, sigue atado al programa que lo usó primero. Si esto no se cumple,\n"+
+			"ofrecer el entorno es entregar el pairing entero.", otro.Status)
+	}
+}
+
+// TestElRechazoNombraAlLanzadorYLaSalida fija la segunda mitad de #25.
+//
+// El mensaje viejo decía sólo «corré pair --install», que es exactamente lo que
+// el usuario acababa de hacer cuando se quedó sin MCP. Un remedio que es la
+// acción que falló no es un remedio.
+func TestElRechazoNombraAlLanzadorYLaSalida(t *testing.T) {
+	const launcher = `C:\Tools\algun-cliente.exe`
+	stderr, client := Explain(Result{
+		Status:   NoToken,
+		Label:    "claude-desktop",
+		Detail:   "this server is paired, and the process that launched it presented no " + EnvVar,
+		Launcher: launcher,
+	})
+	if stderr == "" {
+		t.Fatal("stderr vacío")
+	}
+	// The log has to carry the way out too, not only the message for the model.
+	// In this state the user's client is broken, so the model's relay may never
+	// reach them — the log is the one channel they certainly have, and it is
+	// where this gets diagnosed. An escape only in the message they cannot read
+	// repeats the mistake this whole change exists to fix.
+	if !strings.Contains(stderr, "pair --unpair") {
+		t.Errorf("the log names no way out, so a user whose client is dead cannot rescue themselves "+
+			"from what they can actually read:\n%s", stderr)
+	}
+	if !strings.Contains(client, launcher) {
+		t.Errorf("el mensaje al cliente no nombra al lanzador (%s).\n"+
+			"Es el dato que dice en la configuración de QUÉ programa tiene que estar el token,\n"+
+			"que puede no ser el archivo donde el instalador lo escribió.\n\n%s", launcher, client)
+	}
+	if !strings.Contains(client, "pair --unpair") {
+		t.Errorf("el mensaje al cliente no nombra la salida.\n"+
+			"En este estado el usuario NO TIENE MCP, así que la respuesta no puede ser\n"+
+			"«andá a leer algo»: hay que darle el comando que se lo devuelve.\n\n%s", client)
+	}
+
+	// Sin lanzador resuelto —hay plataformas donde no se puede— el mensaje tiene
+	// que seguir siendo útil en vez de quedar a medio armar.
+	_, sinLanzador := Explain(Result{Status: NoToken, Label: "x", Detail: "d"})
+	if !strings.Contains(sinLanzador, "pair --unpair") {
+		t.Errorf("sin lanzador resuelto el mensaje pierde la salida:\n%s", sinLanzador)
 	}
 }
 
@@ -427,5 +578,149 @@ func TestExplainAlwaysSaysWhatToDo(t *testing.T) {
 	}
 	if stderr, client := Explain(Result{Status: Unpaired}); stderr != "" || client != "" {
 		t.Error("an unpaired server produced a rejection message")
+	}
+}
+
+// The launcher reaches the log only because Verify writes it into Detail, and
+// Explain then passes Detail through. That coupling is invisible from either
+// side on its own, so it is worth one test that walks the whole path: a change
+// to how Verify words its detail would otherwise drop the launcher from the log
+// with every unit test still green.
+//
+// It matters because the log is what a locked-out user reads, and the launcher
+// is the fact that says whose configuration the token has to live in.
+func TestTheLogNamesTheLauncherEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	secret, err := Mint(dir, "claude-desktop", false)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	const launcher = `C:\Tools\some-client.exe`
+	confirm(t, dir, secret, launcher)
+
+	r, err := Verify(dir, "", launcher)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != NoToken {
+		t.Fatalf("status = %v, want NoToken — this test needs the rejected path", r.Status)
+	}
+
+	stderr, client := Explain(r)
+	for _, want := range []string{launcher, "pair --unpair"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the log is missing %q, which is what the user has to act on:\n%s", want, stderr)
+		}
+		if !strings.Contains(client, want) {
+			t.Errorf("the message for the model is missing %q:\n%s", want, client)
+		}
+	}
+}
+
+// Pairing must not be able to cost someone their client. A record that has
+// never seen a working token serves instead of refusing, so a token written
+// into a config the client does not read leaves them with a client that still
+// works and a log that says why — rather than the failure #25 describes, where
+// the first sign of trouble is the MCP disappearing after a restart.
+func TestAFreshPairingDoesNotLockAnyoneOut(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Mint(dir, "claude-desktop", false); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	r, err := Verify(dir, "", "/opt/Claude/claude")
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != Armed {
+		t.Fatalf("status = %v, want Armed", r.Status)
+	}
+	if !r.Allowed() {
+		t.Fatal("a pairing nobody has confirmed locked the user out; that is exactly the failure this prevents")
+	}
+
+	stderr, client := Explain(r)
+	for name, msg := range map[string]string{"log": stderr, "model message": client} {
+		if !strings.Contains(msg, "NOT") {
+			t.Errorf("the %s does not make clear that pairing is not in effect yet:\n%s", name, msg)
+		}
+	}
+}
+
+// The trial closes on evidence, not on a timer: the first launch that presents
+// a valid token turns enforcement on, and it stays on.
+func TestTheFirstGoodTokenTurnsEnforcementOn(t *testing.T) {
+	dir := t.TempDir()
+	secret, err := Mint(dir, "claude-desktop", false)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	if r, _ := Verify(dir, "", "/opt/Claude/claude"); r.Status != Armed {
+		t.Fatalf("before any successful use: status = %v, want Armed", r.Status)
+	}
+	confirm(t, dir, secret, "/opt/Claude/claude")
+
+	r, err := Verify(dir, "", "/opt/Claude/claude")
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != NoToken {
+		t.Fatalf("after a successful use: status = %v, want NoToken — enforcement never engaged", r.Status)
+	}
+	if r.Allowed() {
+		t.Fatal("the server still serves an unauthenticated launcher after pairing was confirmed")
+	}
+}
+
+// Rotating a credential is not evidence that pairing stopped working. Deriving
+// confirmation from the tokens rather than the record would reopen a door that
+// had been shut for months, and it would do it silently — the operator rotates
+// a token, and the next unauthenticated launcher is served.
+func TestRotatingATokenDoesNotReopenTheDoor(t *testing.T) {
+	dir := t.TempDir()
+	first, err := Mint(dir, "claude-desktop", false)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	confirm(t, dir, first, "")
+
+	if _, err := Mint(dir, "claude-desktop", false); err != nil {
+		t.Fatalf("re-Mint: %v", err)
+	}
+
+	r, err := Verify(dir, "", "/opt/Claude/claude")
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status == Armed || r.Allowed() {
+		t.Fatalf("status = %v after rotation: rotating a token dropped a confirmed install back into its trial", r.Status)
+	}
+}
+
+// The window is a default, not a verdict. Whoever will not have it can close it
+// without waiting for anything.
+func TestEnforceNowSkipsTheTrial(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Mint(dir, "claude-desktop", false); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	f, _, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	f.EnforceNow = true
+	if err := Save(dir, f); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	r, err := Verify(dir, "", "/opt/Claude/claude")
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != NoToken || r.Allowed() {
+		t.Fatalf("status = %v with --enforce-now set, want a refusal", r.Status)
 	}
 }

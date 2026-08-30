@@ -98,6 +98,51 @@ type Parent struct {
 type File struct {
 	Version int     `json:"version"`
 	Tokens  []Token `json:"tokens"`
+
+	// EnforceNow skips the trial described on Armed: no window, locked from the
+	// moment the record is written. Waiting for the token is the right default,
+	// not the right answer for everyone — a scripted install already knows the
+	// token arrives, and some operators simply will not have the window.
+	EnforceNow bool `json:"enforce_now,omitempty"`
+
+	// ConfirmedAt is when a launcher first presented a valid token — the
+	// evidence enforcement waits for.
+	//
+	// It lives on the record rather than being derived from Token.LastUsed, and
+	// the difference matters: rotating a token would leave a record whose only
+	// token had never been used, drop it back into its trial, and silently
+	// reopen a door shut months ago. Rotating a credential is not evidence that
+	// pairing stopped working.
+	//
+	// Only --unpair clears it, by removing the record.
+	//
+	// The omitempty is inert — encoding/json does not omit a zero struct, so an
+	// unconfirmed record carries "confirmed_at":"0001-01-01T00:00:00Z" rather
+	// than nothing. Harmless, since every reader goes through Confirmed() and
+	// IsZero(), but the tag promises something it does not do and someone will
+	// eventually read the file and wonder. Kept for the day it stops being a
+	// struct; not worth a pointer to fix the cosmetics of a field nobody edits
+	// by hand.
+	//
+	// AN OLDER SERVER READING THIS RECORD DOES NOT KNOW ANY OF IT. It sees a
+	// pairing with tokens and enforces immediately — the lockout the trial
+	// exists to prevent, arriving through a version mismatch. Measured against
+	// the v0.13.0 release binary: it refuses where this build serves. That is
+	// why runMint tells the user to install first and pair afterwards.
+	ConfirmedAt time.Time `json:"confirmed_at,omitempty"`
+}
+
+// Confirmed reports whether a launcher has ever presented a valid token here.
+func (f *File) Confirmed() bool {
+	return f != nil && !f.ConfirmedAt.IsZero()
+}
+
+// Enforcing reports whether a launch without a valid token should be refused.
+func (f *File) Enforcing() bool {
+	if f == nil {
+		return false
+	}
+	return f.EnforceNow || f.Confirmed()
 }
 
 // Status is the outcome of checking a launcher's credentials.
@@ -121,6 +166,24 @@ const (
 	// ForeignParent means the secret was valid but the process that launched
 	// this one is not the launcher the token is bound to.
 	ForeignParent
+
+	// Armed means the record exists but no token has ever worked here, so this
+	// launch is served instead of refused.
+	//
+	// Turning on authentication can cost you the ability to undo it: if the
+	// token never reaches the server, the client stops working and the fix is a
+	// terminal command nobody knows. SSH keeps password auth until you prove
+	// the key in a second session; a router reverts unless you confirm. Same
+	// shape: the risky change stays provisional until it is seen to work.
+	//
+	// So enforcement waits for evidence. The first launch presenting a valid
+	// token confirms the pairing, permanently. Until then the server serves and
+	// says so loudly.
+	//
+	// The price, stated rather than hidden: in that window any launcher gets in.
+	// It closes at the user's next client restart — which is exactly when they
+	// would otherwise be locked out — and --enforce-now skips it entirely.
+	Armed
 )
 
 // Result reports the check and carries enough detail to tell the user what to
@@ -129,10 +192,19 @@ type Result struct {
 	Status Status
 	Label  string // the matched token, when there is one
 	Detail string
+
+	// Launcher is the executable that started this process, when the platform
+	// could answer. It is carried into the rejection because it is the single
+	// most useful fact for someone locked out: the token has to live in THAT
+	// program's configuration, and the installer may well have written it
+	// somewhere else entirely (issue #25).
+	Launcher string
 }
 
 // Allowed reports whether the server should expose its real tools.
-func (r Result) Allowed() bool { return r.Status == OK || r.Status == Unpaired }
+func (r Result) Allowed() bool {
+	return r.Status == OK || r.Status == Unpaired || r.Status == Armed
+}
 
 // Path is where the pairing record lives for a given state directory.
 func Path(stateDir string) string { return filepath.Join(stateDir, FileName) }
@@ -318,11 +390,39 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 		}, nil
 	}
 
+	// armed is the verdict for a record that has never seen a working token.
+	// "You configured pairing" and "pairing works" are different things, and
+	// only the second is worth locking the door on.
+	armed := func(why string) Result {
+		return Result{
+			Status:   Armed,
+			Detail:   why + ", and no launcher has ever presented a valid token, so this server is still serving. Enforcement starts the first time one arrives",
+			Launcher: parentExe,
+		}
+	}
+
 	secret = strings.TrimSpace(secret)
 	if secret == "" {
+		// The detail names the launcher whenever the platform could resolve one.
+		// That is what separates a useless message — "presented nothing" — from
+		// an actionable one: it says whose configuration the token has to live
+		// in, which may not be the file the installer wrote (issue #25).
+		//
+		// It says "launched by" rather than asserting that program is the
+		// client, because the parent can be a shim or a shell standing between
+		// the two. It is still the best signal available, and a name the user
+		// can recognise beats no name at all.
+		detail := "this server is paired, and the process that launched it presented no " + EnvVar
+		if parentExe != "" {
+			detail += " (launched by " + parentExe + " — the token has to reach that program, or whatever it passes its environment to)"
+		}
+		if !f.Enforcing() {
+			return armed("this server is paired but the launcher presented no " + EnvVar), nil
+		}
 		return Result{
-			Status: NoToken,
-			Detail: "this server is paired, and the process that launched it presented no " + EnvVar,
+			Status:   NoToken,
+			Detail:   detail,
+			Launcher: parentExe,
 		}, nil
 	}
 
@@ -340,6 +440,9 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 		detail := "the presented " + EnvVar + " matches no issued token"
 		if !strings.HasPrefix(secret, tokenPrefix) {
 			detail += fmt.Sprintf("; it does not even look like one (tokens start with %q), so check the value was copied whole", tokenPrefix)
+		}
+		if !f.Enforcing() {
+			return armed("the presented " + EnvVar + " matches no issued token"), nil
 		}
 		return Result{Status: BadToken, Detail: detail}, nil
 	}
@@ -365,10 +468,18 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 		}, nil
 	}
 
-	tok.LastUsed = time.Now().UTC()
-	// A failed write costs the last-used timestamp and, on a first launch, the
-	// binding — worth a warning to the caller, never worth refusing to serve a
-	// client that just proved it holds a valid token.
+	now := time.Now().UTC()
+	tok.LastUsed = now
+	// The evidence the trial waits for: a token reached the server, so pairing
+	// works and the door can close for good.
+	if f.ConfirmedAt.IsZero() {
+		f.ConfirmedAt = now
+	}
+	// A failed write costs the timestamp, the binding on a first launch, and
+	// this confirmation — worth warning about, never worth refusing a client
+	// that just proved it holds a valid token. Losing the confirmation is the
+	// mildest of the three: the record stays in its trial one launch longer,
+	// which errs towards the user keeping a working client.
 	if err := Save(stateDir, f); err != nil {
 		return res, err
 	}

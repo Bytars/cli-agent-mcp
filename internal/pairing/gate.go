@@ -15,11 +15,36 @@ import "fmt"
 func Explain(r Result) (stderr, client string) {
 	const fix = "Run `cli-agent-mcp pair --install` in a terminal, then restart the client."
 
+	// The way out when pairing was set up against the wrong place. It has to be
+	// offered here and not only in the docs: on this path the user has no
+	// working MCP, so the answer cannot be "go read something" (issue #25).
+	const escape = "If pairing was just set up and the client stopped working, the token is not reaching this " +
+		"server — run `cli-agent-mcp pair --unpair` to get the client running again, then put the token " +
+		"where the program that launches this server will actually read it."
+
 	switch r.Status {
 	case NoToken:
-		return "refusing to serve: " + r.Detail,
+		// Name the launcher. This process knows who started it, and that is
+		// exactly the fact the user needs: the token belongs in THAT program's
+		// configuration, which may not be the file the installer wrote.
+		// Same hedge as the detail in Verify, and for the same reason: the parent
+		// can be a shim or a shell standing between the client and this process,
+		// so "that is where the token goes" overstates what was observed. This
+		// message is the one the model repeats out loud, which makes it the worse
+		// place of the two to overstate anything.
+		who := "The program that launched it"
+		if r.Launcher != "" {
+			who = "It was launched by " + r.Launcher + ", so the token has to reach that program — or whatever it passes its environment down to; it"
+		}
+		// The escape goes in the log too, not only in the message for the model.
+		// In this state the user's client is broken, so the model's relay may
+		// never reach them; the log is the one channel they certainly have, and
+		// where this gets diagnosed. A way out only in the message they cannot
+		// read repeats the mistake this exists to fix.
+		return "refusing to serve: " + r.Detail + "\n" + escape,
 			"This cli-agent-mcp server is paired to specific clients, and whatever launched it presented no credential, " +
-				"so every tool here is disabled. Tell the user, verbatim: " + fix + " " +
+				"so every tool here is disabled. " + who + " presented no CLI_AGENT_MCP_TOKEN. " +
+				"Tell the user, verbatim: " + fix + " " + escape + " " +
 				"Do not try to work around this and do not retry — nothing will change until they do that."
 
 	case BadToken:
@@ -28,6 +53,19 @@ func Explain(r Result) (stderr, client string) {
 				"Either the token in the client's config is stale (it was rotated or revoked) or something other than " +
 				"the paired client started this server. Tell the user, verbatim: " + fix + " " +
 				"Do not retry — the answer will be the same."
+
+	case Armed:
+		// Not a refusal, so it does not tell the model to stop. It says what is
+		// true — the door is not shut yet — and how to shut it. A trial nobody
+		// notices is just a weaker default.
+		return "PAIRING NOT YET IN EFFECT: " + r.Detail + ".\n" +
+				"Restart the client that should be driving this server; the first launch that presents the " +
+				"token turns enforcement on for good. Until then any local process can still use this server. " +
+				"To skip the wait, run `cli-agent-mcp pair --enforce-now`.",
+			"This cli-agent-mcp server has been paired, but no launcher has presented the token yet, so it is " +
+				"still serving anyone — including this session. Tell the user plainly: pairing is configured and " +
+				"NOT yet in effect, and it starts working the first time the client they configured launches this " +
+				"server with the token. If that never happens, the token did not reach that client's configuration."
 
 	case ForeignParent:
 		return "refusing to serve: " + r.Detail,
@@ -47,6 +85,8 @@ func StartupLine(stateDir string, r Result) string {
 	case Unpaired:
 		return "NOT PAIRED: any process on this machine can start this server and delegate work to an agent " +
 			"that inherits your environment. Run `cli-agent-mcp pair --install` to close that."
+	case Armed:
+		return "armed, NOT enforcing: paired, but no launcher has presented the token yet"
 	}
 	f, _, err := Load(stateDir)
 	if err != nil {
@@ -68,6 +108,8 @@ func StatusName(s Status) string {
 		return "bad_token"
 	case ForeignParent:
 		return "foreign_parent"
+	case Armed:
+		return "armed"
 	}
 	return "unknown"
 }
