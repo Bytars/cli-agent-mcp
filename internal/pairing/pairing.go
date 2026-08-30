@@ -115,6 +115,20 @@ type File struct {
 	// pairing stopped working.
 	//
 	// Only --unpair clears it, by removing the record.
+	//
+	// The omitempty is inert — encoding/json does not omit a zero struct, so an
+	// unconfirmed record carries "confirmed_at":"0001-01-01T00:00:00Z" rather
+	// than nothing. Harmless, since every reader goes through Confirmed() and
+	// IsZero(), but the tag promises something it does not do and someone will
+	// eventually read the file and wonder. Kept for the day it stops being a
+	// struct; not worth a pointer to fix the cosmetics of a field nobody edits
+	// by hand.
+	//
+	// AN OLDER SERVER READING THIS RECORD DOES NOT KNOW ANY OF IT. It sees a
+	// pairing with tokens and enforces immediately — the lockout the trial
+	// exists to prevent, arriving through a version mismatch. Measured against
+	// the v0.13.0 release binary: it refuses where this build serves. That is
+	// why runMint tells the user to install first and pair afterwards.
 	ConfirmedAt time.Time `json:"confirmed_at,omitempty"`
 }
 

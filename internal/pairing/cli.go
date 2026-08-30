@@ -290,6 +290,13 @@ instead of from a client that stopped working.
 Until then any local process can still use this server. To close the door now
 and skip the check, run ` + "`cli-agent-mcp pair --enforce-now`" + `.
 
+The trial only protects you if the SERVER your client launches also knows about
+it. An older build reads this same record, sees a pairing, and refuses on the
+spot — which is the lockout this exists to prevent, arriving by the back door.
+So install the new binary FIRST, and pair afterwards. Check with:
+
+    <the binary your client launches> --version
+
 Keep this terminal's output out of anything shared — the secret is shown once
 and only its hash is stored.
 
