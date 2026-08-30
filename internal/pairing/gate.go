@@ -27,9 +27,14 @@ func Explain(r Result) (stderr, client string) {
 		// Name the launcher. This process knows who started it, and that is
 		// exactly the fact the user needs: the token belongs in THAT program's
 		// configuration, which may not be the file the installer wrote.
+		// Same hedge as the detail in Verify, and for the same reason: the parent
+		// can be a shim or a shell standing between the client and this process,
+		// so "that is where the token goes" overstates what was observed. This
+		// message is the one the model repeats out loud, which makes it the worse
+		// place of the two to overstate anything.
 		who := "The program that launched it"
 		if r.Launcher != "" {
-			who = "It was launched by " + r.Launcher + ", so the token belongs in that program's configuration; it"
+			who = "It was launched by " + r.Launcher + ", so the token has to reach that program — or whatever it passes its environment down to; it"
 		}
 		// The escape goes in the log too, not only in the message for the model.
 		// In this state the user's client is broken, so the model's relay may
