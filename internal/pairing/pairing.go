@@ -114,6 +114,12 @@ type File struct {
 	// reopen a door shut months ago. Rotating a credential is not evidence that
 	// pairing stopped working.
 	//
+	// TrustedLaunchers authorizes by who starts the server instead of by a
+	// secret. See launcher.go for why that is the better default: the token
+	// protects only as well as it is kept, and on a client with no config file
+	// it ends up somewhere every process of this user can read.
+	TrustedLaunchers []Launcher `json:"trusted_launchers,omitempty"`
+
 	// Only --unpair clears it, by removing the record.
 	//
 	// The omitempty is inert — encoding/json does not omit a zero struct, so an
@@ -184,6 +190,14 @@ const (
 	// It closes at the user's next client restart — which is exactly when they
 	// would otherwise be locked out — and --enforce-now skips it entirely.
 	Armed
+
+	// TrustedLauncher means this server is authorized by WHO launched it rather
+	// than by a secret, and the launching program is on the list. See
+	// launcher.go.
+	TrustedLauncher
+
+	// ForeignLauncher means the same, but the launching program is not on it.
+	ForeignLauncher
 )
 
 // Result reports the check and carries enough detail to tell the user what to
@@ -203,7 +217,21 @@ type Result struct {
 
 // Allowed reports whether the server should expose its real tools.
 func (r Result) Allowed() bool {
-	return r.Status == OK || r.Status == Unpaired || r.Status == Armed
+	return r.Status == OK || r.Status == Unpaired || r.Status == Armed || r.Status == TrustedLauncher
+}
+
+// launcherList names the trusted launchers for a rejection message. Somebody
+// locked out needs to see what the server is comparing against, not just that
+// the comparison failed.
+func launcherList(f *File) string {
+	if f == nil || len(f.TrustedLaunchers) == 0 {
+		return "no program in particular"
+	}
+	out := f.TrustedLaunchers[0].Exe
+	for _, l := range f.TrustedLaunchers[1:] {
+		out += ", " + l.Exe
+	}
+	return out
 }
 
 // Path is where the pairing record lives for a given state directory.
@@ -381,8 +409,80 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 		return Result{Status: BadToken, Detail: err.Error()}, err
 	}
 	if !paired {
-		return Result{Status: Unpaired}, nil
+		// Nothing configured. Rather than serving anyone forever, record who
+		// launched us and answer to that from now on (issue #27, launcher.go).
+		//
+		// The user runs no command and sees no secret; the machinery that used
+		// to be needed here — a token, a config file to put it in, a trial to
+		// confirm it arrived — was guarding a value that in the setup this was
+		// written for is readable by every process of the same user anyway.
+		//
+		// A platform that cannot name the parent falls through to the old
+		// behaviour. Refusing there would deny people their own server on a
+		// system where this layer simply cannot apply, and that trade went the
+		// wrong way once already (see TestUnknownParentDoesNotBlock).
+		if parentExe == "" {
+			return Result{Status: Unpaired}, nil
+		}
+		fresh := &File{Version: fileVersion}
+		fresh.Trust(parentExe, true)
+		if err := Save(stateDir, fresh); err != nil {
+			// Serve anyway. Failing to write the record is not a reason to
+			// withhold a server from the program that just started it — it only
+			// means the same launcher gets trusted again next time.
+			return Result{Status: Unpaired, Launcher: parentExe}, err
+		}
+		return Result{
+			Status:   TrustedLauncher,
+			Launcher: parentExe,
+			Detail:   "first launch: " + parentExe + " is now the program allowed to start this server",
+		}, nil
 	}
+
+	// Authorization by launcher: no secret involved, so none of the token
+	// checks below apply.
+	if f.TrustsLaunchers() {
+		if parentExe == "" {
+			// The list exists but this platform cannot say who launched us, so
+			// the check cannot be made. Serving is the same call as above: the
+			// alternative locks someone out of their own server over a fact the
+			// operating system would not report.
+			return Result{
+				Status: TrustedLauncher,
+				Detail: "this platform cannot name the launching program, so the launcher check was skipped",
+			}, nil
+		}
+		if f.Trusts(parentExe) {
+			return Result{
+				Status:   TrustedLauncher,
+				Launcher: parentExe,
+				Detail:   parentExe + " is a trusted launcher",
+			}, nil
+		}
+		// Inside the learning window a new launcher is adopted rather than
+		// refused, so an install where two programs start the server keeps
+		// working across the upgrade (see learningWindow, and the test that
+		// insisted on it).
+		if f.StillLearning(time.Now().UTC()) {
+			f.Trust(parentExe, true)
+			detail := parentExe + " was added to the trusted launchers: this record is less than a day old and is " +
+				"still learning which programs start this server. After that it refuses anything new"
+			if err := Save(stateDir, f); err != nil {
+				// Serve, and say the record did not stick. Refusing here would
+				// lock out a legitimate second client over a failed write.
+				return Result{Status: TrustedLauncher, Launcher: parentExe, Detail: detail}, err
+			}
+			return Result{Status: TrustedLauncher, Launcher: parentExe, Detail: detail}, nil
+		}
+		return Result{
+			Status:   ForeignLauncher,
+			Launcher: parentExe,
+			Detail: "this server answers to " + launcherList(f) + ", but it was launched by " + parentExe +
+				". If that is your client — it moved, or updated to a new path — run `cli-agent-mcp trust --add` from it, " +
+				"or `cli-agent-mcp trust --reset` to start over",
+		}, nil
+	}
+
 	if len(f.Tokens) == 0 {
 		return Result{
 			Status: NoToken,

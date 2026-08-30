@@ -67,6 +67,18 @@ func Explain(r Result) (stderr, client string) {
 				"NOT yet in effect, and it starts working the first time the client they configured launches this " +
 				"server with the token. If that never happens, the token did not reach that client's configuration."
 
+	case ForeignLauncher:
+		// The recovery here is one command with no secret in it, which is the
+		// whole point of the launcher mode: being locked out is a nuisance
+		// rather than an emergency. Say the command, and say it in the log too —
+		// the person reading it has no working client.
+		return "refusing to serve: " + r.Detail,
+			"This cli-agent-mcp server only answers to the program that set it up, and something else started it, " +
+				"so every tool here is disabled. That is what it looks like when another program on this machine tries " +
+				"to use the server — worth telling the user plainly. If instead they just moved or updated their client, " +
+				"the fix is `cli-agent-mcp trust --add` run from that client, or `cli-agent-mcp trust --reset` to forget " +
+				"the old one. Do not retry — the answer will be the same."
+
 	case ForeignParent:
 		return "refusing to serve: " + r.Detail,
 			"This cli-agent-mcp server holds a valid credential but was started by a program it is not bound to, " +
@@ -87,6 +99,13 @@ func StartupLine(stateDir string, r Result) string {
 			"that inherits your environment. Run `cli-agent-mcp pair --install` to close that."
 	case Armed:
 		return "armed, NOT enforcing: paired, but no launcher has presented the token yet"
+	case TrustedLauncher:
+		if r.Launcher == "" {
+			return "trusting the launching program (this platform cannot name it, so the check was skipped)"
+		}
+		return "authorized: started by " + r.Launcher
+	case ForeignLauncher:
+		return "refusing to serve: " + r.Detail
 	}
 	f, _, err := Load(stateDir)
 	if err != nil {
@@ -110,6 +129,10 @@ func StatusName(s Status) string {
 		return "foreign_parent"
 	case Armed:
 		return "armed"
+	case TrustedLauncher:
+		return "trusted_launcher"
+	case ForeignLauncher:
+		return "foreign_launcher"
 	}
 	return "unknown"
 }
