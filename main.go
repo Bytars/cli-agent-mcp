@@ -107,6 +107,15 @@ func main() {
 			log.SetPrefix("cli-agent-mcp: ")
 			log.SetFlags(0)
 			os.Exit(pairing.Run(os.Args[2:], state.ResolveDir))
+		case "trust":
+			// Decides which program may start this server, without a secret.
+			// Most installs never run it: the server records its launcher on
+			// first start (issue #27). This is for when that fact stops being
+			// true — the client moved, or a second one needs in.
+			log.SetOutput(os.Stderr)
+			log.SetPrefix("cli-agent-mcp: ")
+			log.SetFlags(0)
+			os.Exit(pairing.RunTrust(os.Args[2:], state.ResolveDir))
 		case "--list-agents":
 			// Handled further down, once the registry exists.
 		default:

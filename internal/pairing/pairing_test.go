@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // confirm walks a record through the launch that turns pairing on: a launcher
@@ -30,6 +31,12 @@ func confirm(t *testing.T, dir, secret, launcher string) {
 
 // An install that predates pairing must keep working. Bricking a working setup
 // on upgrade would be a worse outcome than the exposure this feature closes.
+//
+// The verdict changed with issue #27 — a fresh record now records its launcher
+// instead of serving anonymously for ever — but the promise this test exists to
+// hold did not: whatever was working before the upgrade still works after it.
+// So it asserts Allowed(), which is the promise, rather than Unpaired, which
+// was only ever how the promise happened to be kept.
 func TestUnpairedServesAsBefore(t *testing.T) {
 	dir := t.TempDir()
 
@@ -37,11 +44,71 @@ func TestUnpairedServesAsBefore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify on an unpaired dir: %v", err)
 	}
-	if res.Status != Unpaired {
-		t.Fatalf("status = %v, want Unpaired", res.Status)
-	}
 	if !res.Allowed() {
-		t.Fatal("an unpaired server refused to serve; that breaks every existing install on upgrade")
+		t.Fatalf("an unpaired server refused to serve (status %v); that breaks every existing install on upgrade", res.Status)
+	}
+}
+
+// The case the test above caught when #27 first refused everyone after the
+// first launcher: an install where TWO programs start the server. Whoever got
+// there first would have won, and the other would have stopped working on
+// upgrade — precisely the outcome that test was written to prevent.
+func TestDosProgramasQueYaFuncionabanSiguenFuncionando(t *testing.T) {
+	dir := t.TempDir()
+	const cliente = `C:\Tools\claude.exe`
+	const editor = `C:\Tools\algun-editor.exe`
+
+	if r, _ := Verify(dir, "", cliente); !r.Allowed() {
+		t.Fatalf("el primer programa fue rechazado: %v", r.Status)
+	}
+	r, err := Verify(dir, "", editor)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !r.Allowed() {
+		t.Fatalf("el segundo programa que ya usaba este servidor quedó afuera al actualizar (status %v).\n"+
+			"Eso es romper una instalación que funcionaba, que es peor que la exposición que esto cierra.", r.Status)
+	}
+
+	f, _, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !f.Trusts(cliente) || !f.Trusts(editor) {
+		t.Errorf("no quedaron los dos en la lista: %+v", f.TrustedLaunchers)
+	}
+}
+
+// Y su control: pasada la ventana, la lista se cierra. Sin esto, "sigue
+// aprendiendo" sería indistinguible de "nunca aprende", y el mecanismo no
+// protegería de nada.
+func TestPasadaLaVentanaNoSeAdoptaNadieMas(t *testing.T) {
+	dir := t.TempDir()
+	const cliente = `C:\Tools\claude.exe`
+	const intruso = `C:\Temp\algo-raro.exe`
+
+	if r, _ := Verify(dir, "", cliente); r.Status != TrustedLauncher {
+		t.Fatalf("preparación: %v", r.Status)
+	}
+
+	// Envejecer el registro es lo único que hace falta: la ventana se mide
+	// desde la entrada más vieja.
+	f, _, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	f.TrustedLaunchers[0].Recorded = time.Now().UTC().Add(-2 * learningWindow)
+	if err := Save(dir, f); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	r, err := Verify(dir, "", intruso)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if r.Status != ForeignLauncher || r.Allowed() {
+		t.Fatalf("status = %v (allowed=%v) sobre un registro viejo: la ventana no cierra nunca, "+
+			"así que cualquier programa entra siempre", r.Status, r.Allowed())
 	}
 }
 
@@ -564,13 +631,21 @@ func TestElRechazoNombraAlLanzadorYLaSalida(t *testing.T) {
 }
 
 func TestExplainAlwaysSaysWhatToDo(t *testing.T) {
-	for _, st := range []Status{NoToken, BadToken, ForeignParent} {
+	// Every status that refuses, not a subset. ForeignLauncher shipped without
+	// being listed here, which is how a rejection that says nothing gets in: the
+	// list is kept by hand and the compiler does not check it.
+	//
+	// The assertion is that the message names A way out, not one particular one.
+	// The launcher statuses are escaped with `trust`, not `pair`, and demanding
+	// the word "pair" from them would only push their message back toward the
+	// mechanism the user is not on.
+	for _, st := range []Status{NoToken, BadToken, ForeignParent, ForeignLauncher, EmptyRecord} {
 		stderr, client := Explain(Result{Status: st, Label: "claude-desktop"})
 		if stderr == "" || client == "" {
 			t.Errorf("%v: stderr=%q client=%q; a silent rejection is indistinguishable from a crash", st, stderr, client)
 		}
-		if !strings.Contains(client, "pair") {
-			t.Errorf("%v: the client-facing message never mentions pairing: %q", st, client)
+		if !strings.Contains(client, "pair") && !strings.Contains(client, "trust") {
+			t.Errorf("%v: the client-facing message names no way out: %q", st, client)
 		}
 	}
 	if stderr, client := Explain(Result{Status: OK}); stderr != "" || client != "" {

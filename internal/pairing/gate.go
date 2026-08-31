@@ -67,6 +67,31 @@ func Explain(r Result) (stderr, client string) {
 				"NOT yet in effect, and it starts working the first time the client they configured launches this " +
 				"server with the token. If that never happens, the token did not reach that client's configuration."
 
+	case ForeignLauncher:
+		// The recovery here is one command with no secret in it, which is the
+		// whole point of the launcher mode: being locked out is a nuisance
+		// rather than an emergency. Say the command, and say it in the log too —
+		// the person reading it has no working client.
+		return "refusing to serve: " + r.Detail,
+			"This cli-agent-mcp server only answers to the program that set it up, and something else started it, " +
+				"so every tool here is disabled. That is what it looks like when another program on this machine tries " +
+				"to use the server — worth telling the user plainly. If instead they just moved or updated their client, " +
+				"the fix is `cli-agent-mcp trust --add` run from that client, or `cli-agent-mcp trust --reset` to forget " +
+				"the old one. Do not retry — the answer will be the same."
+
+	case EmptyRecord:
+		// Name BOTH ways out. An emptied launcher list and a revoked last token
+		// leave the same record behind, so this message cannot know which
+		// mechanism the user was on — and guessing "token" is how somebody who
+		// never held one gets told to go put a secret somewhere.
+		const bothWaysOut = "Run `cli-agent-mcp trust --reset` to go back to trusting whichever program starts " +
+			"this server, or `cli-agent-mcp pair --install` to authorize with a token instead."
+		return "refusing to serve: " + r.Detail + "\n" + bothWaysOut,
+			"This cli-agent-mcp server has a pairing record with nothing in it — no token and no trusted launcher — " +
+				"so nothing can authenticate and every tool here is disabled. That is what a revoked last token or a " +
+				"removed last launcher leaves behind. Tell the user, verbatim: " + bothWaysOut + " " +
+				"Do not retry — the answer will be the same."
+
 	case ForeignParent:
 		return "refusing to serve: " + r.Detail,
 			"This cli-agent-mcp server holds a valid credential but was started by a program it is not bound to, " +
@@ -87,6 +112,15 @@ func StartupLine(stateDir string, r Result) string {
 			"that inherits your environment. Run `cli-agent-mcp pair --install` to close that."
 	case Armed:
 		return "armed, NOT enforcing: paired, but no launcher has presented the token yet"
+	case TrustedLauncher:
+		if r.Launcher == "" {
+			return "trusting the launching program (this platform cannot name it, so the check was skipped)"
+		}
+		return "authorized: started by " + r.Launcher
+	case ForeignLauncher:
+		return "refusing to serve: " + r.Detail
+	case EmptyRecord:
+		return "locked: the record holds neither a token nor a trusted launcher"
 	}
 	f, _, err := Load(stateDir)
 	if err != nil {
@@ -110,6 +144,12 @@ func StatusName(s Status) string {
 		return "foreign_parent"
 	case Armed:
 		return "armed"
+	case TrustedLauncher:
+		return "trusted_launcher"
+	case ForeignLauncher:
+		return "foreign_launcher"
+	case EmptyRecord:
+		return "empty_record"
 	}
 	return "unknown"
 }
