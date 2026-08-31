@@ -79,6 +79,19 @@ func Explain(r Result) (stderr, client string) {
 				"the fix is `cli-agent-mcp trust --add` run from that client, or `cli-agent-mcp trust --reset` to forget " +
 				"the old one. Do not retry — the answer will be the same."
 
+	case EmptyRecord:
+		// Name BOTH ways out. An emptied launcher list and a revoked last token
+		// leave the same record behind, so this message cannot know which
+		// mechanism the user was on — and guessing "token" is how somebody who
+		// never held one gets told to go put a secret somewhere.
+		const bothWaysOut = "Run `cli-agent-mcp trust --reset` to go back to trusting whichever program starts " +
+			"this server, or `cli-agent-mcp pair --install` to authorize with a token instead."
+		return "refusing to serve: " + r.Detail + "\n" + bothWaysOut,
+			"This cli-agent-mcp server has a pairing record with nothing in it — no token and no trusted launcher — " +
+				"so nothing can authenticate and every tool here is disabled. That is what a revoked last token or a " +
+				"removed last launcher leaves behind. Tell the user, verbatim: " + bothWaysOut + " " +
+				"Do not retry — the answer will be the same."
+
 	case ForeignParent:
 		return "refusing to serve: " + r.Detail,
 			"This cli-agent-mcp server holds a valid credential but was started by a program it is not bound to, " +
@@ -106,6 +119,8 @@ func StartupLine(stateDir string, r Result) string {
 		return "authorized: started by " + r.Launcher
 	case ForeignLauncher:
 		return "refusing to serve: " + r.Detail
+	case EmptyRecord:
+		return "locked: the record holds neither a token nor a trusted launcher"
 	}
 	f, _, err := Load(stateDir)
 	if err != nil {
@@ -133,6 +148,8 @@ func StatusName(s Status) string {
 		return "trusted_launcher"
 	case ForeignLauncher:
 		return "foreign_launcher"
+	case EmptyRecord:
+		return "empty_record"
 	}
 	return "unknown"
 }

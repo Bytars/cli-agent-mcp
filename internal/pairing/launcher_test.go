@@ -183,3 +183,66 @@ func TestAgregarYQuitarLanzadores(t *testing.T) {
 		t.Error("Untrust dijo haber quitado algo que no estaba")
 	}
 }
+
+// The learning window is the one thing about a launcher record that changes on
+// its own, and `trust --status` now reports it. So it needs an end somebody can
+// be told about, and that end has to actually arrive.
+func TestTheLearningWindowHasADeadlineAndItArrives(t *testing.T) {
+	f := &File{Version: fileVersion}
+	if !f.Trust("/opt/cliente", true) {
+		t.Fatal("Trust recorded nothing")
+	}
+	recorded := f.TrustedLaunchers[0].Recorded
+
+	closes, learning := f.LearningUntil(recorded)
+	if !learning {
+		t.Fatal("a record written just now is already done learning")
+	}
+	if got := closes.Sub(recorded); got != learningWindow {
+		t.Fatalf("window = %v, want %v", got, learningWindow)
+	}
+	if _, learning := f.LearningUntil(closes); learning {
+		t.Fatal("the window is still open at the very moment it should shut")
+	}
+}
+
+// A launcher-mode user walks into the empty record one way: trusted on first
+// launch, then that single launcher removed. The refusal they get has to name
+// the way back for the mechanism they were actually using.
+//
+// It answered with NoToken before, whose message tells them to run
+// `pair --install` and put a token where their client will read it — a secret
+// they never held, for a mechanism they never used. That is the mistake of
+// issue #25 wearing different clothes: the remedy points at the wrong thing.
+func TestAnEmptyRecordDoesNotSendYouToFixATokenYouNeverHad(t *testing.T) {
+	dir := t.TempDir()
+	const exe = "/opt/cliente"
+
+	if res, err := Verify(dir, "", exe); err != nil || res.Status != TrustedLauncher {
+		t.Fatalf("first launch: status=%v err=%v", res.Status, err)
+	}
+	f, _, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !f.Untrust(exe) {
+		t.Fatal("Untrust removed nothing")
+	}
+	if err := Save(dir, f); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	res, _ := Verify(dir, "", exe)
+	if res.Allowed() {
+		t.Fatalf("status = %v: a record that trusts nothing served anyway", res.Status)
+	}
+	if res.Status != EmptyRecord {
+		t.Fatalf("status = %v, want EmptyRecord", res.Status)
+	}
+	stderr, client := Explain(res)
+	for _, msg := range []string{stderr, client} {
+		if !strings.Contains(msg, "trust --reset") {
+			t.Errorf("the way back is missing: %q", msg)
+		}
+	}
+}

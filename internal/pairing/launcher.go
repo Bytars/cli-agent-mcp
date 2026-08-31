@@ -93,11 +93,16 @@ func (f *File) TrustsLaunchers() bool {
 	return f != nil && len(f.Tokens) == 0 && len(f.TrustedLaunchers) > 0
 }
 
-// StillLearning reports whether this record is inside the window where new
-// launchers are adopted rather than refused.
-func (f *File) StillLearning(now time.Time) bool {
+// LearningUntil reports when this record stops adopting new launchers, and
+// whether that moment is still ahead.
+//
+// It hands back the deadline rather than a bare yes/no because `trust --status`
+// has to show it. "Trusted" and "closed" are two different states, and a status
+// that reports the first as though it were the second is the same failure
+// `pair --status` had between "paired" and "enforcing" (issue #25).
+func (f *File) LearningUntil(now time.Time) (closes time.Time, learning bool) {
 	if f == nil || len(f.TrustedLaunchers) == 0 {
-		return false
+		return time.Time{}, false
 	}
 	// Measured from the oldest entry: the window belongs to the record, not to
 	// each launcher. Otherwise adding one every 23 hours would keep it open for
@@ -108,7 +113,15 @@ func (f *File) StillLearning(now time.Time) bool {
 			oldest = l.Recorded
 		}
 	}
-	return now.Sub(oldest) < learningWindow
+	closes = oldest.Add(learningWindow)
+	return closes, now.Before(closes)
+}
+
+// StillLearning reports whether this record is inside the window where new
+// launchers are adopted rather than refused.
+func (f *File) StillLearning(now time.Time) bool {
+	_, learning := f.LearningUntil(now)
+	return learning
 }
 
 // Trusts reports whether exe is on the list.

@@ -106,7 +106,20 @@ func trustStatus(dir string) int {
 		fmt.Println("Run `cli-agent-mcp trust --reset` to start over.")
 		return 0
 	}
-	fmt.Printf("status: answers to %d program(s)\n\n", len(f.TrustedLaunchers))
+	// While the window is open this record still adopts whatever starts the
+	// server, so "answers to these programs" is only half the truth. Printing
+	// the half that sounds safe is how somebody checking whether they are
+	// protected concludes they are — the same thing `pair --status` used to do
+	// with "paired" and "enforcing".
+	if closes, learning := f.LearningUntil(time.Now().UTC()); learning {
+		fmt.Printf("status: answers to %d program(s), and STILL LEARNING until %s\n\n",
+			len(f.TrustedLaunchers), closes.Local().Format(time.RFC3339))
+		fmt.Print("Anything that starts this server before then is trusted too, permanently. That\n" +
+			"is deliberate — it lets a second client in on the first day instead of breaking\n" +
+			"it — but until that time passes, this list is not the whole answer.\n\n")
+	} else {
+		fmt.Printf("status: answers to %d program(s), and the list is CLOSED\n\n", len(f.TrustedLaunchers))
+	}
 	for _, l := range f.TrustedLaunchers {
 		how := "added by hand"
 		if l.FirstUse {

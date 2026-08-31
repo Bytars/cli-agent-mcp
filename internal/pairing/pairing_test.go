@@ -631,13 +631,21 @@ func TestElRechazoNombraAlLanzadorYLaSalida(t *testing.T) {
 }
 
 func TestExplainAlwaysSaysWhatToDo(t *testing.T) {
-	for _, st := range []Status{NoToken, BadToken, ForeignParent} {
+	// Every status that refuses, not a subset. ForeignLauncher shipped without
+	// being listed here, which is how a rejection that says nothing gets in: the
+	// list is kept by hand and the compiler does not check it.
+	//
+	// The assertion is that the message names A way out, not one particular one.
+	// The launcher statuses are escaped with `trust`, not `pair`, and demanding
+	// the word "pair" from them would only push their message back toward the
+	// mechanism the user is not on.
+	for _, st := range []Status{NoToken, BadToken, ForeignParent, ForeignLauncher, EmptyRecord} {
 		stderr, client := Explain(Result{Status: st, Label: "claude-desktop"})
 		if stderr == "" || client == "" {
 			t.Errorf("%v: stderr=%q client=%q; a silent rejection is indistinguishable from a crash", st, stderr, client)
 		}
-		if !strings.Contains(client, "pair") {
-			t.Errorf("%v: the client-facing message never mentions pairing: %q", st, client)
+		if !strings.Contains(client, "pair") && !strings.Contains(client, "trust") {
+			t.Errorf("%v: the client-facing message names no way out: %q", st, client)
 		}
 	}
 	if stderr, client := Explain(Result{Status: OK}); stderr != "" || client != "" {

@@ -114,12 +114,6 @@ type File struct {
 	// reopen a door shut months ago. Rotating a credential is not evidence that
 	// pairing stopped working.
 	//
-	// TrustedLaunchers authorizes by who starts the server instead of by a
-	// secret. See launcher.go for why that is the better default: the token
-	// protects only as well as it is kept, and on a client with no config file
-	// it ends up somewhere every process of this user can read.
-	TrustedLaunchers []Launcher `json:"trusted_launchers,omitempty"`
-
 	// Only --unpair clears it, by removing the record.
 	//
 	// The omitempty is inert — encoding/json does not omit a zero struct, so an
@@ -136,6 +130,12 @@ type File struct {
 	// the v0.13.0 release binary: it refuses where this build serves. That is
 	// why runMint tells the user to install first and pair afterwards.
 	ConfirmedAt time.Time `json:"confirmed_at,omitempty"`
+
+	// TrustedLaunchers authorizes by who starts the server instead of by a
+	// secret. See launcher.go for why that is the better default: the token
+	// protects only as well as it is kept, and on a client with no config file
+	// it ends up somewhere every process of this user can read.
+	TrustedLaunchers []Launcher `json:"trusted_launchers,omitempty"`
 }
 
 // Confirmed reports whether a launcher has ever presented a valid token here.
@@ -198,6 +198,14 @@ const (
 
 	// ForeignLauncher means the same, but the launching program is not on it.
 	ForeignLauncher
+
+	// EmptyRecord means the record holds neither a token nor a trusted
+	// launcher, so nothing can authenticate. Revoking the last token and
+	// removing the last launcher both land here, and the server cannot tell
+	// which — which is why this is its own status: NoToken's message names only
+	// the token way out, and sending somebody who never held a token to go fix
+	// one is the mistake of issue #25 in a new place.
+	EmptyRecord
 )
 
 // Result reports the check and carries enough detail to tell the user what to
@@ -485,8 +493,8 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 
 	if len(f.Tokens) == 0 {
 		return Result{
-			Status: NoToken,
-			Detail: "the pairing record exists but holds no tokens, so nothing can authenticate; run `cli-agent-mcp pair` to issue one",
+			Status: EmptyRecord,
+			Detail: "the pairing record holds neither a token nor a trusted launcher, so nothing can authenticate",
 		}, nil
 	}
 
