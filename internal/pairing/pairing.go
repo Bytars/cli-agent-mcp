@@ -46,7 +46,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -221,6 +220,27 @@ type Result struct {
 	// program's configuration, and the installer may well have written it
 	// somewhere else entirely (issue #25).
 	Launcher string
+
+	// StateDir is the directory this verdict was read from, carried so every
+	// rescue instruction can name it.
+	//
+	// WHY A VERDICT HAS TO REPORT WHERE IT CAME FROM
+	// Claude Desktop ships as an MSIX package, and MSIX virtualizes %APPDATA%.
+	// The server reads
+	//
+	//	%LOCALAPPDATA%\Packages\Claude_…\LocalCache\Roaming\cli-agent-mcp\
+	//
+	// while `pair` run from a terminal writes to %APPDATA%\cli-agent-mcp\.
+	// **They are never the same file.** On 1-sep that cost four consecutive
+	// rescue attempts that changed nothing: `pair --status` reported NOT PAIRED
+	// while the server went on refusing, because each was looking at its own
+	// side of a mirror neither knew about (issue #29).
+	//
+	// No amount of agreeing on an environment variable fixes it — the two
+	// processes see different values for the same variable. The only thing that
+	// does is for the side that knows to say so, and for the instruction to
+	// carry the answer instead of asking the reader to derive it.
+	StateDir string
 }
 
 // Allowed reports whether the server should expose its real tools.
@@ -411,7 +431,20 @@ func Unbind(stateDir, label string) (bool, error) {
 // this layer is here to narrow what a stolen secret is worth, and failing shut
 // on a platform where the lookup is unavailable would deny the legitimate user
 // their own server for no gain in safety.
+// Verify decides whether this launch may drive the server, and stamps every
+// verdict with the directory it was read from.
+//
+// The stamping is a wrapper rather than eighteen edits: every path out of
+// verify has to carry it, and a return added later would otherwise silently
+// come back with an empty StateDir — which is exactly the kind of instruction
+// that sent someone to fix the wrong file for a day.
 func Verify(stateDir, secret, parentExe string) (Result, error) {
+	r, err := verify(stateDir, secret, parentExe)
+	r.StateDir = stateDir
+	return r, err
+}
+
+func verify(stateDir, secret, parentExe string) (Result, error) {
 	f, paired, err := Load(stateDir)
 	if err != nil {
 		return Result{Status: BadToken, Detail: err.Error()}, err
@@ -596,9 +629,16 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 
 // sameExe compares two executable paths the way the host filesystem would.
 func sameExe(a, b string) bool {
-	a, b = filepath.Clean(a), filepath.Clean(b)
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(a, b)
-	}
-	return a == b
+	// By identity, not by path. Comparing paths is what let a background update
+	// of the client lock the user out of their own server: an MSIX executable
+	// carries its version in its path, so `Claude_1.40609.0.0_...` became
+	// `Claude_1.40609.1.0_...` and the binding stopped matching (issue #29).
+	//
+	// The three callers — Trusts, Untrust and the ForeignParent check — all go
+	// through here, so this one line is the whole fix.
+	//
+	// Deliberately still takes paths: records written before this change hold
+	// paths, and deriving the identity on read keeps them working without a
+	// migration.
+	return IdentityOf(a).Matches(IdentityOf(b))
 }
