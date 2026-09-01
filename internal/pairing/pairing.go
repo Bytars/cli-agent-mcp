@@ -46,7 +46,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -596,9 +595,16 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 
 // sameExe compares two executable paths the way the host filesystem would.
 func sameExe(a, b string) bool {
-	a, b = filepath.Clean(a), filepath.Clean(b)
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(a, b)
-	}
-	return a == b
+	// By identity, not by path. Comparing paths is what let a background update
+	// of the client lock the user out of their own server: an MSIX executable
+	// carries its version in its path, so `Claude_1.40609.0.0_...` became
+	// `Claude_1.40609.1.0_...` and the binding stopped matching (issue #29).
+	//
+	// The three callers — Trusts, Untrust and the ForeignParent check — all go
+	// through here, so this one line is the whole fix.
+	//
+	// Deliberately still takes paths: records written before this change hold
+	// paths, and deriving the identity on read keeps them working without a
+	// migration.
+	return IdentityOf(a).Matches(IdentityOf(b))
 }
