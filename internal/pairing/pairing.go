@@ -20,19 +20,41 @@
 // and by default may edit files. Nothing distinguishes the MCP client the user
 // configured from a rogue npm postinstall script.
 //
-// Pairing closes that. A secret is minted once, stored here as a hash, and
-// handed to the client through its own config; a launcher that cannot present
-// it gets a server that refuses to do anything.
+// Pairing narrows that. The server records which program is allowed to launch
+// it, and answers to that one; a token may also be minted, stored here as a
+// hash, and handed to the client through its own config.
 //
-// # The limit, stated plainly
+// # What this is, stated at the size it actually is
 //
-// The secret lives in the client's config file and in this process's
-// environment, both readable by anything running as the same user. An attacker
-// who already has that read access takes the token and is indistinguishable
-// from the real client. Pairing raises the bar — it stops code that can execute
-// but not rummage through the user's profile — it is not a wall against a
-// same-user attacker. Parent binding (see parent.go) is the second layer that
-// narrows what a stolen token is worth.
+// It is a safety interlock with an alarm. It is NOT a security boundary against
+// an attacker running as this user, and it cannot be made into one, because the
+// state it depends on is a file that attacker can write.
+//
+// That is measurable, not a caveat. Given a paired record, a process running as
+// this user can DELETE it — and deleting it gets that process served, and
+// recorded as the trusted launcher. Whatever a token or a binding says, this is
+// the shorter path, and nothing in this package closes it. The secret makes it
+// no harder: it lives in the client's config and in this process's environment,
+// both readable by the same attacker.
+//
+// So what is it worth? It stops what is careless rather than determined: code
+// that executes without looking around, a second client nobody meant to
+// authorize, a stray script. And it makes the determined case loud — a refusal
+// in the log, an audit entry naming the launcher, a rescue that leaves a record.
+// That is a real gain, and it is smaller than "a server that refuses to do
+// anything".
+//
+// The distinction earns its place in this comment because designing against the
+// larger promise is how this package got six lockouts in two days (issue #29).
+// Every one of them came from treating a mechanism this porous as though it
+// were worth locking the user out to defend. It is not. Hence the rule the rest
+// of this package follows: THE MECHANISM MUST NOT BE ABLE TO LOCK THE USER OUT.
+// If in doubt, serve and shout.
+//
+// A real boundary would have to come from the operating system — a separate
+// account, or an AppContainer — so that the attacker cannot write this file in
+// the first place. That is a different project, and naming it here is meant to
+// keep this one from being redesigned every quarter in the hope of reaching it.
 package pairing
 
 import (
@@ -135,6 +157,16 @@ type File struct {
 	// protects only as well as it is kept, and on a client with no config file
 	// it ends up somewhere every process of this user can read.
 	TrustedLaunchers []Launcher `json:"trusted_launchers,omitempty"`
+
+	// AnnouncedLaunchers are the identities that have already been warned they
+	// will be refused, and so may now be refused. See announce.go: nothing is
+	// ever blocked here without an earlier start having said it would be.
+	//
+	// A record written before this field existed carries none, which is exactly
+	// the right migration: every launcher it has ever refused gets its warning
+	// once, on the next start, instead of being blocked on the strength of a
+	// notice that was never given.
+	AnnouncedLaunchers []AnnouncedLauncher `json:"announced_launchers,omitempty"`
 }
 
 // Confirmed reports whether a launcher has ever presented a valid token here.
@@ -198,6 +230,23 @@ const (
 	// ForeignLauncher means the same, but the launching program is not on it.
 	ForeignLauncher
 
+	// UnreadableRecord means the pairing file could not be understood — corrupt
+	// JSON, or a format version this build does not know. It SERVES, loudly.
+	//
+	// Refusing here looked like the careful choice and is the opposite, measured
+	// against the binary. This file is writable by anything running as this
+	// user, and a process that can corrupt it can also DELETE it — and deleting
+	// it gets that process served, and recorded as the trusted launcher. So the
+	// refusal never stopped the attacker, who has a better move available; all
+	// it bought was a one-line way to leave the user with no MCP at all, either
+	// deliberately (write a format version this build cannot know) or by
+	// accident: three bytes of UTF-8 BOM, which PowerShell's Out-File writes by
+	// default, are enough.
+	//
+	// Issue #29, after six lockouts in two days: the mechanism must not be able
+	// to lock the user out. If in doubt, serve and shout.
+	UnreadableRecord
+
 	// EmptyRecord means the record holds neither a token nor a trusted
 	// launcher, so nothing can authenticate. Revoking the last token and
 	// removing the last launcher both land here, and the server cannot tell
@@ -205,6 +254,18 @@ const (
 	// the token way out, and sending somebody who never held a token to go fix
 	// one is the mistake of issue #25 in a new place.
 	EmptyRecord
+
+	// Announced is the last start before a refusal: this launcher would be
+	// turned away — it is foreign to the trusted list, or bound to a different
+	// program — and is served anyway, once, with a warning that says the next
+	// one will not be. See announce.go for why no refusal is allowed to arrive
+	// unannounced (issue #29, point 4).
+	//
+	// It is served, so Allowed() says yes. What it changes is the conversation:
+	// the model gets the warning as its instructions instead of the usual ones,
+	// the same way Armed does, because a warning the user never sees is not a
+	// warning.
+	Announced
 )
 
 // Result reports the check and carries enough detail to tell the user what to
@@ -245,7 +306,9 @@ type Result struct {
 
 // Allowed reports whether the server should expose its real tools.
 func (r Result) Allowed() bool {
-	return r.Status == OK || r.Status == Unpaired || r.Status == Armed || r.Status == TrustedLauncher
+	return r.Status == OK || r.Status == Unpaired || r.Status == Armed ||
+		r.Status == TrustedLauncher || r.Status == Announced ||
+		r.Status == UnreadableRecord
 }
 
 // launcherList names the trusted launchers for a rejection message. Somebody
@@ -447,7 +510,11 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 func verify(stateDir, secret, parentExe string) (Result, error) {
 	f, paired, err := Load(stateDir)
 	if err != nil {
-		return Result{Status: BadToken, Detail: err.Error()}, err
+		// Serve. The error still travels back so the caller logs it, and the
+		// record is deliberately left untouched: whoever repairs the file gets
+		// their pairing back exactly as they wrote it. Rewriting it from here
+		// would turn one bad byte into a destroyed configuration.
+		return Result{Status: UnreadableRecord, Detail: err.Error(), Launcher: parentExe}, err
 	}
 	if !paired {
 		// Nothing configured. Rather than serving anyone forever, record who
@@ -515,11 +582,40 @@ func verify(stateDir, secret, parentExe string) (Result, error) {
 			}
 			return Result{Status: TrustedLauncher, Launcher: parentExe, Detail: detail}, nil
 		}
+		// Nothing is refused that was not announced first (issue #29, point 4).
+		// The first time an unknown launcher appears it is served and marked;
+		// only the start after that is turned away. A block with no warning
+		// before it reads from inside a client as the software being broken,
+		// which is how a background update of the client cost a working day of
+		// wrong diagnoses.
+		id := IdentityOf(parentExe)
+		if !f.WasAnnounced(id) {
+			f.Announce(id, StatusName(ForeignLauncher))
+			res := Result{
+				Status:   Announced,
+				Launcher: parentExe,
+				Detail: "this server answers to " + launcherList(f) + ", but it was launched by " + parentExe +
+					". It is being served THIS ONCE; the next start by " + id.String() + " will be refused. " +
+					"If that is your client — it moved, or updated to a new path — run `cli-agent-mcp trust --add` from it now, " +
+					"or `cli-agent-mcp trust --reset` to start over",
+			}
+			if err := Save(stateDir, f); err != nil {
+				// Serve, and hand the write failure back for the caller to log.
+				// A failed write must never turn into a refusal — the same
+				// discipline the token binding has kept since it was written.
+				// The cost of losing it is that this launcher is warned a
+				// second time instead of being refused, which errs towards the
+				// user keeping a working client.
+				return res, err
+			}
+			return res, nil
+		}
 		return Result{
 			Status:   ForeignLauncher,
 			Launcher: parentExe,
 			Detail: "this server answers to " + launcherList(f) + ", but it was launched by " + parentExe +
-				". If that is your client — it moved, or updated to a new path — run `cli-agent-mcp trust --add` from it, " +
+				". An earlier start already warned that this one would be refused. " +
+				"If that is your client — it moved, or updated to a new path — run `cli-agent-mcp trust --add` from it, " +
 				"or `cli-agent-mcp trust --reset` to start over",
 		}, nil
 	}
@@ -598,12 +694,42 @@ func verify(stateDir, secret, parentExe string) (Result, error) {
 		// Trust on first use: whoever launched the server the first time the
 		// token worked is what the token means from now on.
 		tok.Parent = &Parent{Exe: parentExe, Recorded: time.Now().UTC()}
+		// Binding retires any warning standing against this launcher: the mark
+		// asks "may this program start the server", and the binding has just
+		// answered yes. Left behind, it would refuse this same client without
+		// warning the first time an `--unbind` sent it back around here.
+		f.ForgetAnnouncement(IdentityOf(parentExe))
 	case !sameExe(tok.Parent.Exe, parentExe):
+		// Same rule as the launcher path above, and for the same incident: the
+		// binding broke because the client updated itself, and the user's first
+		// notice was a server with no tools in it. Warn on this start, refuse
+		// on the next.
+		id := IdentityOf(parentExe)
+		if !f.WasAnnounced(id) {
+			f.Announce(id, StatusName(ForeignParent))
+			res := Result{
+				Status:   Announced,
+				Label:    tok.Label,
+				Launcher: parentExe,
+				Detail: fmt.Sprintf(
+					"token %q is bound to %s but this server was launched by %s. "+
+						"It is being served THIS ONCE; the next start by %s will be refused. "+
+						"If you moved or reinstalled that client, run `cli-agent-mcp pair --unbind %s` now and start it again.",
+					tok.Label, tok.Parent.Exe, parentExe, id.String(), tok.Label),
+			}
+			// Serve on a failed write, as everywhere else here. Losing the mark
+			// costs this launcher nothing but a second warning.
+			if err := Save(stateDir, f); err != nil {
+				return res, err
+			}
+			return res, nil
+		}
 		return Result{
 			Status: ForeignParent,
 			Label:  tok.Label,
 			Detail: fmt.Sprintf(
-				"token %q is bound to %s but this server was launched by %s. "+
+				"token %q is bound to %s but this server was launched by %s, and an earlier start already warned "+
+					"that this one would be refused. "+
 					"If you moved or reinstalled that client, run `cli-agent-mcp pair --unbind %s` and start it again.",
 				tok.Label, tok.Parent.Exe, parentExe, tok.Label),
 		}, nil

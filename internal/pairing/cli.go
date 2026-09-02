@@ -104,6 +104,12 @@ func runStatus(dir string) int {
 		return 1
 	}
 	fmt.Printf("record: %s\n", Path(dir))
+	// Before the verdict, not after: "NOT PAIRED" read on its own is what sent
+	// four rescue attempts at the wrong file, and a caveat printed under the
+	// answer arrives after the reader has already believed it (issue #29).
+	if w := virtualizedRecordWarning(dir); w != "" {
+		fmt.Printf("\n%s", w)
+	}
 	if !paired {
 		fmt.Print(`status: NOT PAIRED
 
@@ -111,6 +117,16 @@ Any process on this machine can start this server and delegate work to a coding
 agent that inherits your environment. Run `)
 		fmt.Print("`cli-agent-mcp pair --install`")
 		fmt.Print(" to close that.\n")
+		return 0
+	}
+	// A launcher record answers this question with a different mechanism, and
+	// calling it dead is simply false: measured on the binary, the server logs
+	// `authorized: started by ...` for the very record this line reported as unable
+	// to authenticate anything. trustStatus already redirects the mirror case;
+	// this is the missing half.
+	if f.TrustsLaunchers() {
+		fmt.Printf("status: this record authorizes by LAUNCHER, not by token (%d program(s) trusted).\n", len(f.TrustedLaunchers))
+		fmt.Println("Run `cli-agent-mcp trust --status` to see it.")
 		return 0
 	}
 	if len(f.Tokens) == 0 {

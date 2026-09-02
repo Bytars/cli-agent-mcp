@@ -118,6 +118,50 @@ func Explain(r Result) (stderr, client string) {
 				"the fix is " + cmd(r, "trust --add") + " run from that client, or " + cmd(r, "trust --reset") + " to forget " +
 				"the old one. " + exactamente(r) + "Do not retry — the answer will be the same."
 
+	case Announced:
+		// Not a refusal: the last start before one. It has to read as a
+		// deadline rather than an error — the tools all work — and it has to
+		// carry the command that cancels the deadline, because the whole point
+		// of issue #29's point 4 is that nobody is locked out without having
+		// been told first, and "told" means told something actionable.
+		//
+		// The command differs by mechanism, and picking the wrong one would be
+		// issue #25 in new clothes: `trust --add` on a record that holds tokens
+		// exits with an error (see trustAdd), so pointing a token user there
+		// hands them a rescue that cannot work. A Label means a token matched,
+		// which is the only way this verdict is reached from the binding.
+		permanent := cmd(r, "trust --add") + " run from that program"
+		if r.Label != "" {
+			permanent = cmd(r, "pair --unbind "+r.Label) + ", then restart that program"
+		}
+		who := "The program that started it"
+		if r.Launcher != "" {
+			who = r.Launcher
+		}
+		return "SERVING THIS ONCE, then refusing: " + r.Detail + "\n" +
+				"The next start by this program will be REFUSED and every tool disabled. If it is legitimate, " +
+				"make it permanent now: " + permanent + ".",
+			"This cli-agent-mcp server is not bound to the program that just started it: " + who +
+				" is not a launcher this server answers to. It is being served THIS ONCE, and the next start from it " +
+				"will be refused with every tool disabled. Tell the user now, while there is still time to act: if this " +
+				"is their own client — it may have moved or updated itself in the background, which is exactly what " +
+				"happened before — the fix is " + permanent + ". " + exactamente(r) +
+				"If it is not their client, then something else on this machine is starting this server, and that is " +
+				"worth saying plainly too. The tools do work in this session; use them normally."
+
+	case UnreadableRecord:
+		// Not a refusal, and the wording must not sound like one. It cannot be
+		// quiet either: whatever protection this record described is not in
+		// effect, and the user is the only one who can put it back.
+		return "SERVING WITH NO PAIRING IN EFFECT: " + r.Detail + "\n" +
+				"The record is being ignored, so any local process can start this server right now. Rewrite it " +
+				"with `cli-agent-mcp pair --install`, or `cli-agent-mcp trust --reset` to go back to trusting whichever " +
+				"program starts it.",
+			"This cli-agent-mcp server's pairing record cannot be read, so it is running with NO pairing in effect: " +
+				"every tool here is available to this session and to anything else on this machine. Nothing is " +
+				"broken and you should keep working, but tell the user plainly that pairing is not protecting them " +
+				"right now, and that the fix is `cli-agent-mcp pair --install` or `cli-agent-mcp trust --reset`."
+
 	case EmptyRecord:
 		// Name BOTH ways out. An emptied launcher list and a revoked last token
 		// leave the same record behind, so this message cannot know which
@@ -167,8 +211,16 @@ func startupVerdict(stateDir string, r Result) string {
 		return "authorized: started by " + r.Launcher
 	case ForeignLauncher:
 		return "refusing to serve: " + r.Detail
+	case Announced:
+		// Deliberately not "refusing": this start IS served. A startup line
+		// that cried refusal here would teach the reader to ignore the one that
+		// means it, and the whole value of the warning is that the next line
+		// like it is real.
+		return "SERVING THIS ONCE, then refusing: " + r.Detail
 	case EmptyRecord:
 		return "locked: the record holds neither a token nor a trusted launcher"
+	case UnreadableRecord:
+		return "SERVING, pairing record ignored: " + r.Detail
 	}
 	f, _, err := Load(stateDir)
 	if err != nil {
@@ -198,6 +250,10 @@ func StatusName(s Status) string {
 		return "foreign_launcher"
 	case EmptyRecord:
 		return "empty_record"
+	case UnreadableRecord:
+		return "unreadable_record"
+	case Announced:
+		return "announced"
 	}
 	return "unknown"
 }

@@ -102,10 +102,11 @@ func TestPasadaLaVentanaNoSeAdoptaNadieMas(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	r, err := Verify(dir, "", intruso)
-	if err != nil {
-		t.Fatalf("Verify: %v", err)
-	}
+	// El rechazo cae en el segundo arranque: al primero se lo avisa y se lo
+	// sirve (announce.go). Lo que este test mide sigue siendo la ventana —que
+	// el intruso termine afuera— y trasElAviso afirma la otra mitad, que se lo
+	// dijimos antes.
+	r := trasElAviso(t, dir, "", intruso)
 	if r.Status != ForeignLauncher || r.Allowed() {
 		t.Fatalf("status = %v (allowed=%v) sobre un registro viejo: la ventana no cierra nunca, "+
 			"así que cualquier programa entra siempre", r.Status, r.Allowed())
@@ -254,8 +255,12 @@ func TestBindingRejectsAnotherLauncher(t *testing.T) {
 	if res, _ := Verify(dir, secret, "/opt/Claude/claude"); res.Status != OK {
 		t.Fatalf("first use: %v", res.Status)
 	}
-	// Same secret, different program.
-	res, _ := Verify(dir, secret, "/tmp/definitely-not-claude")
+	// Same secret, different program. The rejection lands on that program's
+	// SECOND start; the first is served with a warning, because nothing here is
+	// allowed to block without having announced it (announce.go). trasElAviso
+	// asserts that warning happened, so this test still measures the binding
+	// and now also pins the order.
+	res := trasElAviso(t, dir, secret, "/tmp/definitely-not-claude")
 	if res.Status != ForeignParent {
 		t.Fatalf("status = %v, want ForeignParent — a stolen token just worked", res.Status)
 	}
@@ -331,37 +336,135 @@ func TestEmptyRecordLocks(t *testing.T) {
 
 // A truncated or hand-edited record must not be read as "unpaired" — that would
 // turn a corrupt file into an open server.
-func TestCorruptRecordDoesNotOpenTheServer(t *testing.T) {
+// A record nobody can read must not cost the user their server.
+//
+// This asserted the opposite until issue #29, and the reversal is the point
+// rather than a relaxation. Measured against the binary: a record that is
+// DELETED gets its deleter served and recorded as the trusted launcher, while a
+// record that was CORRUPT refused everyone. So the refusal never stopped an
+// attacker who can write this file — deleting it is strictly the better move
+// for them — and it did hand them a one-line way to leave the user with no MCP.
+// Three bytes of UTF-8 BOM, which PowerShell's Out-File writes by default, do
+// it by accident.
+//
+// Serving is not the whole answer, so this pins the shouting too. A server that
+// quietly ignored the record would be worse than either.
+func TestUnRegistroIlegibleSirveYGrita(t *testing.T) {
+	sano := func(t *testing.T, dir string) []byte {
+		t.Helper()
+		if _, err := Mint(dir, "claude-desktop", false); err != nil {
+			t.Fatalf("Mint: %v", err)
+		}
+		buf, err := os.ReadFile(Path(dir))
+		if err != nil {
+			t.Fatalf("read record: %v", err)
+		}
+		return buf
+	}
+	casos := []struct {
+		nombre string
+		romper func(t *testing.T, dir string) []byte
+	}{
+		{"json roto", func(t *testing.T, dir string) []byte {
+			sano(t, dir)
+			return []byte("{ not json")
+		}},
+		{"BOM UTF-8 delante de un registro valido", func(t *testing.T, dir string) []byte {
+			// The accident, not the attack: Out-File writes this by default.
+			return append([]byte{0xEF, 0xBB, 0xBF}, sano(t, dir)...)
+		}},
+		{"formato de una version futura", func(t *testing.T, dir string) []byte {
+			sano(t, dir)
+			buf, _ := json.Marshal(File{Version: fileVersion + 1})
+			return buf
+		}},
+	}
+	for _, c := range casos {
+		t.Run(c.nombre, func(t *testing.T) {
+			dir := t.TempDir()
+			roto := c.romper(t, dir)
+			if err := os.WriteFile(Path(dir), roto, 0o600); err != nil {
+				t.Fatalf("write record: %v", err)
+			}
+
+			res, err := Verify(dir, "anything", `C:\\algun\\cliente.exe`)
+			if !res.Allowed() {
+				t.Fatalf("status = %v: an unreadable record took the server away from the user", res.Status)
+			}
+			if res.Status != UnreadableRecord {
+				t.Fatalf("status = %v, want UnreadableRecord", res.Status)
+			}
+			// The shouting, in every channel a person or a model can read.
+			if err == nil {
+				t.Error("the caller got no error to log")
+			}
+			stderr, client := Explain(res)
+			if stderr == "" || client == "" {
+				t.Errorf("silently ignored: stderr=%q client=%q", stderr, client)
+			}
+			if linea := StartupLine(dir, res); !strings.Contains(linea, "SERVING") {
+				t.Errorf("the startup line does not say it is serving anyway: %q", linea)
+			}
+			// And the record is left alone, so repairing the file brings back
+			// the pairing the user actually wrote.
+			ahora, err := os.ReadFile(Path(dir))
+			if err != nil {
+				t.Fatalf("re-read record: %v", err)
+			}
+			if string(ahora) != string(roto) {
+				t.Fatal("the unreadable record was overwritten; repairing it can no longer bring the pairing back")
+			}
+		})
+	}
+}
+
+// The control for the test above: a record this build CAN read still decides.
+// Without it, "serve when unreadable" is indistinguishable from "always serve".
+func TestUnRegistroLegibleSigueMandando(t *testing.T) {
+	dir := t.TempDir()
+	secret, err := Mint(dir, "claude-desktop", false)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	confirm(t, dir, secret, "")
+
+	res, _ := Verify(dir, "el-secreto-equivocado", "")
+	if res.Allowed() {
+		t.Fatalf("status = %v: a readable record accepted a wrong token", res.Status)
+	}
+	if res.Status == UnreadableRecord {
+		t.Fatal("a perfectly readable record was treated as unreadable")
+	}
+}
+
+// La linea de arranque y la conducta se deciden en lugares distintos —
+// Allowed() por un lado, startupVerdict/Explain por otro— y nada las obligaba a
+// coincidir. Sacando UnreadableRecord de Allowed(), el servidor rechazaba toda
+// herramienta mientras el log seguia diciendo "SERVING": la clase exacta de
+// mentira que #25 y #29 existen para eliminar, ahora dentro del mecanismo que
+// las arregla.
+//
+// Este test recorre TODOS los estados, no una lista de los interesantes: el que
+// se agregue manana tambien tiene que cumplirlo, y una lista escrita a mano ya
+// dejo afuera a ForeignLauncher una vez.
+func TestElLogNoPuedeDecirUnaCosaYElServidorHacerOtra(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := Mint(dir, "claude-desktop", false); err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if err := os.WriteFile(Path(dir), []byte("{ not json"), 0o600); err != nil {
-		t.Fatalf("corrupt the record: %v", err)
-	}
-
-	res, err := Verify(dir, "anything", "")
-	if err == nil {
-		t.Error("a corrupt record was accepted without complaint")
-	}
-	if res.Allowed() {
-		t.Fatal("a corrupt record left the server open to any launcher")
-	}
-}
-
-func TestFutureFormatIsNotIgnored(t *testing.T) {
-	dir := t.TempDir()
-	buf, _ := json.Marshal(File{Version: fileVersion + 1})
-	if err := os.WriteFile(Path(dir), buf, 0o600); err != nil {
-		t.Fatalf("write record: %v", err)
-	}
-
-	res, err := Verify(dir, "anything", "")
-	if err == nil {
-		t.Error("a record from a newer format was read as if it were this one")
-	}
-	if res.Allowed() {
-		t.Fatal("a record this build cannot understand left the server open")
+	for st := Unpaired; st <= UnreadableRecord; st++ {
+		res := Result{Status: st, Label: "claude-desktop", Launcher: `C:\\cliente.exe`, Detail: "porque si"}
+		linea := StartupLine(dir, res)
+		suena := strings.HasPrefix(linea, "refusing to serve") || strings.HasPrefix(linea, "locked")
+		if res.Allowed() && suena {
+			t.Errorf("%s: sirve, pero el log lo anuncia como rechazo: %q", StatusName(st), linea)
+		}
+		if !res.Allowed() && !suena {
+			t.Errorf("%s: rechaza, y el log no lo dice: %q", StatusName(st), linea)
+		}
+		if stderr, _ := Explain(res); res.Allowed() && strings.HasPrefix(stderr, "refusing to serve") {
+			t.Errorf("%s: sirve, pero Explain empieza como un rechazo: %q", StatusName(st), stderr)
+		}
 	}
 }
 
@@ -574,10 +677,9 @@ func TestElTokenDelEntornoSirve(t *testing.T) {
 	// Y desde OTRO lanzador, con el secreto correcto: tiene que rechazar. Es lo
 	// que hace que la variable de entorno siga valiendo algo pese a ser legible
 	// por cualquier proceso del usuario.
-	otro, err := Verify(dir, secreto, `C:\Windows\System32\cmd.exe`)
-	if err != nil {
-		t.Fatalf("Verify desde otro lanzador: %v", err)
-	}
+	// En el segundo arranque de ese otro lanzador: al primero se lo avisa y se
+	// lo sirve (announce.go), y trasElAviso afirma esa mitad.
+	otro := trasElAviso(t, dir, secreto, `C:\Windows\System32\cmd.exe`)
 	if otro.Status != ForeignParent {
 		t.Errorf("desde otro lanzador el estado es %v, quería ForeignParent.\n"+
 			"Éste es el argumento por el que la variable de entorno es aceptable: aunque el\n"+
@@ -631,15 +733,22 @@ func TestElRechazoNombraAlLanzadorYLaSalida(t *testing.T) {
 }
 
 func TestExplainAlwaysSaysWhatToDo(t *testing.T) {
-	// Every status that refuses, not a subset. ForeignLauncher shipped without
-	// being listed here, which is how a rejection that says nothing gets in: the
-	// list is kept by hand and the compiler does not check it.
+	// Every status that refuses, plus the one that announces a coming refusal,
+	// not a subset. ForeignLauncher shipped without being listed here, which is
+	// how a rejection that says nothing gets in: the list is kept by hand and
+	// the compiler does not check it.
+	//
+	// Announced belongs on it even though it serves. It is the start where the
+	// user still has a working client to act in, so it is the one message that
+	// has to arrive with something to do in it; a silent Announced would mean
+	// the refusal that follows was, in every way the user can observe,
+	// unannounced.
 	//
 	// The assertion is that the message names A way out, not one particular one.
 	// The launcher statuses are escaped with `trust`, not `pair`, and demanding
 	// the word "pair" from them would only push their message back toward the
 	// mechanism the user is not on.
-	for _, st := range []Status{NoToken, BadToken, ForeignParent, ForeignLauncher, EmptyRecord} {
+	for _, st := range []Status{NoToken, BadToken, ForeignParent, ForeignLauncher, EmptyRecord, Announced} {
 		stderr, client := Explain(Result{Status: st, Label: "claude-desktop"})
 		if stderr == "" || client == "" {
 			t.Errorf("%v: stderr=%q client=%q; a silent rejection is indistinguishable from a crash", st, stderr, client)

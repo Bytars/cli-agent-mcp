@@ -60,6 +60,11 @@ func TestUnaActualizacionDelClienteNoTeDejaAfuera(t *testing.T) {
 
 // EL CONTROL. Que una actualización pase no puede significar que pase
 // cualquiera.
+//
+// El rechazo llega en el segundo arranque: al primero se le avisa y se lo sirve
+// (announce.go). trasElAviso afirma esa mitad, así que este control sigue
+// midiendo lo que dice —que el intruso termina afuera— y de paso comprueba que
+// se lo dijimos antes.
 func TestOtraAppSiQuedaAfuera(t *testing.T) {
 	const otraApp = `C:\Program Files\WindowsApps\OtraCosa_3.0.0.0_x64__zzzzzzzzzzzz\app\claude.exe`
 
@@ -69,7 +74,7 @@ func TestOtraAppSiQuedaAfuera(t *testing.T) {
 		if r, _ := Verify(dir, secreto, claudeVieja); r.Status != OK {
 			t.Fatalf("preparación: %v", r.Status)
 		}
-		r, _ := Verify(dir, secreto, otraApp)
+		r := trasElAviso(t, dir, secreto, otraApp)
 		if r.Status != ForeignParent || r.Allowed() {
 			t.Fatalf("status = %v (allowed=%v): otro paquete entró con un token robado", r.Status, r.Allowed())
 		}
@@ -81,7 +86,7 @@ func TestOtraAppSiQuedaAfuera(t *testing.T) {
 			t.Fatalf("preparación: %v", r.Status)
 		}
 		envejecerElRegistro(t, dir)
-		r, _ := Verify(dir, "", otraApp)
+		r := trasElAviso(t, dir, "", otraApp)
 		if r.Status != ForeignLauncher || r.Allowed() {
 			t.Fatalf("status = %v (allowed=%v): otro programa entró", r.Status, r.Allowed())
 		}
@@ -116,7 +121,7 @@ func TestElRechazoSeEntiende(t *testing.T) {
 		t.Fatalf("preparación: %v", r.Status)
 	}
 	envejecerElRegistro(t, dir)
-	r, _ := Verify(dir, "", `C:\Temp\raro.exe`)
+	r := trasElAviso(t, dir, "", `C:\Temp\raro.exe`)
 	if r.Status != ForeignLauncher {
 		t.Fatalf("status = %v", r.Status)
 	}

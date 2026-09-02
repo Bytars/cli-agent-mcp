@@ -75,6 +75,9 @@ func TestElPrimerLanzadorQuedaRegistradoSinQueNadieHagaNada(t *testing.T) {
 // aparezca (ver learningWindow), así que un control escrito sin envejecerlo
 // mediría la ventana en vez del rechazo. Éste falló exactamente así cuando se
 // agregó la ventana, que es la señal de que estaba midiendo lo que decía.
+//
+// Y pasa por trasElAviso por la misma razón, una capa más tarde: el rechazo
+// llega recién en el SEGUNDO arranque, porque el primero avisa (announce.go).
 func TestOtroProgramaNoEntra(t *testing.T) {
 	dir := t.TempDir()
 	if r, _ := Verify(dir, "", elCliente); r.Status != TrustedLauncher {
@@ -82,10 +85,7 @@ func TestOtroProgramaNoEntra(t *testing.T) {
 	}
 	envejecerElRegistro(t, dir)
 
-	r, err := Verify(dir, "", elOtro)
-	if err != nil {
-		t.Fatalf("Verify: %v", err)
-	}
+	r := trasElAviso(t, dir, "", elOtro)
 	if r.Status != ForeignLauncher {
 		t.Fatalf("status = %v, quería ForeignLauncher — otro programa acaba de usar el servidor", r.Status)
 	}

@@ -139,7 +139,18 @@ func (f *File) Trusts(exe string) bool {
 
 // Trust adds exe to the list, and reports whether it was already there.
 func (f *File) Trust(exe string, firstUse bool) (added bool) {
-	if f == nil || exe == "" || f.Trusts(exe) {
+	if f == nil || exe == "" {
+		return false
+	}
+	// Trusting an identity retires the warning standing against it. This is the
+	// third point of issue #29's point 4: an announcement must not be carried
+	// around for ever by a program that has since been authorized — a stale
+	// mark is a refusal waiting for the day this launcher is removed from the
+	// list again, and that refusal would arrive with no warning of its own.
+	// Cleared before the already-trusted check so the mark cannot survive by
+	// arriving second.
+	f.ForgetAnnouncement(IdentityOf(exe))
+	if f.Trusts(exe) {
 		return false
 	}
 	f.TrustedLaunchers = append(f.TrustedLaunchers, Launcher{
