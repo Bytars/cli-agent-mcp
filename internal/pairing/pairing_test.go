@@ -336,37 +336,104 @@ func TestEmptyRecordLocks(t *testing.T) {
 
 // A truncated or hand-edited record must not be read as "unpaired" — that would
 // turn a corrupt file into an open server.
-func TestCorruptRecordDoesNotOpenTheServer(t *testing.T) {
-	dir := t.TempDir()
-	if _, err := Mint(dir, "claude-desktop", false); err != nil {
-		t.Fatalf("Mint: %v", err)
+// A record nobody can read must not cost the user their server.
+//
+// This asserted the opposite until issue #29, and the reversal is the point
+// rather than a relaxation. Measured against the binary: a record that is
+// DELETED gets its deleter served and recorded as the trusted launcher, while a
+// record that was CORRUPT refused everyone. So the refusal never stopped an
+// attacker who can write this file — deleting it is strictly the better move
+// for them — and it did hand them a one-line way to leave the user with no MCP.
+// Three bytes of UTF-8 BOM, which PowerShell's Out-File writes by default, do
+// it by accident.
+//
+// Serving is not the whole answer, so this pins the shouting too. A server that
+// quietly ignored the record would be worse than either.
+func TestUnRegistroIlegibleSirveYGrita(t *testing.T) {
+	sano := func(t *testing.T, dir string) []byte {
+		t.Helper()
+		if _, err := Mint(dir, "claude-desktop", false); err != nil {
+			t.Fatalf("Mint: %v", err)
+		}
+		buf, err := os.ReadFile(Path(dir))
+		if err != nil {
+			t.Fatalf("read record: %v", err)
+		}
+		return buf
 	}
-	if err := os.WriteFile(Path(dir), []byte("{ not json"), 0o600); err != nil {
-		t.Fatalf("corrupt the record: %v", err)
+	casos := []struct {
+		nombre string
+		romper func(t *testing.T, dir string) []byte
+	}{
+		{"json roto", func(t *testing.T, dir string) []byte {
+			sano(t, dir)
+			return []byte("{ not json")
+		}},
+		{"BOM UTF-8 delante de un registro valido", func(t *testing.T, dir string) []byte {
+			// The accident, not the attack: Out-File writes this by default.
+			return append([]byte{0xEF, 0xBB, 0xBF}, sano(t, dir)...)
+		}},
+		{"formato de una version futura", func(t *testing.T, dir string) []byte {
+			sano(t, dir)
+			buf, _ := json.Marshal(File{Version: fileVersion + 1})
+			return buf
+		}},
 	}
+	for _, c := range casos {
+		t.Run(c.nombre, func(t *testing.T) {
+			dir := t.TempDir()
+			roto := c.romper(t, dir)
+			if err := os.WriteFile(Path(dir), roto, 0o600); err != nil {
+				t.Fatalf("write record: %v", err)
+			}
 
-	res, err := Verify(dir, "anything", "")
-	if err == nil {
-		t.Error("a corrupt record was accepted without complaint")
-	}
-	if res.Allowed() {
-		t.Fatal("a corrupt record left the server open to any launcher")
+			res, err := Verify(dir, "anything", `C:\\algun\\cliente.exe`)
+			if !res.Allowed() {
+				t.Fatalf("status = %v: an unreadable record took the server away from the user", res.Status)
+			}
+			if res.Status != UnreadableRecord {
+				t.Fatalf("status = %v, want UnreadableRecord", res.Status)
+			}
+			// The shouting, in every channel a person or a model can read.
+			if err == nil {
+				t.Error("the caller got no error to log")
+			}
+			stderr, client := Explain(res)
+			if stderr == "" || client == "" {
+				t.Errorf("silently ignored: stderr=%q client=%q", stderr, client)
+			}
+			if linea := StartupLine(dir, res); !strings.Contains(linea, "SERVING") {
+				t.Errorf("the startup line does not say it is serving anyway: %q", linea)
+			}
+			// And the record is left alone, so repairing the file brings back
+			// the pairing the user actually wrote.
+			ahora, err := os.ReadFile(Path(dir))
+			if err != nil {
+				t.Fatalf("re-read record: %v", err)
+			}
+			if string(ahora) != string(roto) {
+				t.Fatal("the unreadable record was overwritten; repairing it can no longer bring the pairing back")
+			}
+		})
 	}
 }
 
-func TestFutureFormatIsNotIgnored(t *testing.T) {
+// The control for the test above: a record this build CAN read still decides.
+// Without it, "serve when unreadable" is indistinguishable from "always serve".
+func TestUnRegistroLegibleSigueMandando(t *testing.T) {
 	dir := t.TempDir()
-	buf, _ := json.Marshal(File{Version: fileVersion + 1})
-	if err := os.WriteFile(Path(dir), buf, 0o600); err != nil {
-		t.Fatalf("write record: %v", err)
+	secret, err := Mint(dir, "claude-desktop", false)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
 	}
+	confirm(t, dir, secret, "")
 
-	res, err := Verify(dir, "anything", "")
-	if err == nil {
-		t.Error("a record from a newer format was read as if it were this one")
-	}
+	res, _ := Verify(dir, "el-secreto-equivocado", "")
 	if res.Allowed() {
-		t.Fatal("a record this build cannot understand left the server open")
+		t.Fatalf("status = %v: a readable record accepted a wrong token", res.Status)
+	}
+	if res.Status == UnreadableRecord {
+		t.Fatal("a perfectly readable record was treated as unreadable")
 	}
 }
 

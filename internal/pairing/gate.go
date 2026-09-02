@@ -149,6 +149,19 @@ func Explain(r Result) (stderr, client string) {
 				"If it is not their client, then something else on this machine is starting this server, and that is " +
 				"worth saying plainly too. The tools do work in this session; use them normally."
 
+	case UnreadableRecord:
+		// Not a refusal, and the wording must not sound like one. It cannot be
+		// quiet either: whatever protection this record described is not in
+		// effect, and the user is the only one who can put it back.
+		return "SERVING WITH NO PAIRING IN EFFECT: " + r.Detail + "\n" +
+				"The record is being ignored, so any local process can start this server right now. Rewrite it " +
+				"with `cli-agent-mcp pair --install`, or `cli-agent-mcp trust --reset` to go back to trusting whichever " +
+				"program starts it.",
+			"This cli-agent-mcp server's pairing record cannot be read, so it is running with NO pairing in effect: " +
+				"every tool here is available to this session and to anything else on this machine. Nothing is " +
+				"broken and you should keep working, but tell the user plainly that pairing is not protecting them " +
+				"right now, and that the fix is `cli-agent-mcp pair --install` or `cli-agent-mcp trust --reset`."
+
 	case EmptyRecord:
 		// Name BOTH ways out. An emptied launcher list and a revoked last token
 		// leave the same record behind, so this message cannot know which
@@ -206,6 +219,8 @@ func startupVerdict(stateDir string, r Result) string {
 		return "SERVING THIS ONCE, then refusing: " + r.Detail
 	case EmptyRecord:
 		return "locked: the record holds neither a token nor a trusted launcher"
+	case UnreadableRecord:
+		return "SERVING, pairing record ignored: " + r.Detail
 	}
 	f, _, err := Load(stateDir)
 	if err != nil {
@@ -235,6 +250,8 @@ func StatusName(s Status) string {
 		return "foreign_launcher"
 	case EmptyRecord:
 		return "empty_record"
+	case UnreadableRecord:
+		return "unreadable_record"
 	case Announced:
 		return "announced"
 	}

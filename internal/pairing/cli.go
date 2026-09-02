@@ -119,6 +119,16 @@ agent that inherits your environment. Run `)
 		fmt.Print(" to close that.\n")
 		return 0
 	}
+	// A launcher record answers this question with a different mechanism, and
+	// calling it dead is simply false: measured on the binary, the server logs
+	// `authorized: started by ...` for the very record this line reported as unable
+	// to authenticate anything. trustStatus already redirects the mirror case;
+	// this is the missing half.
+	if f.TrustsLaunchers() {
+		fmt.Printf("status: this record authorizes by LAUNCHER, not by token (%d program(s) trusted).\n", len(f.TrustedLaunchers))
+		fmt.Println("Run `cli-agent-mcp trust --status` to see it.")
+		return 0
+	}
 	if len(f.Tokens) == 0 {
 		fmt.Println("status: paired, but no tokens — nothing can authenticate. Run `cli-agent-mcp pair` to issue one.")
 		return 0

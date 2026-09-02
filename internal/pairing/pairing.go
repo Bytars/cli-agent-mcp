@@ -208,6 +208,23 @@ const (
 	// ForeignLauncher means the same, but the launching program is not on it.
 	ForeignLauncher
 
+	// UnreadableRecord means the pairing file could not be understood — corrupt
+	// JSON, or a format version this build does not know. It SERVES, loudly.
+	//
+	// Refusing here looked like the careful choice and is the opposite, measured
+	// against the binary. This file is writable by anything running as this
+	// user, and a process that can corrupt it can also DELETE it — and deleting
+	// it gets that process served, and recorded as the trusted launcher. So the
+	// refusal never stopped the attacker, who has a better move available; all
+	// it bought was a one-line way to leave the user with no MCP at all, either
+	// deliberately (write a format version this build cannot know) or by
+	// accident: three bytes of UTF-8 BOM, which PowerShell's Out-File writes by
+	// default, are enough.
+	//
+	// Issue #29, after six lockouts in two days: the mechanism must not be able
+	// to lock the user out. If in doubt, serve and shout.
+	UnreadableRecord
+
 	// EmptyRecord means the record holds neither a token nor a trusted
 	// launcher, so nothing can authenticate. Revoking the last token and
 	// removing the last launcher both land here, and the server cannot tell
@@ -268,7 +285,8 @@ type Result struct {
 // Allowed reports whether the server should expose its real tools.
 func (r Result) Allowed() bool {
 	return r.Status == OK || r.Status == Unpaired || r.Status == Armed ||
-		r.Status == TrustedLauncher || r.Status == Announced
+		r.Status == TrustedLauncher || r.Status == Announced ||
+		r.Status == UnreadableRecord
 }
 
 // launcherList names the trusted launchers for a rejection message. Somebody
@@ -470,7 +488,11 @@ func Verify(stateDir, secret, parentExe string) (Result, error) {
 func verify(stateDir, secret, parentExe string) (Result, error) {
 	f, paired, err := Load(stateDir)
 	if err != nil {
-		return Result{Status: BadToken, Detail: err.Error()}, err
+		// Serve. The error still travels back so the caller logs it, and the
+		// record is deliberately left untouched: whoever repairs the file gets
+		// their pairing back exactly as they wrote it. Rewriting it from here
+		// would turn one bad byte into a destroyed configuration.
+		return Result{Status: UnreadableRecord, Detail: err.Error(), Launcher: parentExe}, err
 	}
 	if !paired {
 		// Nothing configured. Rather than serving anyone forever, record who
