@@ -437,6 +437,37 @@ func TestUnRegistroLegibleSigueMandando(t *testing.T) {
 	}
 }
 
+// La linea de arranque y la conducta se deciden en lugares distintos —
+// Allowed() por un lado, startupVerdict/Explain por otro— y nada las obligaba a
+// coincidir. Sacando UnreadableRecord de Allowed(), el servidor rechazaba toda
+// herramienta mientras el log seguia diciendo "SERVING": la clase exacta de
+// mentira que #25 y #29 existen para eliminar, ahora dentro del mecanismo que
+// las arregla.
+//
+// Este test recorre TODOS los estados, no una lista de los interesantes: el que
+// se agregue manana tambien tiene que cumplirlo, y una lista escrita a mano ya
+// dejo afuera a ForeignLauncher una vez.
+func TestElLogNoPuedeDecirUnaCosaYElServidorHacerOtra(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Mint(dir, "claude-desktop", false); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	for st := Unpaired; st <= UnreadableRecord; st++ {
+		res := Result{Status: st, Label: "claude-desktop", Launcher: `C:\\cliente.exe`, Detail: "porque si"}
+		linea := StartupLine(dir, res)
+		suena := strings.HasPrefix(linea, "refusing to serve") || strings.HasPrefix(linea, "locked")
+		if res.Allowed() && suena {
+			t.Errorf("%s: sirve, pero el log lo anuncia como rechazo: %q", StatusName(st), linea)
+		}
+		if !res.Allowed() && !suena {
+			t.Errorf("%s: rechaza, y el log no lo dice: %q", StatusName(st), linea)
+		}
+		if stderr, _ := Explain(res); res.Allowed() && strings.HasPrefix(stderr, "refusing to serve") {
+			t.Errorf("%s: sirve, pero Explain empieza como un rechazo: %q", StatusName(st), stderr)
+		}
+	}
+}
+
 func TestSaveIsOwnerOnly(t *testing.T) {
 	if os.Getuid() == -1 {
 		t.Skip("Windows does not apply the mode bits")

@@ -39,6 +39,13 @@ func runFailOpen(r *rig) {
 	// with no way to find out why.
 	r.check("unreadable record -> and does NOT go silent about the cause",
 		"is corrupt", out)
+	// AND the tools are actually reachable. Every check above reads what the
+	// server SAYS, and that is not the criterion: with Result.Allowed() mutated
+	// to drop UnreadableRecord, the server refuses every tool through the
+	// lockdown middleware while all three lines above stay exactly the same.
+	// This harness passed that mutation, which is how the hole was found.
+	r.check("unreadable record -> and the tools really are reachable",
+		"^served$", servedOrNot(callTool(r, state, "agent_list_agents")))
 
 	// A UTF-8 BOM is the realistic version of the same fault: it is what a
 	// well-meaning editor, or a PowerShell redirect, leaves on a file that is

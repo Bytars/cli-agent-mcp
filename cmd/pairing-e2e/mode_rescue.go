@@ -109,6 +109,19 @@ func plantForeignRecord(stateDir string) error {
 // handshake, which a refusing server has to keep answering or the tool could
 // never be reached.
 func callRescue(r *rig, stateDir string) (*mcp.CallToolResult, error) {
+	return callTool(r, stateDir, "agent_pairing_rescue")
+}
+
+// callTool starts a server and calls one tool on it.
+//
+// It exists because reading stderr is not enough to know whether a server
+// serves. Measured: with Result.Allowed() mutated to exclude UnreadableRecord —
+// a total regression of #29 point 4 — every line this harness used to check
+// stayed identical, because the verdict text and the lockdown decision are made
+// in different places. The log kept saying SERVING while every tool was refused.
+//
+// So the modes that claim a server serves, or does not, ask it.
+func callTool(r *rig, stateDir, name string) (*mcp.CallToolResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -127,9 +140,24 @@ func callRescue(r *rig, stateDir string) (*mcp.CallToolResult, error) {
 	defer session.Close()
 
 	return session.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "agent_pairing_rescue",
+		Name:      name,
 		Arguments: map[string]any{},
 	})
+}
+
+// servedOrNot reduces a tool call to one word so the behavioural claim goes
+// through check() with a pattern, like every other assertion here — and so a
+// failure prints WHY it was refused instead of just "false".
+func servedOrNot(res *mcp.CallToolResult, err error) string {
+	switch {
+	case err != nil:
+		return "the client could not even connect: " + err.Error()
+	case res == nil:
+		return "the server answered with nothing at all"
+	case res.IsError:
+		return "refused: " + toolText(res)
+	}
+	return "served"
 }
 
 // The three helpers below exist so every assertion in this file goes through
