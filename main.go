@@ -301,6 +301,7 @@ func main() {
 	})
 
 	registerTools(srv, reg, mgr, cfg, desk, grantStore)
+	registerRescue(srv, gate, stateDir, launcher, auditLog)
 
 	// The tools stay registered when locked, and the middleware answers for
 	// them. Serving an empty tool list instead would tell the model nothing —
@@ -468,9 +469,20 @@ func lockdown(msg string) mcp.Middleware {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			switch method {
 			case "tools/call":
+				// Exactly one tool stays reachable while locked, and that is the
+				// point of a lock somebody can survive: the rescue. Letting it
+				// through here is what keeps a bad pairing from costing the user
+				// their machine (issue #29).
+				if call, ok := req.(*mcp.CallToolRequest); ok && call.Params != nil && call.Params.Name == rescueTool {
+					return next(ctx, method, req)
+				}
 				// A tool-level error, not a protocol one: this is a refusal the
 				// model is meant to read and relay, not a transport fault.
-				return errResult(msg), nil
+				//
+				// The way out travels with every refusal. A rescue the model is
+				// never told about is a rescue nobody runs, and this message is
+				// the only channel that reaches a user whose client is broken.
+				return errResult(msg + wayOut), nil
 			case "resources/read":
 				// The task board reads its data through here, and rendering it
 				// empty would look like "no tasks" rather than "not authorized".
@@ -479,6 +491,82 @@ func lockdown(msg string) mcp.Middleware {
 			return next(ctx, method, req)
 		}
 	}
+}
+
+// rescueTool is the one tool a locked server still answers.
+const rescueTool = "agent_pairing_rescue"
+
+// wayOut rides along with every refusal, because a rescue nobody is told about
+// is a rescue nobody runs.
+const wayOut = " If the user confirms this is the client they configured, access can be recovered by calling " +
+	rescueTool + ": it removes the pairing record THIS server reads, with no path for anyone to guess. " +
+	"Ask them first — it turns pairing off — and tell them they must restart this client afterwards."
+
+// rescueResult is what agent_pairing_rescue reports back.
+type rescueResult struct {
+	Rescued bool   `json:"rescued"`
+	Record  string `json:"record"`
+	Detail  string `json:"detail"`
+}
+
+// registerRescue wires the one operation a refusing server still performs.
+//
+// # Why this cannot be a command
+//
+// `pair` and `trust` work out the state directory by their own reckoning, and under
+// MSIX they reckon wrong: the server Claude Desktop launches reads
+// %LOCALAPPDATA%\\Packages\\...\\LocalCache\\Roaming\\cli-agent-mcp\\, while the same command
+// typed into a terminal reads %APPDATA%\\cli-agent-mcp\\. They are never the same
+// file. Four rescue attempts in a row changed nothing, and the user lost a
+// working day before anyone worked out why (issue #29).
+//
+// This process does not have to work anything out. It is already holding the
+// record it refused on. So the rescue is a tool the client calls, and the whole
+// question of which path to name disappears.
+//
+// # Why handing this to a locked-out caller is not the hole it looks like
+//
+// It reads like giving the off switch to whoever is being shut out. Measured,
+// the switch was never guarded: this record is writable by anything running as
+// this user, and DELETING it gets that process served — and recorded as the
+// trusted launcher. An attacker already has a shorter path than calling a tool
+// that writes an audit entry naming them.
+//
+// So what pairing is, honestly, is a safety interlock with an alarm: it stops
+// the accidental and the unaware, and it makes deliberate abuse loud. This tool
+// keeps that true without keeping the user out of their own machine.
+func registerRescue(srv *mcp.Server, gate pairing.Result, stateDir, launcher string, auditLog *audit.Logger) {
+	record := pairing.Path(stateDir)
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: rescueTool,
+		Description: "Recover access when this server is refusing to serve because of pairing. Removes the " +
+			"pairing record this server actually reads — no path to guess, which is the point — so the next " +
+			"start trusts whichever program launches it. Refuses to do anything when the server is not locked.",
+		Annotations: mutatingTool(),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, rescueResult, error) {
+		// Not a general unpair button. A server that is working keeps its
+		// pairing: making this callable at any moment would turn one prompt
+		// injection into a permanently unpaired machine, and it would give a
+		// blocked caller nothing they did not already have.
+		if gate.Allowed() {
+			const nada = "this server is not locked, so there is nothing to rescue. Pairing is left exactly as it is."
+			return errResult(nada), rescueResult{Record: record, Detail: nada}, nil
+		}
+		if err := pairing.Unpair(stateDir); err != nil {
+			msg := "could not remove the pairing record at " + record + ": " + err.Error()
+			return errResult(msg), rescueResult{Record: record, Detail: msg}, nil
+		}
+		// The only trace that somebody recovered access, and from where.
+		auditLog.Log("pairing_rescued", map[string]any{
+			"record": record,
+			"parent": launcher,
+			"was":    pairing.StatusName(gate.Status),
+		})
+		done := "Pairing removed from " + record + ". This running server STAYS locked — its verdict was decided " +
+			"when it started — so tell the user, plainly, to restart this client. The next start will trust " +
+			"whichever program launches the server, and `cli-agent-mcp trust --status` will show which one it picked."
+		return textResult(done), rescueResult{Rescued: true, Record: record, Detail: done}, nil
+	})
 }
 
 // readOnlyTool / mutatingTool are the annotation hints shared by the tools of

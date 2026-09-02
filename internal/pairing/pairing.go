@@ -20,19 +20,41 @@
 // and by default may edit files. Nothing distinguishes the MCP client the user
 // configured from a rogue npm postinstall script.
 //
-// Pairing closes that. A secret is minted once, stored here as a hash, and
-// handed to the client through its own config; a launcher that cannot present
-// it gets a server that refuses to do anything.
+// Pairing narrows that. The server records which program is allowed to launch
+// it, and answers to that one; a token may also be minted, stored here as a
+// hash, and handed to the client through its own config.
 //
-// # The limit, stated plainly
+// # What this is, stated at the size it actually is
 //
-// The secret lives in the client's config file and in this process's
-// environment, both readable by anything running as the same user. An attacker
-// who already has that read access takes the token and is indistinguishable
-// from the real client. Pairing raises the bar — it stops code that can execute
-// but not rummage through the user's profile — it is not a wall against a
-// same-user attacker. Parent binding (see parent.go) is the second layer that
-// narrows what a stolen token is worth.
+// It is a safety interlock with an alarm. It is NOT a security boundary against
+// an attacker running as this user, and it cannot be made into one, because the
+// state it depends on is a file that attacker can write.
+//
+// That is measurable, not a caveat. Given a paired record, a process running as
+// this user can DELETE it — and deleting it gets that process served, and
+// recorded as the trusted launcher. Whatever a token or a binding says, this is
+// the shorter path, and nothing in this package closes it. The secret makes it
+// no harder: it lives in the client's config and in this process's environment,
+// both readable by the same attacker.
+//
+// So what is it worth? It stops what is careless rather than determined: code
+// that executes without looking around, a second client nobody meant to
+// authorize, a stray script. And it makes the determined case loud — a refusal
+// in the log, an audit entry naming the launcher, a rescue that leaves a record.
+// That is a real gain, and it is smaller than "a server that refuses to do
+// anything".
+//
+// The distinction earns its place in this comment because designing against the
+// larger promise is how this package got six lockouts in two days (issue #29).
+// Every one of them came from treating a mechanism this porous as though it
+// were worth locking the user out to defend. It is not. Hence the rule the rest
+// of this package follows: THE MECHANISM MUST NOT BE ABLE TO LOCK THE USER OUT.
+// If in doubt, serve and shout.
+//
+// A real boundary would have to come from the operating system — a separate
+// account, or an AppContainer — so that the attacker cannot write this file in
+// the first place. That is a different project, and naming it here is meant to
+// keep this one from being redesigned every quarter in the hope of reaching it.
 package pairing
 
 import (
