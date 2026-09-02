@@ -102,10 +102,11 @@ func TestPasadaLaVentanaNoSeAdoptaNadieMas(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	r, err := Verify(dir, "", intruso)
-	if err != nil {
-		t.Fatalf("Verify: %v", err)
-	}
+	// El rechazo cae en el segundo arranque: al primero se lo avisa y se lo
+	// sirve (announce.go). Lo que este test mide sigue siendo la ventana —que
+	// el intruso termine afuera— y trasElAviso afirma la otra mitad, que se lo
+	// dijimos antes.
+	r := trasElAviso(t, dir, "", intruso)
 	if r.Status != ForeignLauncher || r.Allowed() {
 		t.Fatalf("status = %v (allowed=%v) sobre un registro viejo: la ventana no cierra nunca, "+
 			"así que cualquier programa entra siempre", r.Status, r.Allowed())
@@ -254,8 +255,12 @@ func TestBindingRejectsAnotherLauncher(t *testing.T) {
 	if res, _ := Verify(dir, secret, "/opt/Claude/claude"); res.Status != OK {
 		t.Fatalf("first use: %v", res.Status)
 	}
-	// Same secret, different program.
-	res, _ := Verify(dir, secret, "/tmp/definitely-not-claude")
+	// Same secret, different program. The rejection lands on that program's
+	// SECOND start; the first is served with a warning, because nothing here is
+	// allowed to block without having announced it (announce.go). trasElAviso
+	// asserts that warning happened, so this test still measures the binding
+	// and now also pins the order.
+	res := trasElAviso(t, dir, secret, "/tmp/definitely-not-claude")
 	if res.Status != ForeignParent {
 		t.Fatalf("status = %v, want ForeignParent — a stolen token just worked", res.Status)
 	}
@@ -574,10 +579,9 @@ func TestElTokenDelEntornoSirve(t *testing.T) {
 	// Y desde OTRO lanzador, con el secreto correcto: tiene que rechazar. Es lo
 	// que hace que la variable de entorno siga valiendo algo pese a ser legible
 	// por cualquier proceso del usuario.
-	otro, err := Verify(dir, secreto, `C:\Windows\System32\cmd.exe`)
-	if err != nil {
-		t.Fatalf("Verify desde otro lanzador: %v", err)
-	}
+	// En el segundo arranque de ese otro lanzador: al primero se lo avisa y se
+	// lo sirve (announce.go), y trasElAviso afirma esa mitad.
+	otro := trasElAviso(t, dir, secreto, `C:\Windows\System32\cmd.exe`)
 	if otro.Status != ForeignParent {
 		t.Errorf("desde otro lanzador el estado es %v, quería ForeignParent.\n"+
 			"Éste es el argumento por el que la variable de entorno es aceptable: aunque el\n"+
@@ -631,15 +635,22 @@ func TestElRechazoNombraAlLanzadorYLaSalida(t *testing.T) {
 }
 
 func TestExplainAlwaysSaysWhatToDo(t *testing.T) {
-	// Every status that refuses, not a subset. ForeignLauncher shipped without
-	// being listed here, which is how a rejection that says nothing gets in: the
-	// list is kept by hand and the compiler does not check it.
+	// Every status that refuses, plus the one that announces a coming refusal,
+	// not a subset. ForeignLauncher shipped without being listed here, which is
+	// how a rejection that says nothing gets in: the list is kept by hand and
+	// the compiler does not check it.
+	//
+	// Announced belongs on it even though it serves. It is the start where the
+	// user still has a working client to act in, so it is the one message that
+	// has to arrive with something to do in it; a silent Announced would mean
+	// the refusal that follows was, in every way the user can observe,
+	// unannounced.
 	//
 	// The assertion is that the message names A way out, not one particular one.
 	// The launcher statuses are escaped with `trust`, not `pair`, and demanding
 	// the word "pair" from them would only push their message back toward the
 	// mechanism the user is not on.
-	for _, st := range []Status{NoToken, BadToken, ForeignParent, ForeignLauncher, EmptyRecord} {
+	for _, st := range []Status{NoToken, BadToken, ForeignParent, ForeignLauncher, EmptyRecord, Announced} {
 		stderr, client := Explain(Result{Status: st, Label: "claude-desktop"})
 		if stderr == "" || client == "" {
 			t.Errorf("%v: stderr=%q client=%q; a silent rejection is indistinguishable from a crash", st, stderr, client)
