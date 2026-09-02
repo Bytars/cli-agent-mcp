@@ -47,26 +47,103 @@ func TestOtroPaqueteSigueSiendoOtroPrograma(t *testing.T) {
 	}
 }
 
-// Fuera de MSIX no hay familia de paquete, así que se compara el nombre del
-// ejecutable — más grueso, pero sobrevive a una actualización en el lugar, que
-// es lo que la ruta completa no hace.
-func TestFueraDeMsixSeComparaElNombre(t *testing.T) {
+// Fuera de MSIX no hay familia de paquete, así que la identidad es la carpeta
+// que lo contiene más el nombre del ejecutable: sobrevive a una actualización
+// en el lugar, y no confunde a dos programas homónimos en carpetas distintas.
+func TestFueraDeMsixSeComparaCarpetaYNombre(t *testing.T) {
 	a := IdentityOf(`C:\Tools\algun-cliente.exe`)
 	b := IdentityOf(`C:\Tools\algun-cliente.exe`)
 	c := IdentityOf(`D:\otra\ruta\algun-cliente.exe`)
 	d := IdentityOf(`C:\Tools\cosa-distinta.exe`)
 
-	if a.Kind != "exe" || a.Value != "algun-cliente.exe" {
+	if a.Kind != "exe" || a.Value != `c:\tools\algun-cliente.exe` {
 		t.Fatalf("identidad inesperada: %+v", a)
 	}
 	if !a.Matches(b) {
 		t.Error("el mismo programa no se reconoció")
 	}
-	if !a.Matches(c) {
-		t.Error("mover el ejecutable lo convirtió en otro programa; ésa es la trampa que se está evitando")
+	if a.Matches(c) {
+		t.Error("el mismo nombre en otra carpeta se dio por el mismo programa; " +
+			"es el agujero por el que entraba el node de la caché de npm")
 	}
 	if a.Matches(d) {
 		t.Error("dos ejecutables distintos se dieron por iguales")
+	}
+}
+
+// Las dos rutas que aparecieron al medir esto en la máquina: el node con el que
+// arranca el cliente, y el node bajo el que corre un `postinstall` de npm.
+const (
+	nodeDelCliente = `C:\Program Files\nodejs\node.exe`
+	nodeDeLaCache  = `C:\Users\usuario\AppData\Local\npm-cache\_npx\a1b2\node_modules\.bin\node.exe`
+)
+
+// EL AGUJERO QUE DEJABA COMPARAR SOLO EL NOMBRE.
+//
+// El issue #29 nombra al atacante con precisión: código que se ejecuta pero no
+// puede hurgar en el perfil — un `postinstall` de npm. Un postinstall corre bajo
+// node.exe, así que para cualquier cliente basado en node el programa confiado y
+// el atacante eran literalmente la misma cadena, y el atacante no necesitaba
+// robar nada. Con la ruta completa —antes de este PR— no coincidían: era una
+// regresión, no una concesión.
+func TestElNodeDeLaCacheDeNpmNoEsElNodeDelCliente(t *testing.T) {
+	cliente := IdentityOf(nodeDelCliente)
+	cache := IdentityOf(nodeDeLaCache)
+
+	if cliente.Kind != "exe" || cache.Kind != "exe" {
+		t.Fatalf("no son identidades de ejecutable: %+v / %+v", cliente, cache)
+	}
+	if cliente.Matches(cache) {
+		t.Errorf("el node de la caché de npm pasó por el node del cliente.\n"+
+			"  confiado: %s\n  atacante: %s\n"+
+			"Un postinstall puede llamarse node.exe; lo que no puede es escribir en C:\\Program Files.",
+			cliente.Value, cache.Value)
+	}
+}
+
+// SU CONTROL. Si la carpeta hiciera que nada coincidiera nunca, el test de
+// arriba pasaría sin probar nada — y una actualización en el lugar, que
+// reemplaza el binario sin moverlo, volvería a dejar al usuario afuera, que es
+// justo lo que este PR existe para impedir.
+func TestActualizarNodeEnSuCarpetaNoLoVuelveOtroPrograma(t *testing.T) {
+	cliente := IdentityOf(nodeDelCliente)
+
+	if !cliente.Matches(IdentityOf(`C:\Program Files\nodejs\node.exe`)) {
+		t.Error("un binario nuevo en la misma carpeta se dio por otro programa; " +
+			"así se rompe una actualización en el lugar")
+	}
+	// Y la misma carpeta escrita de otra manera sigue siendo la misma carpeta.
+	// Windows devuelve la ruta con la caja que se le antoja, y este paquete lee
+	// registros JSON que pudo escribir un build de otra plataforma: si la
+	// derivación no normalizara, una diferencia de forma se leería como mudanza.
+	if !cliente.Matches(IdentityOf(`C:/PROGRAM FILES/NodeJS/node.exe`)) {
+		t.Error("otra forma de escribir la misma ruta produjo otra identidad")
+	}
+}
+
+// La regla de la carpeta es sólo del ramal "exe". En MSIX la carpeta es
+// exactamente lo que cambia al actualizar, así que dejarla entrar ahí habría
+// reintroducido el bug del 1-sep que este archivo existe para arreglar.
+func TestEnMsixLaCarpetaNoDecide(t *testing.T) {
+	if claudeVieja == claudeNueva {
+		t.Fatal("las dos rutas del incidente son iguales; el test no está midiendo nada")
+	}
+	vieja, nueva := IdentityOf(claudeVieja), IdentityOf(claudeNueva)
+	if vieja.Kind != "msix" || nueva.Kind != "msix" {
+		t.Fatalf("no se reconoció el paquete: %+v / %+v", vieja, nueva)
+	}
+	if !vieja.Matches(nueva) {
+		t.Errorf("dos versiones del mismo paquete dejaron de coincidir: %s vs %s.\n"+
+			"La comparación por carpeta se filtró al ramal MSIX.", vieja.Value, nueva.Value)
+	}
+
+	// El otro sentido: que MSIX ignore la carpeta no puede volverlo permisivo.
+	otro := IdentityOf(`C:\Program Files\WindowsApps\Malicioso_1.0.0.0_x64__aaaaaaaaaaaa\app\claude.exe`)
+	if otro.Kind != "msix" {
+		t.Fatalf("no se reconoció como MSIX: %+v", otro)
+	}
+	if vieja.Matches(otro) {
+		t.Error("otro paquete con el mismo ejecutable se dio por el mismo programa")
 	}
 }
 

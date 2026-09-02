@@ -30,23 +30,36 @@ import (
 //
 // For an MSIX package, the identity is the *package family*: `Claude` plus the
 // publisher hash `pzs8sxrjxfjjc`. That pair survives every version bump, which
-// is exactly the property a binding needs. Outside MSIX there is no such
-// notion, so this falls back to the executable name — coarser, but it also
-// survives an in-place update, which the full path does not.
+// is exactly the property a binding needs.
 //
-// # Coarser on purpose
+// Outside MSIX there is no package family, so the identity is where the program
+// lives plus what it is called. An update in place overwrites the binary in the
+// folder it already occupies, so that survives an update too — the property
+// this file exists for. Moving or reinstalling somewhere else does not, and has
+// to be trusted again; that cost is stated in launcher.go and is one command.
 //
-// Comparing `claude.exe` rather than a full path means a program of the same
-// name somewhere else also matches. That is a real loss, and it is the right
-// trade: the alternative is what happened here, where the legitimate client
-// locked itself out by updating. The attacker this defends against — code that
-// can execute but cannot rummage through the profile — is not helped much by
-// the extra precision, and the user is hurt a lot by it.
+// # Why the folder is not dropped
+//
+// The name alone was tried first, and it was too wide to be worth anything.
+// Issue #29 names the attacker precisely: code that can execute but cannot
+// rummage through the profile — an npm `postinstall`. A postinstall runs under
+// `node.exe`, so for any node-based client the trusted identity and the
+// attacker were the same string, and the attacker needed to steal nothing:
+//
+//	C:\Program Files\nodejs\node.exe
+//	C:\Users\<user>\AppData\Local\npm-cache\_npx\<hash>\node_modules\.bin\node.exe
+//
+// Keeping the folder puts the check where that attacker cannot reach: it may
+// drop a `node.exe` wherever it likes, but not into `C:\Program Files`. The
+// last folder name alone would not do either — creating a directory called
+// `nodejs` next to the payload costs a postinstall one line.
 type Identity struct {
 	// Kind is "msix" or "exe", and says how Value should be read.
 	Kind string `json:"kind"`
 
-	// Value is the package family for msix, the executable name for exe.
+	// Value is the package family for msix; for exe it is the containing
+	// directory and the executable name, lowercased and rejoined on a single
+	// separator so no comparison downstream has to think about either.
 	Value string `json:"value"`
 
 	// Path is the full path this identity was derived from, kept only so a
@@ -83,7 +96,14 @@ func IdentityOf(exe string) Identity {
 			return Identity{Kind: "msix", Value: m[1] + "_" + m[2], Path: exe}
 		}
 	}
-	return Identity{Kind: "exe", Value: strings.ToLower(segs[len(segs)-1]), Path: exe}
+	// Rejoined rather than kept as a path, so the stored value is already
+	// normalised: one separator, one case. Two spellings of the same location —
+	// and Windows hands back whichever it feels like — have to derive the same
+	// identity, or an update in place would look like a move.
+	//
+	// A path with no directory at all keeps just the name, which is as narrow as
+	// it can be made from what was given.
+	return Identity{Kind: "exe", Value: strings.ToLower(strings.Join(segs, `\`)), Path: exe}
 }
 
 // segments splits a path on BOTH separators, independently of the one this
@@ -126,6 +146,10 @@ func (i Identity) Matches(other Identity) bool {
 		// like everything else Windows names.
 		return strings.EqualFold(i.Value, other.Value)
 	}
+	// exe values are lowercased at derivation, so this is only ever comparing
+	// like with like — but it stays EqualFold so a value that ever arrives from
+	// somewhere other than IdentityOf cannot turn a case difference into a
+	// lock-out.
 	return strings.EqualFold(i.Value, other.Value)
 }
 
