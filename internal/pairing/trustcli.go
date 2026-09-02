@@ -92,6 +92,12 @@ func trustStatus(dir string) int {
 		return 1
 	}
 	fmt.Printf("record: %s\n", Path(dir))
+	// Same reason as in runStatus: the answer below is about this file, and
+	// under MSIX the server's file is a different one. Say so before the answer
+	// rather than after it.
+	if w := virtualizedRecordWarning(dir); w != "" {
+		fmt.Printf("\n%s", w)
+	}
 	if !exists {
 		fmt.Println("status: nothing recorded yet — the next program to start this server becomes the trusted one.")
 		return 0

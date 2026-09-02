@@ -104,6 +104,12 @@ func runStatus(dir string) int {
 		return 1
 	}
 	fmt.Printf("record: %s\n", Path(dir))
+	// Before the verdict, not after: "NOT PAIRED" read on its own is what sent
+	// four rescue attempts at the wrong file, and a caveat printed under the
+	// answer arrives after the reader has already believed it (issue #29).
+	if w := virtualizedRecordWarning(dir); w != "" {
+		fmt.Printf("\n%s", w)
+	}
 	if !paired {
 		fmt.Print(`status: NOT PAIRED
 
