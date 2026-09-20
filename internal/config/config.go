@@ -36,6 +36,10 @@ type Config struct {
 	// auto-detection fails. Defaults to "cursor-agent".
 	CursorBin string
 
+	// KimiBin is the command used to launch the Kimi Code CLI. Defaults to
+	// "kimi" (typically %USERPROFILE%\.kimi-code\bin\kimi.exe on Windows).
+	KimiBin string
+
 	// PermissionMode is passed to Claude Code's --permission-mode. Because the
 	// agent runs headless (no human at the terminal to approve prompts), this
 	// governs how autonomous it is. See README for the safety trade-offs.
@@ -63,10 +67,11 @@ type Config struct {
 	// caller as much as you trust your own shell.
 	AllowExtraArgs bool
 
-	// ClaudeExtraArgs / CursorExtraArgs are appended verbatim to every launch,
-	// letting the user tune flags without a rebuild.
+	// ClaudeExtraArgs / CursorExtraArgs / KimiExtraArgs are appended verbatim to
+	// every launch, letting the user tune flags without a rebuild.
 	ClaudeExtraArgs []string
 	CursorExtraArgs []string
+	KimiExtraArgs   []string
 
 	// AppendSystemPrompt is added to Claude Code's system prompt on every task
 	// (--append-system-prompt). Use it for standing, machine-specific guidance —
@@ -300,12 +305,14 @@ func Load() Config {
 		DefaultAgent:       getenv("CLI_AGENT_MCP_DEFAULT_AGENT", "claude"),
 		ClaudeBin:          getenv("CLI_AGENT_MCP_CLAUDE_BIN", "claude"),
 		CursorBin:          getenv("CLI_AGENT_MCP_CURSOR_BIN", "cursor-agent"),
+		KimiBin:            getenv("CLI_AGENT_MCP_KIMI_BIN", "kimi"),
 		PermissionMode:     getenv("CLI_AGENT_MCP_PERMISSION_MODE", "acceptEdits"),
 		AllowedTools:       getenv("CLI_AGENT_MCP_ALLOWED_TOOLS", ""),
 		DisallowedTools:    getenv("CLI_AGENT_MCP_DISALLOWED_TOOLS", ""),
 		AllowExtraArgs:     getbool("CLI_AGENT_MCP_ALLOW_EXTRA_ARGS", false),
 		ClaudeExtraArgs:    splitList("CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS"),
 		CursorExtraArgs:    splitList("CLI_AGENT_MCP_CURSOR_EXTRA_ARGS"),
+		KimiExtraArgs:      splitList("CLI_AGENT_MCP_KIMI_EXTRA_ARGS"),
 		AppendSystemPrompt: getenv("CLI_AGENT_MCP_APPEND_SYSTEM_PROMPT", ""),
 		CustomName:         getenv("CLI_AGENT_MCP_CUSTOM_NAME", "custom"),
 		CustomBin:          getenv("CLI_AGENT_MCP_CUSTOM_BIN", ""),

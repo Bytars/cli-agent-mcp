@@ -296,22 +296,33 @@ func main() {
 	}
 	fmt.Printf("  correctly refused: %s\n", firstLine(textContent(gateRes)))
 
-	// 0c. plan-only run must not execute.
+	// 0c. plan-only run must not execute. Agents that cannot guarantee
+	// plan-only (cursor, custom, kimi) fail closed by design — for them the
+	// tool error IS the correct behavior, so verify the refusal and move on.
 	fmt.Println("\n== agent_plan_task (plan only, nothing executed) ==")
-	planRes := callTool(ctx, session, "agent_plan_task", map[string]any{
+	planRes, planErr := tryCallTool(ctx, session, "agent_plan_task", map[string]any{
 		"prompt": prompt,
 		"agent":  agentName,
 		"cwd":    cwd,
 	})
-	planStatus := jsonField(planRes, "status")
-	planResult := jsonField(planRes, "result")
-	fmt.Printf("  status=%s\n  result=%s\n", planStatus, firstLine(planResult))
-	if agentName == "mock" {
-		if planStatus != "done" {
-			log.Fatalf("FAIL: expected plan status done, got %q", planStatus)
+	if planErr != "" {
+		// A fail-closed refusal is the expected outcome for agents without a
+		// guaranteed plan-only mode. Anything else is a real failure.
+		if !strings.Contains(planErr, "cannot guarantee plan-only") {
+			log.Fatalf("call agent_plan_task: %s", planErr)
 		}
-		if !strings.Contains(planResult, "PLAN") {
-			log.Fatalf("FAIL: expected a plan in the result, got %q", planResult)
+		fmt.Printf("  correctly refused (agent cannot plan-only): %s\n", firstLine(planErr))
+	} else {
+		planStatus := jsonField(planRes, "status")
+		planResult := jsonField(planRes, "result")
+		fmt.Printf("  status=%s\n  result=%s\n", planStatus, firstLine(planResult))
+		if agentName == "mock" {
+			if planStatus != "done" {
+				log.Fatalf("FAIL: expected plan status done, got %q", planStatus)
+			}
+			if !strings.Contains(planResult, "PLAN") {
+				log.Fatalf("FAIL: expected a plan in the result, got %q", planResult)
+			}
 		}
 	}
 
@@ -415,14 +426,25 @@ func main() {
 }
 
 func callTool(ctx context.Context, s *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
-	res, err := s.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
-	if err != nil {
-		log.Fatalf("call %s: %v", name, err)
-	}
-	if res.IsError {
-		log.Fatalf("call %s returned tool error: %s", name, textContent(res))
+	res, errStr := tryCallTool(ctx, s, name, args)
+	if errStr != "" {
+		log.Fatalf("call %s: %s", name, errStr)
 	}
 	return res
+}
+
+// tryCallTool is callTool without the fatal exit: it returns the tool/transport
+// error as a string so a section can decide whether the error is the expected
+// outcome (e.g. a fail-closed refusal).
+func tryCallTool(ctx context.Context, s *mcp.ClientSession, name string, args map[string]any) (*mcp.CallToolResult, string) {
+	res, err := s.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		return nil, err.Error()
+	}
+	if res.IsError {
+		return nil, textContent(res)
+	}
+	return res, ""
 }
 
 func textContent(res *mcp.CallToolResult) string {
