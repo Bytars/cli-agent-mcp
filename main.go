@@ -154,6 +154,7 @@ func main() {
 
 	reg := agent.NewRegistry(
 		agent.NewClaudeAdapter(cfg.ClaudeBin, cfg.PermissionMode, cfg.AllowedTools, cfg.DisallowedTools, cfg.AppendSystemPrompt, cfg.ClaudeExtraArgs),
+		agent.NewKimiAdapter(cfg.KimiBin, cfg.KimiExtraArgs),
 		agent.NewCursorAdapter(cfg.CursorBin, cfg.CursorExtraArgs),
 		agent.NewCustomAdapter(cfg.CustomName, cfg.CustomBin, cfg.CustomArgs),
 		agent.NewMockAdapter(),
@@ -1106,13 +1107,15 @@ Usage:
   cli-agent-mcp --help          This help.
 
 Configuration (environment variables):
-  CLI_AGENT_MCP_DEFAULT_AGENT      Default agent: claude|cursor|custom|mock (default: claude)
+  CLI_AGENT_MCP_DEFAULT_AGENT      Default agent: claude|kimi|cursor|custom|mock (default: claude)
   CLI_AGENT_MCP_CLAUDE_BIN         Claude Code launcher                 (default: claude)
   CLI_AGENT_MCP_CURSOR_BIN         Cursor launcher fallback             (default: cursor-agent)
+  CLI_AGENT_MCP_KIMI_BIN           Kimi Code CLI launcher               (default: kimi)
   CLI_AGENT_MCP_PERMISSION_MODE    Claude --permission-mode             (default: acceptEdits)
                                      acceptEdits|auto|bypassPermissions|manual|dontAsk|plan
   CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS  Extra Claude flags (';'-separated)
   CLI_AGENT_MCP_CURSOR_EXTRA_ARGS  Extra Cursor flags (';'-separated)
+  CLI_AGENT_MCP_KIMI_EXTRA_ARGS    Extra Kimi flags (';'-separated)
   CLI_AGENT_MCP_APPEND_SYSTEM_PROMPT  Standing guidance added to every task's system
                                    prompt. e.g. tell the worker to use the full
                                    Windows OpenSSH path for internal SSH (the bare

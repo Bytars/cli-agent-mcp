@@ -10,7 +10,7 @@ A single-binary **MCP (Model Context Protocol) stdio server** that lets an MCP
 client — such as **Claude Desktop** — drive a **local headless CLI coding agent**
 as a background worker, with **live progress streaming**.
 
-Out of the box it drives **Claude Code** and **Cursor**, and any other CLI tool
+Out of the box it drives **Claude Code**, the **Kimi Code CLI** and **Cursor**, and any other CLI tool
 can be wired up with environment variables alone — no code required.
 
 Instead of copy-pasting between a chat window and a terminal agent, the client
@@ -457,6 +457,7 @@ All configuration is environment variables, so it lives entirely in your client'
 |----------|---------|---------|
 | `CLI_AGENT_MCP_DEFAULT_AGENT` | `claude` | Agent used when a call omits `agent`. |
 | `CLI_AGENT_MCP_CLAUDE_BIN` | `claude` | Claude Code launcher (name in PATH or absolute path). |
+| `CLI_AGENT_MCP_KIMI_BIN` | `kimi` | Kimi Code CLI launcher (name in PATH or absolute path, e.g. `%USERPROFILE%\.kimi-code\bin\kimi.exe` on Windows). |
 | `CLI_AGENT_MCP_CURSOR_BIN` | `cursor-agent` | Cursor launcher, used if the bundled runtime isn't auto-detected. |
 | `CLI_AGENT_MCP_PERMISSION_MODE` | `acceptEdits` | Claude Code `--permission-mode`: `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`. |
 | `CLI_AGENT_MCP_DISALLOWED_TOOLS` | — | Claude Code `--disallowedTools` (patterns, e.g. `Bash(rm:*),Bash(git push:*)`). **The reliable deny gate for a headless worker.** |
@@ -465,6 +466,7 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_APPEND_SYSTEM_PROMPT` | — | Standing guidance added to every task's system prompt (Claude `--append-system-prompt`). See [Windows + 1Password SSH](#windows--1password-ssh). |
 | `CLI_AGENT_MCP_CLAUDE_EXTRA_ARGS` | — | Extra Claude flags, `;`-separated. |
 | `CLI_AGENT_MCP_CURSOR_EXTRA_ARGS` | — | Extra Cursor flags, `;`-separated. |
+| `CLI_AGENT_MCP_KIMI_EXTRA_ARGS` | — | Extra Kimi flags, `;`-separated. |
 | `CLI_AGENT_MCP_DEFAULT_CWD` | server's cwd | Working directory when a call omits `cwd`. **Set this.** |
 | `CLI_AGENT_MCP_ALLOWED_CWDS` | — | If set, every task `cwd` must live under one of these roots (`;`-separated). |
 | `CLI_AGENT_MCP_MAX_TASKS` | `100` | Max retained tasks in memory. |
@@ -814,8 +816,8 @@ the returned `task_id` to carry it out. This turns *fire-and-pray* into
 *propose → review → execute*, and is the only way to get judgment in the loop
 before an action happens.
 
-It **fails closed**: agents that can't guarantee plan-only (`cursor`, `custom`)
-refuse the call rather than executing. `agent_list_agents` reports
+It **fails closed**: agents that can't guarantee plan-only (`cursor`, `kimi`,
+`custom`) refuse the call rather than executing. `agent_list_agents` reports
 `supports_plan_only` per agent.
 
 ### Bound what the worker may do
@@ -983,6 +985,7 @@ internal/config/            env-var configuration
 internal/agent/
   adapter.go                Adapter interface + registry + exec helper
   claude.go                 Claude Code adapter
+  kimi.go                   Kimi Code CLI adapter (role-discriminated stream-json)
   cursor.go                 Cursor adapter (bundled-runtime detection)
   custom.go                 generic, env-configured adapter for any CLI
   mock.go                   built-in mock agent
