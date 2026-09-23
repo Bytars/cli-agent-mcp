@@ -111,7 +111,7 @@ jobs:
           stage="$(mktemp -d)"
           mkdir -p "$stage/server"
           CGO_ENABLED=0 go build -trimpath -o "$stage/server/cli-agent-mcp" .
-          cp LICENSE NOTICE "$stage/"
+          cp LICENSE NOTICE mcpb/icon.png mcpb/icon-1024.png "$stage/"
           jq '.version = "0.0.0-ci" | .compatibility.platforms = ["linux"]' \
             mcpb/manifest.json > "$stage/manifest.json"
           npx -y @anthropic-ai/mcpb@2.1.2 pack "$stage" cli-agent-mcp_linux_amd64.mcpb

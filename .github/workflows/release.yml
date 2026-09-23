@@ -102,7 +102,7 @@ jobs:
             stage="$(mktemp -d)"
             mkdir -p "$stage/server"
             cp "dist/cli-agent-mcp_${os}_${arch}${ext}" "$stage/server/cli-agent-mcp${ext}"
-            cp LICENSE NOTICE "$stage/"
+            cp LICENSE NOTICE mcpb/icon.png mcpb/icon-1024.png "$stage/"
             jq --arg v "$VERSION" --arg p "$plat" \
               '.version = $v | .compatibility.platforms = [$p]' \
               mcpb/manifest.json > "$stage/manifest.json"
