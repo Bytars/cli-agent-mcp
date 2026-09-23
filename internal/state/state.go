@@ -62,10 +62,9 @@ func DefaultDir() string {
 }
 
 // ResolveDir turns a configured directory into the absolute path actually used,
-// applying the default for an empty value. Callers that need to read state
-// without opening a store — the pairing check runs before anything else, and
-// must not create directories on behalf of a launcher it has yet to authorize —
-// go through this.
+// applying the default for an empty value. Callers that need a state path
+// without opening a store go through this, so every path the server hands out
+// — grants, the approval config — is the same absolute one.
 func ResolveDir(dir string) string {
 	if strings.TrimSpace(dir) == "" {
 		dir = DefaultDir()
