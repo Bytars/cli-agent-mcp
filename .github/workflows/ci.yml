@@ -86,3 +86,33 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then exe=".exe"; fi
           go build -o "cli-agent-mcp$exe" .
           go run ./cmd/smoketest "./cli-agent-mcp$exe"
+
+  # The release packages every binary as an MCP Bundle (mcpb/manifest.json). A
+  # manifest that fails validation would only be found at tag time, with the
+  # release half-published; checking it on every PR moves that failure here.
+  mcpb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Validate and pack a bundle
+        run: |
+          set -euo pipefail
+          npx -y @anthropic-ai/mcpb@2.1.2 validate mcpb/manifest.json
+          stage="$(mktemp -d)"
+          mkdir -p "$stage/server"
+          CGO_ENABLED=0 go build -trimpath -o "$stage/server/cli-agent-mcp" .
+          cp LICENSE NOTICE "$stage/"
+          jq '.version = "0.0.0-ci" | .compatibility.platforms = ["linux"]' \
+            mcpb/manifest.json > "$stage/manifest.json"
+          npx -y @anthropic-ai/mcpb@2.1.2 pack "$stage" cli-agent-mcp_linux_amd64.mcpb
+          npx -y @anthropic-ai/mcpb@2.1.2 info cli-agent-mcp_linux_amd64.mcpb
