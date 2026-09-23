@@ -29,10 +29,9 @@ environment**. That means it can reach whatever the host machine can reach:
 The MCP client never sees your keys or tokens — it just delegates a task to a
 worker that already has access.
 
-That access is the feature, and it is also the reason to decide *who may ask*.
-Anything that can start this binary inherits the same reach, so pair your client
-once — [see below](#pair-the-client--do-this-once) — and a launcher you did not
-configure gets nothing.
+That access is the feature, and it is also the reason to be deliberate about
+*where the worker runs and what it may do* — see the
+[security model](#security-model).
 
 ```
 MCP client (e.g. Claude Desktop)
@@ -287,18 +286,38 @@ than having two.
 > closing the owner terminates them mid-write. Let them finish first.
 
 State lives in `%AppData%\cli-agent-mcp` on Windows and `~/.config/cli-agent-mcp`
-elsewhere, unless `CLI_AGENT_MCP_STATE_DIR` says otherwise. The
-[pairing record](#pair-the-client--do-this-once) sits alongside it as
-`pairing.json` — hashes and launcher paths, never a secret — which is why moving
-`CLI_AGENT_MCP_STATE_DIR` also moves what the server checks credentials against.
-
-A locked instance is the one exception to all of the above: it writes nothing
-here, not even the PID lock. Letting an unauthorized launcher take that lock
-would make the real server report a rival it cannot see.
+elsewhere, unless `CLI_AGENT_MCP_STATE_DIR` says otherwise.
 
 ## Install
 
-### With Go (recommended)
+### As a Claude Desktop extension (recommended)
+
+Every release ships the server as an **MCP Bundle** for each platform —
+`cli-agent-mcp_windows_amd64.mcpb`, `cli-agent-mcp_darwin_arm64.mcpb`, and so on —
+on the [**Releases**](https://github.com/Bytars/cli-agent-mcp/releases/latest)
+page. Double-click the file and Claude Desktop installs it: it launches the server
+itself and shows the settings as a form, so there is no JSON to edit and nothing
+to pair.
+
+| Setting | Default | What it sets |
+|---|---|---|
+| Default agent | `kimi` | `CLI_AGENT_MCP_DEFAULT_AGENT` — `kimi`, `claude`, `cursor` or `custom` |
+| Kimi Code CLI / Claude Code CLI | `kimi` / `claude` | the launchers, if they are not on `PATH` |
+| Default working directory | — | `CLI_AGENT_MCP_DEFAULT_CWD` |
+| Allowed directories | — | `CLI_AGENT_MCP_ALLOWED_CWDS`, `;`-separated. **Set it.** |
+| Denied tools | — | `CLI_AGENT_MCP_DISALLOWED_TOOLS` (Claude Code only) |
+| Claude Code permission mode | `acceptEdits` | `CLI_AGENT_MCP_PERMISSION_MODE` |
+
+Check the bundle before you open it, exactly as you would the raw binary:
+
+```bash
+gh attestation verify cli-agent-mcp_windows_amd64.mcpb --repo Bytars/cli-agent-mcp
+```
+
+The manifest lives in [`mcpb/manifest.json`](mcpb/manifest.json); every other
+setting in [Configuration](#configuration) keeps its default.
+
+### With Go
 
 ```bash
 go install github.com/Bytars/cli-agent-mcp@latest
@@ -323,6 +342,8 @@ The assets are raw binaries — no unzip needed.
 | Linux (x64) | `cli-agent-mcp_linux_amd64` |
 | Linux (ARM) | `cli-agent-mcp_linux_arm64` |
 
+Each binary also comes packaged as `<same name>.mcpb` — see
+[the extension](#as-a-claude-desktop-extension-recommended) above.
 `checksums.txt` (SHA-256) is attached to every release. On macOS/Linux remember to
 `chmod +x` the downloaded file.
 
@@ -395,59 +416,6 @@ Restart the client, and the `cli-agent` tools appear. Then ask it something like
 > The worker agent must be installed and **authenticated** on its own
 > (e.g. run `claude` or `cursor-agent` once interactively to log in).
 
-### Pair the client — do this once
-
-Until you pair, **any process on this machine can start this server** and
-delegate work to a coding agent that inherits your environment: your SSH keys,
-your VPN routes, an unlocked credential agent, and by default permission to edit
-files. Nothing distinguishes the client you configured from an npm postinstall
-script that decided to run the same binary.
-
-```bash
-cli-agent-mcp pair --install
-```
-
-That mints a secret, stores only its hash under your state directory, and writes
-the secret into Claude Desktop's config for you (it merges — your other servers
-and settings are left alone, and the previous file is backed up). Restart the
-client. From then on, a launcher that cannot present the secret gets a server
-whose every tool answers with an explanation instead of doing anything.
-
-Pair each client separately, so revoking one does not disturb the other:
-
-```bash
-cli-agent-mcp pair --label cowork        # prints the snippet to paste
-cli-agent-mcp pair --status              # what is paired, and to what
-cli-agent-mcp pair --revoke cowork       # take one client's access away
-cli-agent-mcp pair --label claude-desktop  # re-run to rotate a secret in place
-```
-
-**What this does and does not do.** The MCP conversation itself needs no
-protecting: it runs over an anonymous pipe between the client and this process,
-with no port and nothing on the wire to intercept. What pairing adds is
-authorization to *launch*. And it has a limit worth stating plainly — the secret
-sits in the client's config file, readable by anything running as you, so an
-attacker who already has that access can take it. Pairing stops code that can
-execute but not rummage through your profile; it is not a wall against a
-same-user attacker.
-
-That limit is why each token also binds to the program that first used it. A
-secret copied out of your config does not let some other process on the machine
-drive the server:
-
-```
-refusing to serve: token "claude-desktop" is bound to C:\...\Claude.exe but this
-server was launched by C:\Users\you\AppData\Local\Temp\something.exe
-```
-
-If you move or reinstall the client yourself, that is the same message — clear
-the binding with `cli-agent-mcp pair --unbind claude-desktop` and start it again.
-`pair --unpair` removes the whole record and goes back to serving any launcher.
-
-Rejected launches land in the [audit log](#audit-log) as `pairing_rejected`, with
-the program that attempted it. That is the only trace you get that something
-local tried.
-
 ## Configuration
 
 All configuration is environment variables, so it lives entirely in your client's
@@ -481,7 +449,6 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_CUSTOM_BIN` | — | Executable for the custom agent (see below). |
 | `CLI_AGENT_MCP_CUSTOM_ARGS` | — | Argument template for the custom agent, `;`-separated. |
 | `CLI_AGENT_MCP_CUSTOM_NAME` | `custom` | Name to expose the custom agent as. |
-| `CLI_AGENT_MCP_TOKEN` | — | The pairing credential the client presents at launch. Set it with [`cli-agent-mcp pair`](#pair-the-client--do-this-once), not by hand. |
 
 ## Drive any CLI agent (no code)
 
@@ -687,9 +654,6 @@ Each line is one event:
   `↳ ✗ (failed with no output — possibly blocked by security software / sandbox)`.
 - `turn_end` — status, exit code, duration, and a snippet of the result.
 - `cancel` — when a task was interrupted.
-- `pairing_rejected` — a launcher that could not authenticate, with why and the
-  program that tried. Unlike the rest, this one records work that *did not*
-  happen; it is the only trace that something local attempted to use the server.
 
 ```json
 {"ts":"2026-07-16T02:22:26Z","event":"turn_start","task_id":"task-1-…","agent":"claude","cwd":"/code/app","prompt":"run the tests","command":["claude","-p","run the tests","--output-format","stream-json","--verbose","--permission-mode","acceptEdits"]}
@@ -791,12 +755,36 @@ authenticate through 1Password with no further hand-holding.
 
 Read this section before pointing the server at anything you care about.
 
-### Decide who may start the server at all
+### Security model
 
-Everything below bounds what the worker may *do*. It says nothing about *who
-gets to ask*, and unpaired, the answer is "anything on this machine". Run
-[`cli-agent-mcp pair --install`](#pair-the-client--do-this-once) once, before the
-rest of this section is worth much.
+**The server has no network surface of its own.** It speaks MCP over stdio: the
+client starts it and owns both ends of the pipe. So there is no "who may launch
+it" check, and that is deliberate. Whatever can launch this binary is already
+running as you, with your environment — it can start `claude` or `kimi`
+directly and gains nothing by going through here. v0.13 to v0.15 tried anyway,
+with *pairing*; it could not stop a same-user attacker (the credential sat in a
+file that attacker can read) and it did lock the real client out whenever the
+client updated itself. It was removed in v0.16.0.
+
+What actually bounds the server:
+
+1. **Where the worker runs.** `CLI_AGENT_MCP_ALLOWED_CWDS` refuses any task whose
+   directory is outside the roots you list. Empty means anywhere. Set it.
+2. **What the worker may do.** The deny list, plan-first and permission prompts
+   below. They apply to Claude Code. **Kimi Code in headless mode runs its tool
+   calls without asking and has no deny flag** — give it work you would let it do
+   unattended, inside the allowed directories.
+3. **The two loopback endpoints.** The permission-prompt endpoint listens on
+   `127.0.0.1` on an ephemeral port and answers only to the per-task capability
+   URL written into that task's config. The `ui` viewer listens on localhost and
+   checks a per-run session token, `Host` and `Origin`.
+4. **The binary itself.** Releases are built by the public
+   [release workflow](.github/workflows/release.yml) from a tag and carry a
+   provenance attestation; verify with `gh attestation verify` before installing,
+   or build with `go install`.
+
+What it cannot protect against is code already running as you — the same as any
+other tool on your `PATH`.
 
 ### The client cannot stop the worker
 
@@ -951,11 +939,7 @@ SMOKE_AGENT=claude SMOKE_CWD=/path/to/scratch/repo SMOKE_ONLY=permission \
 ```
 
 It launches the server with its own state directory (`SMOKE_STATE_DIR`, default a
-temp path), which keeps mock runs out of your real task history — and matters on
-a machine where you have paired: the smoke test is precisely the unrecognised
-launcher that [pairing](#pair-the-client--do-this-once) turns away, and a fresh
-state directory is unpaired, so the server serves it. Point `SMOKE_STATE_DIR` at
-a paired directory to exercise the refusal instead.
+temp path), which keeps mock runs out of your real task history.
 
 CI ([`ci.yml`](.github/workflows/ci.yml)) runs the build, vet, unit tests and the
 mock smoke test on Linux and Windows for every push and PR. It does **not** run
@@ -981,6 +965,7 @@ be run manually from the Actions tab against an existing tag.
 
 ```
 main.go                     entry point, MCP tool wiring, viewer subcommands, __mock
+mcpb/manifest.json          MCP Bundle manifest: the Claude Desktop extension and its settings
 internal/config/            env-var configuration
 internal/agent/
   adapter.go                Adapter interface + registry + exec helper
@@ -996,13 +981,6 @@ internal/task/
   kill_windows.go           process-tree kill on cancel (Windows)
   kill_other.go             process-group kill on cancel (Unix)
 internal/audit/audit.go     append-only JSONL audit trail
-internal/pairing/           who may launch and drive this server
-  pairing.go                token issue/verify, and what it does not protect
-  gate.go                   how a rejection reaches the user and the model
-  cli.go                    the `pair` command
-  install.go                merging the token into a client's config
-  parent_windows.go         which program launched us? (Windows)
-  parent_other.go           which program launched us? (Unix)
 internal/state/
   state.go                  durable task records + the instance PID lock
   follow.go                 read-only tail of a transcript another process writes
