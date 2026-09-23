@@ -4,8 +4,13 @@
   "name": "cli-agent-mcp",
   "display_name": "CLI Agent MCP",
   "version": "0.0.0-dev",
-  "description": "Delegate coding and ops tasks to a local headless CLI agent (Kimi Code, Claude Code or Cursor) and watch it work.",
-  "long_description": "Runs a headless CLI coding agent on this machine as a background worker for Claude: it inherits this machine's environment (VPN routes, SSH agent, credentials), streams live progress, and can be asked for a plan before it executes anything. Installed as an extension, Claude Desktop launches it and passes the settings below; there is nothing to pair. Read the Security model section of the README before pointing it at anything you care about: https://github.com/Bytars/cli-agent-mcp#security-model",
+  "description": "Delegate coding and ops tasks to a local headless CLI agent (Kimi Code, Claude Code or Cursor) and watch it work. Built by Bytars.",
+  "long_description": "Runs a headless CLI coding agent on this machine as a background worker for Claude: it inherits this machine's environment (VPN routes, SSH agent, credentials), streams live progress, and can be asked for a plan before it executes anything. Installed as an extension, Claude Desktop launches it and passes the settings below; there is nothing to pair. Read the Security model section of the README before pointing it at anything you care about: https://github.com/Bytars/cli-agent-mcp#security-model\n\nBuilt and maintained by Bytars (https://www.bytars.com). Open source under Apache-2.0: issues and pull requests are welcome at https://github.com/Bytars/cli-agent-mcp",
+  "icon": "icon.png",
+  "icons": [
+    { "src": "icon.png", "size": "512x512" },
+    { "src": "icon-1024.png", "size": "1024x1024" }
+  ],
   "author": {
     "name": "Bytars",
     "url": "https://www.bytars.com"
