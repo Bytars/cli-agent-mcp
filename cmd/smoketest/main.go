@@ -47,10 +47,9 @@ func main() {
 	// this line.
 	//
 	// An operator who exported CLI_AGENT_MCP_STATE_DIR asked for that directory
-	// on purpose; explicit wins, exactly as it does in `pair` (issue #22). The
-	// temp default still does its two jobs when nobody asked for anything: it
-	// keeps mock runs out of the real task history, and it is unpaired, so a
-	// paired machine still serves this harness.
+	// on purpose; explicit wins (issue #22). The temp default still does its job
+	// when nobody asked for anything: it keeps mock runs out of the real task
+	// history.
 	stateDir := getenv("SMOKE_STATE_DIR", getenv("CLI_AGENT_MCP_STATE_DIR", filepath.Join(os.TempDir(), "cli-agent-mcp-smoketest")))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
@@ -66,11 +65,8 @@ func main() {
 		// Pin the gate closed so the extra_args assertion is hermetic regardless
 		// of what the developer happens to have exported.
 		"CLI_AGENT_MCP_ALLOW_EXTRA_ARGS=false",
-		// Its own state directory, for two reasons. The smoke test would
-		// otherwise write mock runs into the developer's real task history —
-		// and, on a machine where the server has been paired, it is exactly the
-		// unauthorized launcher that pairing exists to turn away. A fresh
-		// directory is unpaired, so the server serves it.
+		// Its own state directory: the smoke test would otherwise write mock
+		// runs into the developer's real task history.
 		"CLI_AGENT_MCP_STATE_DIR="+stateDir,
 	)
 	cmd.Stderr = os.Stderr

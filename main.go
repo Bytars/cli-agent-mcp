@@ -16,7 +16,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -33,7 +32,6 @@ import (
 	"github.com/Bytars/cli-agent-mcp/internal/config"
 	"github.com/Bytars/cli-agent-mcp/internal/grants"
 	"github.com/Bytars/cli-agent-mcp/internal/inspect"
-	"github.com/Bytars/cli-agent-mcp/internal/pairing"
 	"github.com/Bytars/cli-agent-mcp/internal/state"
 	"github.com/Bytars/cli-agent-mcp/internal/task"
 	"github.com/Bytars/cli-agent-mcp/internal/ui"
@@ -100,13 +98,12 @@ func main() {
 			log.SetPrefix("cli-agent-mcp: ")
 			log.SetFlags(0)
 			os.Exit(inspect.Run(os.Args[1:]))
-		case "pair":
-			// Issues the credential that authorizes a client to drive this
-			// server. A human runs this at a terminal, so it talks on stdout.
-			log.SetOutput(os.Stderr)
-			log.SetPrefix("cli-agent-mcp: ")
-			log.SetFlags(0)
-			os.Exit(pairing.Run(os.Args[2:], state.ResolveDir))
+		case "pair", "trust":
+			// Pairing was removed in v0.16.0 (see "Security model" in the
+			// README). Answer the old command instead of falling through into
+			// server mode, where it would hang on stdin with no explanation.
+			fmt.Fprint(os.Stderr, pairingRemoved)
+			os.Exit(2)
 		case "--list-agents":
 			// Handled further down, once the registry exists.
 		default:
@@ -129,27 +126,18 @@ func main() {
 
 	cfg := config.Load()
 
-	// Authorization is settled before anything with a side effect happens.
-	// An unauthorized launcher must not reach the instance lock: writing that
-	// file would let any local process disturb the legitimate server's view of
-	// the tasks it owns, which is a denial of service that needs no token at all.
-	//
 	// Resolved once, and every later user of a state path takes this one. Empty
 	// means "the per-user default", and passing cfg.StateDir straight through
 	// left grants with no directory at all and the approval config on a relative
 	// path the agent resolved against its own workspace — ResolveDir also makes
 	// it absolute, which is what closes that.
 	stateDir := state.ResolveDir(cfg.StateDir)
-	launcher := pairing.ParentExe()
-	gate, err := pairing.Verify(stateDir, cfg.Token, launcher)
-	if err != nil {
-		// Verify still returns a usable verdict on a write failure; the record
-		// simply did not get its timestamp or first-use binding updated.
-		log.Printf("warning: pairing record: %v", err)
-	}
-	log.Printf("%s", pairing.StartupLine(stateDir, gate))
-	if stderrMsg, _ := pairing.Explain(gate); stderrMsg != "" {
-		log.Print(stderrMsg)
+
+	// A client config written by `pair --install` still carries the old
+	// credential. It is harmless — nothing reads it — but say so once, so
+	// nobody goes looking for a lock that no longer exists.
+	if strings.TrimSpace(os.Getenv("CLI_AGENT_MCP_TOKEN")) != "" {
+		log.Printf("note: CLI_AGENT_MCP_TOKEN is set but ignored: pairing was removed in v0.16.0; you can delete it from the client config")
 	}
 
 	reg := agent.NewRegistry(
@@ -180,29 +168,11 @@ func main() {
 		log.Printf("task timeout: %s", cfg.TaskTimeout)
 	}
 
-	if !gate.Allowed() {
-		// A rejected launch is the one event in this log that means something
-		// tried to use the server and could not. Record who it was: it is the
-		// only trace that a local process attempted it.
-		auditLog.Log("pairing_rejected", map[string]any{
-			"status": pairing.StatusName(gate.Status),
-			"label":  gate.Label,
-			"parent": launcher,
-			"detail": gate.Detail,
-		})
-	}
-
 	// The task registry has to outlive the process. Clients do start a second
 	// server instance — sometimes alongside the first rather than in place of
 	// it — and an instance that came up with an empty map used to report that
 	// emptiness as fact while the other one's workers kept running.
-	//
-	// An unauthorized instance stays out of all of it. It will run no tasks, so
-	// it has nothing to persist, and taking the lock would only make the real
-	// server report a phantom rival it cannot see.
-	if !gate.Allowed() {
-		log.Printf("task state: not touched while locked")
-	} else if store, err := state.Open(stateDir); err != nil {
+	if store, err := state.Open(stateDir); err != nil {
 		log.Printf("warning: task state is not being saved: %v", err)
 	} else {
 		defer store.Close()
@@ -279,29 +249,15 @@ func main() {
 	caps := &mcp.ServerCapabilities{Logging: &mcp.LoggingCapabilities{}}
 	caps.AddExtension(ui.ExtensionName, ui.Capability())
 
-	serverInstructions := instructions
-	if _, clientMsg := pairing.Explain(gate); clientMsg != "" {
-		serverInstructions = clientMsg
-	}
-
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "cli-agent-mcp",
 		Version: version,
 	}, &mcp.ServerOptions{
-		Instructions: serverInstructions,
+		Instructions: instructions,
 		Capabilities: caps,
 	})
 
 	registerTools(srv, reg, mgr, cfg, desk, grantStore)
-
-	// The tools stay registered when locked, and the middleware answers for
-	// them. Serving an empty tool list instead would tell the model nothing —
-	// it would simply conclude the server has no capabilities and move on,
-	// leaving the user to guess why the thing they configured does nothing.
-	if !gate.Allowed() {
-		_, clientMsg := pairing.Explain(gate)
-		srv.AddReceivingMiddleware(lockdown(clientMsg))
-	}
 
 	log.Printf("starting (default agent=%s, max_tasks=%d)", cfg.DefaultAgent, cfg.MaxTasks)
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
@@ -309,7 +265,7 @@ func main() {
 	}
 }
 
-const instructions = `This server delegates coding/ops tasks to a headless CLI agent (Claude Code, Cursor, or a custom-configured tool) running on the host machine. The worker inherits that machine's environment, so it can reach whatever the host can — including private networks and hosts behind an SSH agent. Treat the worker as an extension of yourself: delegate, watch it work, and report the result as if you did it.
+const instructions = `This server delegates coding/ops tasks to a headless CLI agent (Claude Code, Kimi Code, Cursor, or a custom-configured tool) running on the host machine. The worker inherits that machine's environment, so it can reach whatever the host can — including private networks and hosts behind an SSH agent. Treat the worker as an extension of yourself: delegate, watch it work, and report the result as if you did it.
 
 PREFERRED (seamless, no polling):
 - agent_run_task — delegate a task and WAIT; the tool streams live progress notifications while the agent works, then returns the final result inline. Use this by default.
@@ -446,32 +402,6 @@ func errResult(msg string) *mcp.CallToolResult {
 
 // ptr returns a pointer to v, for the SDK's optional *bool annotation fields.
 func ptr[T any](v T) *T { return &v }
-
-// lockdown turns an unauthorized server into one that answers every request
-// with the same explanation instead of doing any work.
-//
-// It sits in front of the dispatcher rather than inside each handler so that a
-// tool added later cannot forget to check. initialize, tools/list and ping are
-// deliberately left alone: the client has to complete a handshake and read the
-// tool list before it can call anything, and that is the path by which the
-// explanation reaches the model at all.
-func lockdown(msg string) mcp.Middleware {
-	return func(next mcp.MethodHandler) mcp.MethodHandler {
-		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
-			switch method {
-			case "tools/call":
-				// A tool-level error, not a protocol one: this is a refusal the
-				// model is meant to read and relay, not a transport fault.
-				return errResult(msg), nil
-			case "resources/read":
-				// The task board reads its data through here, and rendering it
-				// empty would look like "no tasks" rather than "not authorized".
-				return nil, errors.New(msg)
-			}
-			return next(ctx, method, req)
-		}
-	}
-}
 
 // readOnlyTool / mutatingTool are the annotation hints shared by the tools of
 // each kind. Read-only tools only inspect this server's own task state;
@@ -636,7 +566,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_run_task",
-		Description: "Delegate a task to a local headless CLI agent (Claude Code or Cursor) and WAIT for it to finish, streaming live progress notifications as the agent works. This is the seamless, in-line mode — no polling — so it feels like you did the work yourself. Use agent_start_task instead only when you want fire-and-forget or several tasks running in parallel.",
+		Description: "Delegate a task to a local headless CLI agent (Claude Code, Kimi Code or Cursor) and WAIT for it to finish, streaming live progress notifications as the agent works. This is the seamless, in-line mode — no polling — so it feels like you did the work yourself. Use agent_start_task instead only when you want fire-and-forget or several tasks running in parallel.",
 		Annotations: mutatingTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in startInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
@@ -735,7 +665,7 @@ func registerTools(srv *mcp.Server, reg *agent.Registry, mgr *task.Manager, cfg 
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "agent_start_task",
-		Description: "Delegate a task to a local headless CLI agent (Claude Code or Cursor) WITHOUT waiting. Returns a task_id immediately; runs in the background. Use for fire-and-forget or running several agents in parallel, then poll agent_task_status. For the seamless single-task experience, prefer agent_run_task.",
+		Description: "Delegate a task to a local headless CLI agent (Claude Code, Kimi Code or Cursor) WITHOUT waiting. Returns a task_id immediately; runs in the background. Use for fire-and-forget or running several agents in parallel, then poll agent_task_status. For the seamless single-task experience, prefer agent_run_task.",
 		Annotations: mutatingTool(),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in startInput) (*mcp.CallToolResult, task.Snapshot, error) {
 		if strings.TrimSpace(in.Prompt) == "" {
@@ -1082,6 +1012,25 @@ func printHelp() {
 	fmt.Print(helpText())
 }
 
+// pairingRemoved answers `pair` and `trust`, which existed until v0.15.0.
+//
+// Pairing tried to decide which local process may launch this server. Over
+// stdio that is not a boundary: whoever can launch the binary is already
+// running as the user and can start the same agents directly, with the same
+// environment. What it did produce was lockouts — a client that updated itself
+// (MSIX puts the version in the path) or read a different %APPDATA% was turned
+// away as an intruder. The boundaries that do hold are listed in the README
+// under "Security model".
+const pairingRemoved = `cli-agent-mcp: pairing was removed in v0.16.0.
+
+Nothing needs to be paired any more: the server answers the client that
+launches it over stdio. An old CLI_AGENT_MCP_TOKEN in the client config is
+ignored and can be deleted.
+
+What actually bounds this server is described under "Security model" in
+https://github.com/Bytars/cli-agent-mcp#security-model
+`
+
 // helpText is the usage block, kept separate from printHelp so the unknown-flag
 // path can write it to stderr instead of stdout.
 func helpText() string {
@@ -1093,10 +1042,6 @@ background worker, with live progress streaming.
 
 Usage:
   cli-agent-mcp                 Run the MCP server over stdio (how an MCP client launches it).
-  cli-agent-mcp pair            Authorize an MCP client to drive this server. Run it once
-                                per client; --install edits the client's config for you.
-                                Until you do, any local process can start this server and
-                                delegate work to an agent that inherits your environment.
   cli-agent-mcp tasks           List delegated tasks and their status, then exit.
   cli-agent-mcp logs [TASK]     Follow a task's output live in the terminal. Without
                                 TASK it shows a picker; --all follows every running
@@ -1146,10 +1091,6 @@ Configuration (environment variables):
   CLI_AGENT_MCP_COMPACT            Return a filtered, readable transcript from
                                    agent_get_output/agent_watch instead of raw
                                    JSONL.                               (default: true)
-  CLI_AGENT_MCP_TOKEN              The pairing credential the client presents at launch.
-                                   Set it with 'cli-agent-mcp pair', in the client's own
-                                   config — not by hand here. Once paired, a launcher
-                                   without it gets a server that refuses every tool call.
 
 Bounding what the worker may do:
   A headless run executes tool calls by default. To BLOCK dangerous ones use the

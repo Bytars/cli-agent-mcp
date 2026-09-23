@@ -77,6 +77,37 @@ jobs:
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
               -ldflags "-s -w -X main.version=${VERSION}" -o "$out" .
           done
+          ls -lh dist
+
+      # The same binaries, packaged as MCP Bundles (.mcpb): Claude Desktop installs
+      # one with a double click, launches the server itself and shows the
+      # settings in mcpb/manifest.json as a form — no hand-edited config and
+      # nothing to pair. One bundle per platform, each carrying only its own
+      # binary. The CLI is pinned for the same reason go-winres is above: this
+      # is the release path.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Package MCP Bundles
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          npx -y @anthropic-ai/mcpb@2.1.2 validate mcpb/manifest.json
+          for t in windows/amd64 windows/arm64 darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+            os="${t%/*}"; arch="${t#*/}"
+            case "$os" in windows) plat=win32; ext=".exe";; *) plat="$os"; ext="";; esac
+            stage="$(mktemp -d)"
+            mkdir -p "$stage/server"
+            cp "dist/cli-agent-mcp_${os}_${arch}${ext}" "$stage/server/cli-agent-mcp${ext}"
+            cp LICENSE NOTICE "$stage/"
+            jq --arg v "$VERSION" --arg p "$plat" \
+              '.version = $v | .compatibility.platforms = [$p]' \
+              mcpb/manifest.json > "$stage/manifest.json"
+            npx -y @anthropic-ai/mcpb@2.1.2 pack "$stage" "dist/cli-agent-mcp_${os}_${arch}.mcpb"
+          done
           ( cd dist && sha256sum * > checksums.txt )
           ls -lh dist
 

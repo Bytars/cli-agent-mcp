@@ -1,0 +1,97 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-v0.3.schema.json",
+  "manifest_version": "0.3",
+  "name": "cli-agent-mcp",
+  "display_name": "CLI Agent MCP",
+  "version": "0.0.0-dev",
+  "description": "Delegate coding and ops tasks to a local headless CLI agent (Kimi Code, Claude Code or Cursor) and watch it work.",
+  "long_description": "Runs a headless CLI coding agent on this machine as a background worker for Claude: it inherits this machine's environment (VPN routes, SSH agent, credentials), streams live progress, and can be asked for a plan before it executes anything. Installed as an extension, Claude Desktop launches it and passes the settings below; there is nothing to pair. Read the Security model section of the README before pointing it at anything you care about: https://github.com/Bytars/cli-agent-mcp#security-model",
+  "author": {
+    "name": "Bytars",
+    "url": "https://www.bytars.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Bytars/cli-agent-mcp"
+  },
+  "homepage": "https://github.com/Bytars/cli-agent-mcp",
+  "support": "https://github.com/Bytars/cli-agent-mcp/issues",
+  "license": "Apache-2.0",
+  "keywords": ["agents", "kimi", "claude-code", "cursor", "delegation"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/cli-agent-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/server/cli-agent-mcp",
+      "args": [],
+      "env": {
+        "CLI_AGENT_MCP_DEFAULT_AGENT": "${user_config.default_agent}",
+        "CLI_AGENT_MCP_KIMI_BIN": "${user_config.kimi_bin}",
+        "CLI_AGENT_MCP_CLAUDE_BIN": "${user_config.claude_bin}",
+        "CLI_AGENT_MCP_DEFAULT_CWD": "${user_config.default_cwd}",
+        "CLI_AGENT_MCP_ALLOWED_CWDS": "${user_config.allowed_cwds}",
+        "CLI_AGENT_MCP_DISALLOWED_TOOLS": "${user_config.disallowed_tools}",
+        "CLI_AGENT_MCP_PERMISSION_MODE": "${user_config.permission_mode}"
+      },
+      "platform_overrides": {
+        "win32": {
+          "command": "${__dirname}/server/cli-agent-mcp.exe"
+        }
+      }
+    }
+  },
+  "user_config": {
+    "default_agent": {
+      "type": "string",
+      "title": "Default agent",
+      "description": "Agent used when a task does not name one: kimi, claude, cursor or custom.",
+      "default": "kimi",
+      "required": false
+    },
+    "kimi_bin": {
+      "type": "string",
+      "title": "Kimi Code CLI",
+      "description": "Launcher for Kimi Code. Leave as 'kimi' if it is on PATH, or give the full path, e.g. C:\\Users\\you\\.kimi-code\\bin\\kimi.exe.",
+      "default": "kimi",
+      "required": false
+    },
+    "claude_bin": {
+      "type": "string",
+      "title": "Claude Code CLI",
+      "description": "Launcher for Claude Code. Leave as 'claude' if it is on PATH.",
+      "default": "claude",
+      "required": false
+    },
+    "default_cwd": {
+      "type": "string",
+      "title": "Default working directory",
+      "description": "Where a task runs when it does not name a directory. Empty means the directory Claude Desktop starts the server in.",
+      "default": "",
+      "required": false
+    },
+    "allowed_cwds": {
+      "type": "string",
+      "title": "Allowed directories (recommended)",
+      "description": "Roots a task may run in, separated by ';'. A task asking for anything outside them is refused. Empty means any directory — the worker inherits your whole environment, so set this.",
+      "default": "",
+      "required": false
+    },
+    "disallowed_tools": {
+      "type": "string",
+      "title": "Denied tools (Claude Code)",
+      "description": "Claude Code --disallowedTools, the real deny list, e.g. Bash(rm:*),Bash(git push:*). Kimi Code has no equivalent flag: it runs its tool calls without asking.",
+      "default": "",
+      "required": false
+    },
+    "permission_mode": {
+      "type": "string",
+      "title": "Claude Code permission mode",
+      "description": "acceptEdits (default), auto, plan, manual, dontAsk or bypassPermissions.",
+      "default": "acceptEdits",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["win32", "darwin", "linux"]
+  }
+}
