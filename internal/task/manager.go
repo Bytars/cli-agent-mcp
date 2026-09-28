@@ -333,6 +333,17 @@ type Manager struct {
 
 	// grants are the permissions the user granted permanently.
 	grants *grants.Store
+
+	// root is the context every turn hangs off, and rootCancel is how the
+	// server kills them all at once. A turn deliberately does not hang off the
+	// MCP call that asked for it — see runDetached — but it must hang off
+	// something, or nothing can ever stop it. Before this existed each turn
+	// used context.Background(), so when the server went away the worker and
+	// its process tree carried on. Measured on Linux: after the client closed
+	// stdin the server exited and the mock child was reparented and still
+	// running ten seconds later.
+	root       context.Context
+	rootCancel context.CancelFunc
 }
 
 // NewManager builds a task manager retaining up to maxTasks tasks.
@@ -340,13 +351,50 @@ func NewManager(maxTasks int) *Manager {
 	if maxTasks <= 0 {
 		maxTasks = 100
 	}
-	return &Manager{tasks: make(map[string]*Task), maxTasks: maxTasks, desk: newDesk()}
+	root, cancel := context.WithCancel(context.Background())
+	return &Manager{
+		tasks:      make(map[string]*Task),
+		maxTasks:   maxTasks,
+		desk:       newDesk(),
+		root:       root,
+		rootCancel: cancel,
+	}
+}
+
+// Shutdown stops every running turn and waits for the workers to actually be
+// gone, up to grace.
+//
+// The wait is the point, not politeness. Cancelling the root context only
+// starts the teardown: os/exec notices the cancellation on a goroutine of its
+// own, and that goroutine is what reaches procGuard's Cancel and signals the
+// process group (Unix) or terminates the job (Windows). Returning immediately
+// would let main return first, and a Go program that returns from main takes
+// every goroutine with it — including the one that had not killed the child
+// yet. The orphan this is meant to prevent would survive by a few
+// microseconds' bad luck.
+//
+// It reports whether everything stopped within the grace period, so a caller
+// can say so rather than claim a clean shutdown it did not get.
+func (m *Manager) Shutdown(grace time.Duration) bool {
+	m.rootCancel()
+
+	deadline := time.Now().Add(grace)
+	for {
+		if m.Running() == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // SetAudit attaches an audit logger; nil or a disabled logger is fine.
 func (m *Manager) SetAudit(a *audit.Logger) { m.audit = a }
 
-// SetTaskTimeout sets a per-turn timeout; zero disables it.
+// SetTaskTimeout sets a per-turn timeout; zero disables it. The server passes
+// config.Load().TaskTimeout, which is no longer zero by default.
 func (m *Manager) SetTaskTimeout(d time.Duration) { m.timeout = d }
 
 // SetMaxConcurrent caps how many workers may run at once; zero disables it.
@@ -476,7 +524,7 @@ func (m *Manager) StartTask(a agent.Adapter, ws Workspace, spec agent.RunSpec, o
 
 	t.persist()
 
-	go m.runTurn(context.Background(), t, spec, nil)
+	go m.runTurn(m.root, t, spec, nil)
 	return t, nil
 }
 
@@ -545,11 +593,15 @@ func (m *Manager) newTask(a agent.Adapter, ws Workspace, spec agent.RunSpec) *Ta
 // caller stopped listening — the task was lost for the sole reason that nobody
 // was watching it. ctx still bounds how long *this call* waits, which is all it
 // was ever able to speak for.
+//
+// It hangs off m.root instead, which outlives every call and dies with the
+// server. That is the distinction that matters: a turn must survive the
+// request, and must not survive the process.
 func (m *Manager) runDetached(ctx context.Context, t *Task, spec agent.RunSpec, opts Options) (finished bool) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m.runTurn(context.Background(), t, spec, opts.Sink)
+		m.runTurn(m.root, t, spec, opts.Sink)
 	}()
 
 	window := opts.Window
@@ -697,12 +749,23 @@ func (m *Manager) Followup(id, prompt string, allowedTools, extraArgs []string, 
 		t.approver = opts.Approver
 		t.mu.Unlock()
 	}
-	go m.runTurn(context.Background(), t, spec, nil)
+	go m.runTurn(m.root, t, spec, nil)
 	return t, nil
 }
 
 func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, sink EventSink) {
 	ctx, cancel := context.WithCancel(parent)
+	// Every exit has to cancel, not just the ones that go wrong. cancel() was
+	// reached from fail(), from the timeout and from Manager.Cancel — all of
+	// them failure paths — so a turn that simply succeeded returned without
+	// ever cancelling, and watchCancelRequest below sat on ctx.Done() forever.
+	// Measured: 100 successful turns left 100 goroutines waking once a second
+	// for the life of the process.
+	//
+	// It is safe here even though the process is already reaped by the time
+	// this runs: os/exec stops watching the context once Wait returns, so a
+	// late cancel cannot reach cmd.Cancel and kill anything.
+	defer cancel()
 
 	t.mu.Lock()
 	t.cancel = cancel
@@ -909,7 +972,7 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	switch {
 	case t.timedOut:
 		t.status = StatusFailed
-		t.runErr = fmt.Sprintf("timed out after %s (the agent may be blocked on a permission prompt with no approver; pre-approve the tool via allowed_tools / CLI_AGENT_MCP_ALLOWED_TOOLS)", m.timeout)
+		t.runErr = fmt.Sprintf("timed out after %s (the agent may be blocked on a permission prompt with no approver; pre-approve the tool via allowed_tools / CLI_AGENT_MCP_ALLOWED_TOOLS). Raise or disable this limit with CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS; 0 turns it off.", m.timeout)
 	case t.canceledRequested:
 		t.status = StatusCanceled
 	case waitErr == nil && !t.isError:

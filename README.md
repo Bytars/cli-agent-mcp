@@ -444,7 +444,7 @@ All configuration is environment variables, so it lives entirely in your client'
 | `CLI_AGENT_MCP_ASK_PERMISSION` | `true` | Let a worker ask you before using a tool it was not pre-approved for, instead of stalling. |
 | `CLI_AGENT_MCP_PERMISSION_TIMEOUT_SECONDS` | `600` | How long a worker waits for that answer before giving up on it. |
 | `CLI_AGENT_MCP_AUDIT_LOG` | — | Path to a JSONL audit log of what the worker did. See [Audit log](#audit-log). |
-| `CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS` | `0` (off) | Kill a turn that runs longer than this — a safety net for a worker hung on a permission prompt. |
+| `CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS` | `3600` (60 min) | Kill a turn that runs longer than this — a safety net for a worker hung on a permission prompt. Set `0` to turn the limit off. |
 | `CLI_AGENT_MCP_COMPACT` | `true` | `agent_get_output`/`agent_watch` return a filtered, readable transcript instead of raw JSONL (pass `raw: true` on a call to override). |
 | `CLI_AGENT_MCP_CUSTOM_BIN` | — | Executable for the custom agent (see below). |
 | `CLI_AGENT_MCP_CUSTOM_ARGS` | — | Argument template for the custom agent, `;`-separated. |
@@ -865,9 +865,10 @@ the `extra_args` escape hatch:
   policy still wins. This is the safe way for a client to request scoped
   permissions without opening `extra_args`.
 
-Belt and suspenders: set `CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS` so a run that stalls
-anyway is killed with a clear "timed out — possibly blocked on a permission
-prompt" error instead of hanging forever.
+Belt and suspenders: a turn that stalls anyway is killed after 60 minutes with a
+clear "timed out — possibly blocked on a permission prompt" error instead of
+hanging forever. That limit is on by default; `CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS`
+raises or lowers it, and `0` turns it off for genuinely long-running work.
 
 Because a denylist is inherently incomplete, it is one layer — combine it with the
 directory boundary, plan-first, director-mode supervision, and the audit log

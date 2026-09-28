@@ -19,9 +19,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -259,11 +261,42 @@ func main() {
 
 	registerTools(srv, reg, mgr, cfg, desk, grantStore)
 
+	// The server's own lifetime, and the only thing the workers hang off. It
+	// ends on a signal or when the client goes away; either way every turn in
+	// flight has to end with it.
+	//
+	// SIGTERM is a no-op on Windows and listing it costs nothing there; Ctrl+C
+	// arrives as os.Interrupt on both.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	log.Printf("starting (default agent=%s, max_tasks=%d)", cfg.DefaultAgent, cfg.MaxTasks)
-	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
-		log.Fatalf("server exited: %v", err)
+	runErr := srv.Run(ctx, &mcp.StdioTransport{})
+
+	// Both ways out land here. A signal cancels ctx and srv.Run returns;
+	// a client that closes stdin makes it return too — measured on Linux, it
+	// comes back with a nil error the moment the pipe reaches EOF.
+	//
+	// What did NOT happen by itself is the part that matters. On Windows the
+	// worker's process tree dies with this process anyway, because the job
+	// object holding it is created with KILL_ON_JOB_CLOSE and the last handle
+	// goes when we do. Unix has no equivalent: the worker leads its own
+	// process group and nothing signals it, so it was simply reparented and
+	// kept running. Measured on Linux: ten seconds after the client left, the
+	// worker was still there with a new parent.
+	if !mgr.Shutdown(shutdownGrace) {
+		log.Printf("warning: %d worker(s) still running after %s; leaving them", mgr.Running(), shutdownGrace)
+	}
+
+	if runErr != nil && ctx.Err() == nil {
+		log.Fatalf("server exited: %v", runErr)
 	}
 }
+
+// shutdownGrace bounds how long the server waits for its workers to die before
+// giving up on them and saying so. It has to stay well under the ten seconds
+// the acceptance criterion allows for the tree to be gone.
+const shutdownGrace = 5 * time.Second
 
 const instructions = `This server delegates coding/ops tasks to a headless CLI agent (Claude Code, Kimi Code, Cursor, or a custom-configured tool) running on the host machine. The worker inherits that machine's environment, so it can reach whatever the host can — including private networks and hosts behind an SSH agent. Treat the worker as an extension of yourself: delegate, watch it work, and report the result as if you did it.
 
