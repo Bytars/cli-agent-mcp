@@ -744,12 +744,29 @@ Fix: tell the worker to always use the full Windows path. Set once, applies to
 every task:
 
 ```json
-"CLI_AGENT_MCP_APPEND_SYSTEM_PROMPT": "For any SSH/scp to internal servers, always invoke the Windows OpenSSH client by its full path C:\\Windows\\System32\\OpenSSH\\ssh.exe (and scp.exe) — the bare 'ssh' resolves to git-bash OpenSSH which cannot reach the 1Password SSH agent. Use -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new."
+"CLI_AGENT_MCP_APPEND_SYSTEM_PROMPT": "For any SSH/scp to internal servers, always invoke the Windows OpenSSH client by its full path C:\\Windows\\System32\\OpenSSH\\ssh.exe (and scp.exe) — the bare 'ssh' resolves to git-bash OpenSSH which cannot reach the 1Password SSH agent. Connect as root@<NetBird IP>, never by hostname. Do NOT pass -o BatchMode=yes and do NOT relax StrictHostKeyChecking."
 ```
 
-Verified: with this in place, a plain task like *"connect to root@bastion and
-report its hostname"* makes the worker reach for the Windows client and
-authenticate through 1Password with no further hand-holding.
+Verified: with this in place, a plain task like *"connect to root@<the bastion's
+NetBird IP> and report its hostname"* makes the worker reach for the Windows
+client and authenticate through 1Password with no further hand-holding.
+
+> **Corrected 2026-09-28 — the previous version of this prompt was wrong in two
+> ways that break or weaken exactly this setup:**
+>
+> - **`-o BatchMode=yes` suppresses the 1Password approval dialog.** The
+>   signature never gets approved and the connection dies in a timeout that
+>   reads like "agent down". It cost five cycles before it was diagnosed
+>   (`Bytars/exchange` `METODOLOGIA-ssh-1password-windows.md`, `PROTOCOLO.md`
+>   §servidores).
+> - **`StrictHostKeyChecking=accept-new` trusts any new host key silently.**
+>   Trusting a new key is a human decision made with evidence (the fingerprint
+>   checked through a second path — `Bytars/infrastructure` `AGENTS.md` §3).
+>
+> Hosts are reached by **NetBird IP, never by hostname**: `srv1435719` has a stale
+> `known_hosts` entry that raises `REMOTE HOST IDENTIFICATION HAS CHANGED`. The
+> table of IPs lives in `Bytars/exchange` `PROTOCOLO.md` §«Cómo se llega a los
+> servidores»; it is not copied here.
 
 ## ⚠️ Permissions & safety
 
