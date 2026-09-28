@@ -23,6 +23,20 @@ func warnInvalid(key, value, reason string, def any) {
 	log.Printf("warning: %s=%q %s; using default %v", key, value, reason, def)
 }
 
+// DefaultTaskTimeout bounds a single turn when the operator has not said
+// otherwise.
+//
+// It used to be zero — no limit — which reads as the cautious choice and is
+// the opposite. A headless worker blocked on a permission prompt nobody can
+// answer holds its process tree, its files and its credentials until the
+// server dies, and the one person who could notice is the one who is not
+// watching. A net only helps if it is there before anyone thinks to hang it.
+//
+// An hour is long enough that no honest turn hits it by accident, and short
+// enough that a stuck one does not outlive the session. Set
+// CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS to change it, or to 0 to turn it off.
+const DefaultTaskTimeout = 60 * time.Minute
+
 // Config is the fully-resolved server configuration.
 type Config struct {
 	// DefaultAgent is used when a tool call does not specify one.
@@ -138,7 +152,8 @@ type Config struct {
 
 	// TaskTimeout, if > 0, cancels any turn that runs longer than this. It is a
 	// safety net against a worker that hangs — e.g. blocked on a permission
-	// prompt with no human to approve it. Zero means no timeout.
+	// prompt with no human to approve it. Defaults to DefaultTaskTimeout; zero
+	// means no timeout, and has to be asked for explicitly.
 	TaskTimeout time.Duration
 
 	// AskPermission lets a worker put a permission request to the person who
@@ -272,13 +287,17 @@ func Load() Config {
 		}
 	}
 
-	var taskTimeout time.Duration
+	taskTimeout := DefaultTaskTimeout
 	if v := os.Getenv("CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS"); v != "" {
 		switch n, err := strconv.Atoi(v); {
 		case err != nil:
-			warnInvalid("CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS", v, "is not an integer", "no timeout")
-		case n <= 0:
-			warnInvalid("CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS", v, "must be greater than 0", "no timeout")
+			warnInvalid("CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS", v, "is not an integer", DefaultTaskTimeout)
+		case n < 0:
+			warnInvalid("CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS", v, "cannot be negative", DefaultTaskTimeout)
+		case n == 0:
+			// Zero is the documented way out, not a mistake: an operator who
+			// runs genuinely long jobs has to be able to turn the net off.
+			taskTimeout = 0
 		default:
 			taskTimeout = time.Duration(n) * time.Second
 		}

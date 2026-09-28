@@ -346,7 +346,8 @@ func NewManager(maxTasks int) *Manager {
 // SetAudit attaches an audit logger; nil or a disabled logger is fine.
 func (m *Manager) SetAudit(a *audit.Logger) { m.audit = a }
 
-// SetTaskTimeout sets a per-turn timeout; zero disables it.
+// SetTaskTimeout sets a per-turn timeout; zero disables it. The server passes
+// config.Load().TaskTimeout, which is no longer zero by default.
 func (m *Manager) SetTaskTimeout(d time.Duration) { m.timeout = d }
 
 // SetMaxConcurrent caps how many workers may run at once; zero disables it.
@@ -703,6 +704,17 @@ func (m *Manager) Followup(id, prompt string, allowedTools, extraArgs []string, 
 
 func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, sink EventSink) {
 	ctx, cancel := context.WithCancel(parent)
+	// Every exit has to cancel, not just the ones that go wrong. cancel() was
+	// reached from fail(), from the timeout and from Manager.Cancel — all of
+	// them failure paths — so a turn that simply succeeded returned without
+	// ever cancelling, and watchCancelRequest below sat on ctx.Done() forever.
+	// Measured: 100 successful turns left 100 goroutines waking once a second
+	// for the life of the process.
+	//
+	// It is safe here even though the process is already reaped by the time
+	// this runs: os/exec stops watching the context once Wait returns, so a
+	// late cancel cannot reach cmd.Cancel and kill anything.
+	defer cancel()
 
 	t.mu.Lock()
 	t.cancel = cancel
@@ -909,7 +921,7 @@ func (m *Manager) runTurn(parent context.Context, t *Task, spec agent.RunSpec, s
 	switch {
 	case t.timedOut:
 		t.status = StatusFailed
-		t.runErr = fmt.Sprintf("timed out after %s (the agent may be blocked on a permission prompt with no approver; pre-approve the tool via allowed_tools / CLI_AGENT_MCP_ALLOWED_TOOLS)", m.timeout)
+		t.runErr = fmt.Sprintf("timed out after %s (the agent may be blocked on a permission prompt with no approver; pre-approve the tool via allowed_tools / CLI_AGENT_MCP_ALLOWED_TOOLS). Raise or disable this limit with CLI_AGENT_MCP_TASK_TIMEOUT_SECONDS; 0 turns it off.", m.timeout)
 	case t.canceledRequested:
 		t.status = StatusCanceled
 	case waitErr == nil && !t.isError:
