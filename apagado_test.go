@@ -78,6 +78,10 @@ func TestCerrarStdinMataElTurnoEnCurso(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("arrancando el servidor: %v", err)
 	}
+	// Cosechar al servidor en cuanto salga. Sin esto queda de zombi hasta que
+	// termina el test, y en Unix un zombi sigue teniendo entrada en ps: la
+	// primera versión de este test lo contaba como si siguiera vivo.
+	go func() { _ = srv.Wait() }()
 	// Red de contención: si el test falla, lo que quede vivo es exactamente lo
 	// que el defecto deja vivo, y no puede quedar corriendo después.
 	t.Cleanup(func() { matáPorNombre(nombreServidorDePrueba + sufijoEjecutable()) })
@@ -149,22 +153,34 @@ func sufijoEjecutable() string {
 	return ""
 }
 
-// procesosVivos cuenta los procesos cuya imagen es nombre. El nombre es único
-// de este test, así que la cuenta no puede confundirse con ningún otro binario.
+// procesosVivos cuenta los procesos VIVOS cuya imagen es nombre. El nombre es
+// único de este test, así que la cuenta no puede confundirse con ningún otro
+// binario.
+//
+// "Vivos" excluye los zombis, y no es un detalle. En Unix un proceso que ya
+// salió sigue teniendo entrada en ps hasta que su padre lo cosecha, y este
+// test contaba esa entrada: medido en Linux, el criterio informaba 2 procesos
+// cuando en realidad había uno solo —el hijo huérfano— más el cadáver del
+// servidor. La cuenta correcta es la que sólo ve lo que todavía retiene
+// archivos, puertos y credenciales.
 func procesosVivos(t *testing.T, nombre string) int {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		// /NH quita el encabezado; sin tareas, tasklist escribe una línea
-		// "INFO:" que no contiene el nombre de la imagen.
+		// "INFO:" que no contiene el nombre de la imagen. Windows no tiene
+		// zombis: un proceso que salió ya no aparece.
 		out, _ := exec.Command("tasklist", "/FI", "IMAGENAME eq "+nombre, "/NH", "/FO", "CSV").Output()
 		return strings.Count(string(out), `"`+nombre+`"`)
 	}
-	out, _ := exec.Command("pgrep", "-c", "-f", nombre).Output()
+	// stat= y args= sin encabezado: cada línea es "<estado> <línea de órdenes>".
+	out, _ := exec.Command("ps", "-e", "-o", "stat=", "-o", "args=").Output()
 	n := 0
-	for _, l := range strings.Fields(string(out)) {
-		if v, err := time.ParseDuration(l + "ns"); err == nil {
-			n = int(v)
+	for línea := range strings.SplitSeq(string(out), "\n") {
+		línea = strings.TrimSpace(línea)
+		if !strings.Contains(línea, nombre) || strings.HasPrefix(línea, "Z") {
+			continue
 		}
+		n++
 	}
 	return n
 }
