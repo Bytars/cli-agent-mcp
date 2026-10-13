@@ -1,0 +1,35 @@
+name: Commit attribution
+
+# Rule 29 (exchange/RULES.md): no AI attribution in what gets merged.
+#
+# GitHub writes one `Co-authored-by` into the squash message for every commit AUTHOR
+# other than whoever merges, so a commit authored as an AI brings the trailer back
+# even when every message is clean (exchange#27, 4-Oct-2026). This job reads the
+# author, the committer, the trailers and the footers of every commit in the pull
+# request, BEFORE the squash message exists. Make it a required check.
+#
+# This repository is PUBLIC, so the job runs on a GitHub-hosted runner and never on
+# the organisation's self-hosted ones: a pull request from a fork would otherwise run
+# foreign code on our machines. It only reads (`contents: read`), uses no secrets and
+# works the same for fork pull requests: the base and head SHAs come from the event
+# payload and `fetch-depth: 0` makes both reachable.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no-ai-attribution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: No AI author, committer, trailer or footer in the pull request's commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: python3 .githooks/check-no-ai-attribution.py range "$BASE..$HEAD"
