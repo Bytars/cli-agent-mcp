@@ -1,0 +1,64 @@
+name: security
+
+# Security gates on every PR. They no longer run on push to `main` (13-Oct-2026): the
+# gitleaks job only looked at the last commit, which the PR run had already scanned,
+# and trivy is report-only (it blocks nothing), so each merge added two jobs to the
+# queue for no signal. `workflow_dispatch` runs both on demand.
+#   - gitleaks: BLOCKING, but scans only the NEW commits of the PR (base..head),
+#     not the whole history. Scanning the full history would keep flagging old
+#     false positives (design mocks, test fixtures) forever. For new findings,
+#     mark intentional non-secrets inline with `gitleaks:allow`.
+#   - trivy: REPORT-ONLY for now (exit-code 0). Scans vulnerable deps + misconfig
+#     (Dockerfiles/IaC) + secrets. Left non-blocking so it does not block every PR
+#     on the existing debt; once the baseline is triaged, switch trivy's exit-code
+#     to '1' to make it a hard gate.
+#
+# runs-on ubuntu-latest, never self-hosted: this repository is PUBLIC, and a pull
+# request from a fork would otherwise run foreign code on the organisation's own
+# machines. Nothing here needs a secret, and the token is read-only.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0 # full history so base..head is reachable
+      - name: gitleaks (secrets in the PR commits)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          ver=8.30.1
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${ver}/gitleaks_${ver}_linux_x64.tar.gz" -o /tmp/gl.tgz
+          tar -xzf /tmp/gl.tgz -C /tmp gitleaks
+          if [ -n "${BASE:-}" ] && [ -n "${HEAD:-}" ]; then
+            # Pull request: only the commits this PR adds.
+            /tmp/gitleaks git . --redact --no-banner --exit-code 1 --log-opts="${BASE}..${HEAD}"
+          else
+            # Push: only the most recent commit.
+            /tmp/gitleaks git . --redact --no-banner --exit-code 1 --log-opts="-1"
+          fi
+
+  trivy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Trivy fs (deps + misconfig + secrets) - report-only
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0" # TODO: switch to "1" once the baseline is triaged (hard gate)
