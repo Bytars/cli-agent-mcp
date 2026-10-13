@@ -1,0 +1,33 @@
+{
+ "version": 1,
+ "note": "Known and deliberate Spanish (product copy, frozen migrations, quotations of evidence). A count may only go DOWN. Regenerate with --update-baseline: it is a decision that shows in review.",
+ "exempt": [
+  "RENAMES.md",
+  "scripts/ci/check-language.py",
+  "scripts/ci/language-baseline.json"
+ ],
+ "prose": {
+  "README.md": 1,
+  "apagado_test.go": 47,
+  "cmd/smoketest/main.go": 3,
+  "cmd/smoketest/scenario_crosscancel.go": 2,
+  "cmd/smoketest/scenario_worktree.go": 2,
+  "internal/agent/hidewindow_windows.go": 4,
+  "internal/agent/mock.go": 3,
+  "internal/agent/shim_test.go": 1,
+  "internal/config/tiempolimite_test.go": 13,
+  "internal/gitx/gitx.go": 4,
+  "internal/task/aislamiento_test.go": 18,
+  "internal/task/crosscancel_test.go": 3,
+  "internal/task/fuga_goroutines_test.go": 20,
+  "internal/task/kill_windows.go": 2,
+  "internal/task/persist_test.go": 2,
+  "internal/winspawn/harden_windows_test.go": 19,
+  "internal/winspawn/sweep_test.go": 78,
+  "internal/winspawn/winspawn_other.go": 2,
+  "internal/winspawn/winspawn_windows.go": 22,
+  "visibilidad_test.go": 31
+ },
+ "names": [],
+ "former": {}
+}

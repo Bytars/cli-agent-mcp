@@ -1,0 +1,64 @@
+name: Language
+
+# RULE 28 AS A RATCHET (exchange/RULES.md, rules 28 and 30).
+#
+# Everything an agent reads in this repo is written in English. Rule 28 was declared
+# done three times and refuted three times because it was a sentence in a file:
+# nothing failed when a Spanish line came back. This job is what fails.
+#
+# WHAT IT MEASURES (`scripts/ci/check-language.py`, pure stdlib, no network):
+#   - lines with at least two distinct Spanish function words, in every tracked text file;
+#   - file or directory names with a Spanish token or an accented letter.
+# `scripts/ci/language-baseline.json` records what existed when the job was added, per
+# file. A count that GROWS fails; one that shrinks is a warning to lower the baseline.
+# Regenerating the baseline is a deliberate act that shows in review, never something
+# CI does by itself:
+#
+#     python3 scripts/ci/check-language.py --repo . --update-baseline
+#
+# A single line that must stay literal (a quotation) can be marked `lang-ok`.
+#
+# WHAT IT DOES NOT PROVE. A Spanish line with fewer than two of the listed words
+# (`"Guardar"`) goes through, and it cannot tell a translation from a leftover: the
+# baseline is where a human says which is which. The `former` measurement (citations
+# of renamed names) needs the `RENAMES.md` of `Bytars/exchange`; here it is reported as
+# SKIP, which is not a zero.
+#
+# The canonical copy of the script is `Bytars/exchange/tools/check-language.py`; the one
+# in this repo must stay byte-identical to it.
+#
+# This repository is PUBLIC, so the job runs on a GitHub-hosted runner and never on the
+# organisation's self-hosted ones: a pull request from a fork would otherwise run
+# foreign code on our machines.
+#
+# NOT A REQUIRED CHECK YET. Adding `language` to the ruleset is Andres's decision.
+
+# PULL REQUEST ONLY: the ratchet is checked on the PR that would make the count grow.
+# `workflow_dispatch` is there for a full pass by hand.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# NO PATH FILTER, on purpose: if `language` becomes required, a check that does not run
+# stays at "Expected" and the PR can never be merged.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  language:
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: python
+        run: python3 --version
+
+      - name: Spanish prose and names do not grow beyond the baseline
+        run: python3 scripts/ci/check-language.py --repo .
